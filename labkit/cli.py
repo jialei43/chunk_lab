@@ -59,6 +59,13 @@ def cmd_eval(args):
         code = report.get("code", {})
         print(f"\n本轮已存为历史：{run_id}　代码指纹 {code.get('hash', '?')}"
               f"{'（含未提交改动）' if code.get('git_dirty') else ''}")
+        # 生成 Markdown 评估报告：逐条列出问题、证据、可能相关代码与复现命令，
+        # 可直接交给编码助手作为修复依据
+        from .report import save_markdown
+        # 从文本快照取切片全文，供报告中的完整案例使用
+        md = save_markdown(report, chunks_by_case=runs.load_chunks(run_id))
+        # 提示报告位置
+        print(f"评估报告：{md}")
     # 与指定轮次对比，这是判断一次代码改动优劣的核心依据
     if args.compare:
         # 解析对比目标，支持 baseline / latest / 具体 run_id
@@ -175,6 +182,87 @@ def cmd_smoke(args):
     return smoke_main(argv)
 
 
+def cmd_inspect(args):
+    """复现单个样本的问题：打印命中切片的完整正文与前后文。"""
+    # 延迟导入
+    from .detectors import DetectorConfig
+    from .evaluate import inspect_case, load_cases
+    from .report import DETECTOR_INFO
+    # 加载目标样本
+    cases = load_cases(only=[args.case_id])
+    # 样本不存在时列出可选项，避免用户猜名字
+    if not cases:
+        all_ids = [c["case_id"] for c in load_cases()]
+        print(f"样本不存在：{args.case_id}")
+        print("可选样本：" + ", ".join(all_ids))
+        return 1
+    # 按指定参数切分，保证与报告口径一致
+    cfg = DetectorConfig(chunk_token_num=args.chunk_token_num)
+    data = inspect_case(cases[0], cfg=cfg, children_delimiter=args.children_delimiter)
+    # 切分失败时直接报出
+    if data.get("error"):
+        print(f"切分失败：{data['error']}")
+        return 1
+    # 全部切片，按序号索引便于取前后文
+    chunks = data["chunks"]
+    by_idx = {c["index"]: c for c in chunks}
+
+    # 指定切片序号时只看那一块及其前后文
+    if args.chunk is not None:
+        target = by_idx.get(args.chunk)
+        # 序号不存在时提示范围
+        if target is None:
+            print(f"切片 #{args.chunk} 不存在（本样本共 {len(chunks)} 个切片，序号 0..{len(chunks)-1}）")
+            return 1
+        # 打印目标及其相邻切片，截断问题必须看前后文才能判断
+        print(f"样本 {data['case_id']}　文件 {data['filename']}　共 {data['chunk_count']} 切片")
+        print("=" * 78)
+        for i in (args.chunk - 1, args.chunk, args.chunk + 1):
+            c = by_idx.get(i)
+            if c is None:
+                continue
+            mark = "▶ " if i == args.chunk else "  "
+            print(f"{mark}#{i}　类型={c['doc_type_kwd'] or 'text'}　{c['content_len']} 字　"
+                  f"页码={c['page_num_int']}　面包屑={' > '.join(c['important_kwd'] or [])}")
+            print(c["content"])
+            # 该切片的问题标注
+            for f in c["findings"]:
+                print(f"    [{f['severity']}] {f['detector']}: {f['message']}")
+            print("-" * 78)
+        return 0
+
+    # 未指定切片时按检测器筛选，列出该类问题的全部命中
+    hits = [c for c in chunks if c["findings"]
+            and (not args.detector or any(f["detector"] == args.detector for f in c["findings"]))]
+    # 无命中时说明情况
+    if not hits:
+        print(f"样本 {args.case_id} 中没有命中"
+              + (f"「{args.detector}」的切片" if args.detector else "任何问题的切片"))
+        return 0
+    # 打印概要
+    cn = (DETECTOR_INFO.get(args.detector) or {}).get("cn", args.detector) if args.detector else "全部问题"
+    print(f"样本 {data['case_id']}　文件 {data['filename']}　共 {data['chunk_count']} 切片")
+    print(f"筛选：{cn}　命中 {len(hits)} 个切片")
+    print("=" * 78)
+    # 逐个打印命中切片的完整正文
+    for c in hits[:args.limit]:
+        print(f"▶ #{c['index']}　类型={c['doc_type_kwd'] or 'text'}　{c['content_len']} 字　"
+              f"页码={c['page_num_int']}")
+        print(c["content"])
+        # 只打印筛选到的那类问题，避免无关信息干扰
+        for f in c["findings"]:
+            if args.detector and f["detector"] != args.detector:
+                continue
+            print(f"    [{f['severity']}] {f['detector']}: {f['message']}")
+            if f.get("evidence"):
+                print(f"    证据: {f['evidence']}")
+        print("-" * 78)
+    # 超出上限时提示如何看全部
+    if len(hits) > args.limit:
+        print(f"（仅显示前 {args.limit} 个，共 {len(hits)} 个；用 --limit 调整）")
+    return 0
+
+
 def cmd_serve(args):
     """启动本地 Web 控制台。"""
     # 延迟导入，使不用 Web 界面时不必加载 Flask
@@ -243,6 +331,23 @@ def build_parser():
                         help="对比两轮，如 --compare baseline latest")
     # 绑定处理函数
     p_runs.set_defaults(func=cmd_runs)
+
+    # inspect 子命令
+    p_ins = sub.add_parser("inspect", help="复现单个样本的问题，打印切片全文")
+    # 样本标识
+    p_ins.add_argument("case_id", help="样本 ID，如 annual_cnipa")
+    # 按检测器筛选
+    p_ins.add_argument("--detector", help="只看该类问题，如 truncated_sentence")
+    # 直接看某个切片及其前后文
+    p_ins.add_argument("--chunk", type=int, help="查看该序号的切片及其相邻切片")
+    # 展示条数上限
+    p_ins.add_argument("--limit", type=int, default=10, help="最多展示多少个切片")
+    # 切分参数需与报告一致，否则序号对不上
+    p_ins.add_argument("--chunk-token-num", type=int, default=512, help="token 预算")
+    # 父子分块分隔符
+    p_ins.add_argument("--children-delimiter", default="", help="父子分块分隔符")
+    # 绑定处理函数
+    p_ins.set_defaults(func=cmd_inspect)
 
     # serve 子命令
     p_serve = sub.add_parser("serve", help="启动 Web 控制台")

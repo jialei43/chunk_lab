@@ -1,5 +1,33 @@
 [
   {
+    "run_id": "20260808_040204",
+    "generated_at": "2026-08-08T04:02:04",
+    "label": "生成评估报告",
+    "case_count": 13,
+    "chunk_total": 3272,
+    "finding_total": 160,
+    "config": {
+      "chunk_token_num": 512,
+      "children_delimiter": "",
+      "oversize_ratio": 1.5
+    },
+    "code_hash": "41a7fdef3962",
+    "git_commit": "d9c66ffe",
+    "git_dirty": true,
+    "corpus_hash": "2f432b82e63e",
+    "totals_by_detector": {
+      "truncated_sentence": 36,
+      "undersized_chunk": 33,
+      "duplicate_content": 37,
+      "spaced_characters": 1,
+      "noise_residue": 1,
+      "markdown_residue": 23,
+      "missing_breadcrumb": 29
+    },
+    "has_chunks": true,
+    "chunks_bytes": 343653
+  },
+  {
     "run_id": "20260808_035503",
     "generated_at": "2026-08-08T03:55:03",
     "label": "修复面包屑剥离 + 收紧判据",
