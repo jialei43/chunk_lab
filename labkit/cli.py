@@ -29,9 +29,11 @@ def cmd_ingest(args):
 def cmd_eval(args):
     """执行全量评估并输出报告。"""
     # 延迟导入
+    from . import runs
     from .detectors import DetectorConfig
-    from .evaluate import (compare_reports, evaluate_all, format_comparison,
-                           format_report, load_baseline, save_baseline, save_report)
+    from .evaluate import compare_reports, evaluate_all, format_comparison, format_report
+    # 启动时确保旧版基线已收编为历史轮次
+    runs.migrate_legacy_baseline()
     # 构造检测配置，允许命令行覆盖关键阈值
     cfg = DetectorConfig(chunk_token_num=args.chunk_token_num)
     # 执行评估
@@ -44,52 +46,115 @@ def cmd_eval(args):
     if report["case_count"] == 0:
         print("语料库为空，请先执行：./run.sh ingest")
         return 1
+    # 存为不可变的历史轮次，全量评估才入历史以免局部评估污染趋势
+    run_id = None
+    if not args.case:
+        # 落盘并取回带代码指纹的完整快照
+        run_id = runs.save_run(report, label=args.label or "")
+        report = runs.load_run(run_id)
     # 渲染并打印终端报告
     print(format_report(report, top_findings=args.top))
-    # 与基线对比，这是判断一次代码改动优劣的核心依据
+    # 提示本轮的历史标识与代码指纹，便于日后回溯
+    if run_id:
+        code = report.get("code", {})
+        print(f"\n本轮已存为历史：{run_id}　代码指纹 {code.get('hash', '?')}"
+              f"{'（含未提交改动）' if code.get('git_dirty') else ''}")
+    # 与指定轮次对比，这是判断一次代码改动优劣的核心依据
     if args.compare:
-        # 读取基线
-        baseline = load_baseline()
-        # 基线不存在时提示先建立
-        if baseline is None:
-            print("\n尚无基线，请先执行：./run.sh baseline")
+        # 解析对比目标，支持 baseline / latest / 具体 run_id
+        target = runs.resolve_run(args.compare)
+        # 目标不存在或就是本轮自己时给出提示
+        if target is None or target.get("run_id") == run_id:
+            print(f"\n没有可对比的轮次（{args.compare}）。先跑一轮并执行 ./run.sh baseline 设定基准。")
         else:
             # 计算并打印升降
-            print(format_comparison(compare_reports(baseline, report)))
-    # 按需把本次结果固化为新基线
-    if args.set_baseline:
-        # 写出基线文件
-        path = save_baseline(report)
-        # 提示保存位置
-        print(f"\n基线已更新：{path}")
-    # 按需保存 JSON 报告
-    if not args.no_save:
-        # 写出报告文件
-        path = save_report(report, name=args.out)
-        # 提示保存位置
-        print(f"\n报告已保存：{path}")
+            print(format_comparison(compare_reports(target, report)))
+    # 按需把本轮设为新的对比基准
+    if args.set_baseline and run_id:
+        # 基线只是指向某轮的指针
+        runs.set_baseline(run_id)
+        # 提示已更新
+        print(f"\n基准已指向本轮：{run_id}")
     # 正常结束
     return 0
 
 
 def cmd_baseline(args):
-    """跑一次完整评估并把结果固化为回归基线。"""
+    """把某一轮设为对比基准；未指定轮次时跑一轮新的并设为基准。"""
     # 延迟导入
+    from . import runs
     from .detectors import DetectorConfig
-    from .evaluate import evaluate_all, save_baseline
-    # 基线固定使用默认阈值，保证不同次基线之间口径一致
+    from .evaluate import evaluate_all
+    # 先确保旧版基线已收编
+    runs.migrate_legacy_baseline()
+    # 指定了轮次则直接改指针，不必重跑
+    if args.run_id:
+        # 目标轮次必须存在
+        if runs.load_run(args.run_id) is None:
+            print(f"轮次不存在：{args.run_id}")
+            return 1
+        # 设定基准
+        runs.set_baseline(args.run_id)
+        print(f"基准已指向：{args.run_id}")
+        return 0
+    # 未指定则跑一轮新的
     cfg = DetectorConfig(chunk_token_num=args.chunk_token_num)
     # 全量评估
     report = evaluate_all(cfg=cfg, children_delimiter=args.children_delimiter)
-    # 语料为空时不允许建立基线，否则后续对比毫无意义
+    # 语料为空时不允许建立基准，否则后续对比毫无意义
     if report["case_count"] == 0:
         print("语料库为空，请先执行：./run.sh ingest")
         return 1
-    # 写出基线
-    path = save_baseline(report)
+    # 存为历史轮次并设为基准
+    run_id = runs.save_run(report, label=args.label or "基准")
+    runs.set_baseline(run_id)
     # 打印摘要供确认
-    print(f"基线已建立：{path}")
-    print(f"  语料 {report['case_count']} 个   chunk {report['chunk_total']} 个   命中 {report['finding_total']} 条")
+    print(f"基准已建立：{run_id}")
+    print(f"  语料 {report['case_count']} 个   切片 {report['chunk_total']} 个   问题 {report['finding_total']} 条")
+    # 正常结束
+    return 0
+
+
+def cmd_runs(args):
+    """列出历史轮次，或对比其中任意两轮。"""
+    # 延迟导入
+    from . import runs
+    from .evaluate import compare_reports, format_comparison
+    # 确保旧版基线已收编
+    runs.migrate_legacy_baseline()
+    # 指定了两个轮次则执行对比
+    if args.compare:
+        # 解析两侧轮次
+        a, b = runs.resolve_run(args.compare[0]), runs.resolve_run(args.compare[1])
+        # 任一不存在都无法对比
+        if a is None or b is None:
+            print("指定的轮次不存在")
+            return 1
+        # 打印对比结果
+        print(format_comparison(compare_reports(a, b)))
+        return 0
+    # 否则列出全部历史
+    index = runs.list_runs()
+    # 无历史时提示
+    if not index:
+        print("尚无历史轮次。执行 ./run.sh eval 跑一轮。")
+        return 0
+    # 当前基准标识
+    baseline_id = runs.get_baseline_id()
+    # 表头
+    print(f"{'轮次':<17}{'时间':<20}{'问题':>6}{'切片':>7}  {'代码指纹':<14}备注")
+    print("-" * 92)
+    # 逐行输出
+    for r in index:
+        # 基准轮次加标记
+        mark = "★" if r["run_id"] == baseline_id else " "
+        # 代码指纹，含未提交改动时加星号提示
+        code = r.get("code_hash", "?") + ("*" if r.get("git_dirty") else "")
+        # 输出一行
+        print(f"{mark}{r['run_id']:<16}{r.get('generated_at', '')[:19]:<20}"
+              f"{r.get('finding_total', 0):>6}{r.get('chunk_total', 0):>7}  {code:<14}{r.get('label', '')}")
+    # 图例
+    print("\n★ = 当前基准　* = 含未提交改动")
     # 正常结束
     return 0
 
@@ -146,23 +211,38 @@ def build_parser():
     p_eval.add_argument("--top", type=int, default=3, help="每类问题展示的样例条数")
     # 指定报告文件名
     p_eval.add_argument("--out", help="报告文件名")
-    # 不保存报告，用于快速查看
-    p_eval.add_argument("--no-save", action="store_true", help="不保存 JSON 报告")
-    # 与基线对比，改代码后的核心用法
-    p_eval.add_argument("--compare", action="store_true", help="与基线对比并显示指标升降")
-    # 确认改动有效后把当前结果固化为新基线
-    p_eval.add_argument("--set-baseline", action="store_true", help="把本次结果保存为新基线")
+    # 保留该开关以兼容既有用法，历史轮次始终落盘，此开关不再影响行为
+    p_eval.add_argument("--no-save", action="store_true", help="（已废弃）历史轮次始终落盘")
+    # 与指定轮次对比：baseline / latest / 具体 run_id
+    p_eval.add_argument("--compare", nargs="?", const="baseline", default=None,
+                        help="与指定轮次对比，可填 baseline（默认）/ latest / 具体 run_id")
+    # 确认改动有效后把本轮设为新基准
+    p_eval.add_argument("--set-baseline", action="store_true", help="把本轮设为新的对比基准")
+    # 给本轮打备注，便于日后辨认做了什么改动
+    p_eval.add_argument("--label", default="", help="本轮备注，如「修复 DOCX markdown 残留」")
     # 绑定处理函数
     p_eval.set_defaults(func=cmd_eval)
 
     # baseline 子命令
-    p_base = sub.add_parser("baseline", help="建立回归基线")
-    # token 预算，基线与后续评估必须一致
+    p_base = sub.add_parser("baseline", help="设定对比基准")
+    # 直接把已有轮次设为基准，不必重跑
+    p_base.add_argument("run_id", nargs="?", help="把该轮次设为基准；省略则跑一轮新的")
+    # token 预算
     p_base.add_argument("--chunk-token-num", type=int, default=512, help="token 预算")
     # 父子分块分隔符
     p_base.add_argument("--children-delimiter", default="", help="父子分块分隔符")
+    # 备注
+    p_base.add_argument("--label", default="", help="轮次备注")
     # 绑定处理函数
     p_base.set_defaults(func=cmd_baseline)
+
+    # runs 子命令
+    p_runs = sub.add_parser("runs", help="查看历史轮次或对比任意两轮")
+    # 对比两轮：接受两个引用
+    p_runs.add_argument("--compare", nargs=2, metavar=("基准", "对比"),
+                        help="对比两轮，如 --compare baseline latest")
+    # 绑定处理函数
+    p_runs.set_defaults(func=cmd_runs)
 
     # serve 子命令
     p_serve = sub.add_parser("serve", help="启动 Web 控制台")

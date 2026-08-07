@@ -277,12 +277,45 @@ def compare_reports(baseline, current):
                 "chunk_before": b.get("chunk_count", 0),  # 变化前 chunk 数
                 "chunk_after": c.get("chunk_count", 0),  # 变化后 chunk 数
             })
+    # 校验两轮是否真的可比：参数或语料不同的两轮，数字并列没有意义
+    warnings = []
+    # 取两侧的运行参数
+    cfg_a, cfg_b = baseline.get("config") or {}, current.get("config") or {}
+    # token 预算不同会直接改变切分粒度，命中数的增减无法归因于代码改动
+    if cfg_a.get("chunk_token_num") != cfg_b.get("chunk_token_num"):
+        warnings.append(
+            f"token 预算不同（{cfg_a.get('chunk_token_num')} vs {cfg_b.get('chunk_token_num')}），"
+            f"切分粒度本就不同，数字不能直接归因于代码改动")
+    # 父子分隔符决定按段落还是按标题划界，影响同样巨大
+    if cfg_a.get("children_delimiter") != cfg_b.get("children_delimiter"):
+        warnings.append(
+            f"子分隔符不同（{cfg_a.get('children_delimiter')!r} vs {cfg_b.get('children_delimiter')!r}），"
+            f"切分边界口径不同，不可直接比较")
+    # 语料增删会改变总量，此时只应看逐样本变化而非总数
+    if baseline.get("corpus_hash") and current.get("corpus_hash") and baseline["corpus_hash"] != current["corpus_hash"]:
+        warnings.append("语料构成已变化，总数对比无意义，请只看两侧都存在的样本")
+    # 代码指纹相同却出现差异，说明变化另有来源（语料或参数），值得提醒
+    code_a = (baseline.get("code") or {}).get("hash")
+    code_b = (current.get("code") or {}).get("hash")
+    # 仅在两侧都有指纹时判断
+    if code_a and code_b and code_a == code_b and by_detector:
+        warnings.append("两轮的被测代码完全相同，指标差异并非来自代码改动")
+
     # 汇总比较结果
     return {
         "baseline_at": baseline.get("generated_at", ""),  # 基线生成时间
         "current_at": current.get("generated_at", ""),  # 当前报告生成时间
+        "baseline_run_id": baseline.get("run_id", ""),  # 基准轮次标识
+        "current_run_id": current.get("run_id", ""),  # 当前轮次标识
+        "baseline_label": baseline.get("label", ""),  # 基准轮次备注
+        "current_label": current.get("label", ""),  # 当前轮次备注
+        "baseline_code": baseline.get("code") or {},  # 基准的代码指纹
+        "current_code": current.get("code") or {},  # 当前的代码指纹
+        "chunk_before": baseline.get("chunk_total", 0),  # 基准切片总数
+        "chunk_after": current.get("chunk_total", 0),  # 当前切片总数
         "finding_before": baseline.get("finding_total", 0),  # 基线总命中
         "finding_after": current.get("finding_total", 0),  # 当前总命中
+        "warnings": warnings,  # 可比性警告，前端必须显著展示
         "by_detector": by_detector,  # 逐检测器变化
         "by_case": by_case,  # 逐样本变化
     }
@@ -292,16 +325,37 @@ def format_comparison(cmp):
     """把比较结果渲染成终端文本，劣化项显式标注以便一眼看见。"""
     # 逐行累积
     lines = []
-    # 标题与总量变化
+    # 标题与总量变化；带上轮次标识与备注，便于确认比的是哪两轮
     lines.append("")
     lines.append("=" * 78)
-    lines.append(f"【回归对比】基线 {cmp['baseline_at']} → 当前 {cmp['current_at']}")
+    # 组装两侧的标识串：优先展示 run_id 与备注，回落到时间戳
+    left = cmp.get("baseline_run_id") or cmp["baseline_at"]
+    right = cmp.get("current_run_id") or cmp["current_at"]
+    # 备注存在时附在标识后
+    left += f"（{cmp['baseline_label']}）" if cmp.get("baseline_label") else ""
+    right += f"（{cmp['current_label']}）" if cmp.get("current_label") else ""
+    lines.append(f"【轮次对比】{left}  →  {right}")
     # 总命中变化量
     delta = cmp["finding_after"] - cmp["finding_before"]
     # 用符号直观表达方向：命中减少是改善，增加是劣化
     arrow = "改善" if delta < 0 else ("劣化" if delta > 0 else "持平")
-    lines.append(f"总命中 {cmp['finding_before']} → {cmp['finding_after']}（{delta:+d}，{arrow}）")
+    lines.append(f"总问题 {cmp['finding_before']} → {cmp['finding_after']}（{delta:+d}，{arrow}）　"
+                 f"总切片 {cmp.get('chunk_before', 0)} → {cmp.get('chunk_after', 0)}")
+    # 代码指纹对照：判断这次差异是否真的来自代码改动
+    ca, cb = cmp.get("baseline_code") or {}, cmp.get("current_code") or {}
+    # 两侧都有指纹时才展示
+    if ca.get("hash") or cb.get("hash"):
+        lines.append(f"代码指纹 {ca.get('hash', '?')} → {cb.get('hash', '?')}"
+                     f"{'（当前含未提交改动）' if cb.get('git_dirty') else ''}")
     lines.append("=" * 78)
+
+    # 可比性警告必须排在结论之前：参数或语料不同的两轮，数字并列会直接导致误判
+    if cmp.get("warnings"):
+        lines.append("")
+        lines.append("⚠️  这两轮不完全可比：")
+        # 逐条列出原因
+        for w in cmp["warnings"]:
+            lines.append(f"    · {w}")
 
     # 无任何变化时直接说明，避免使用者怀疑没跑成功
     if not cmp["by_detector"] and not cmp["by_case"]:

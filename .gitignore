@@ -15,3 +15,8 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+
+# 历史轮次：完整快照含 findings 明细，体积大不入库；
+# 但轻量索引保留版本管理，指标趋势因此可长期追溯
+runs/*.json
+!runs/index.json

@@ -211,6 +211,60 @@ input[type="text"], input[type="number"], select {
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .spin { animation: none; } .toast { transition: none; } }
 
+/* ========== 轮次对比选择器 ========== */
+.cmp-picker { display: flex; align-items: center; gap: 0.7rem; flex-wrap: wrap; font-size: 0.84rem; color: var(--muted); }
+.cmp-picker select { max-width: 20rem; }
+.arrow-lg { color: var(--line-strong); font-size: 1.1rem; }
+
+/* 对比头部：并排展示两轮的标识、备注与代码指纹 */
+.cmp-head {
+  display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;
+  padding: 0.7rem 0.9rem; margin-bottom: 1rem;
+  background: var(--sunk); border-radius: 5px; font-size: 0.85rem;
+}
+
+/* 可比性警告：必须比结论更醒目，否则用户会直接读数字下错结论 */
+.warn-box {
+  background: var(--warn-soft); border: 1px solid var(--warn);
+  border-radius: 5px; padding: 0.75rem 0.95rem; margin-bottom: 1rem;
+}
+.warn-title { font-weight: 600; color: var(--warn); font-size: 0.88rem; margin-bottom: 0.35rem; }
+.warn-box ul { margin: 0; padding-left: 1.1rem; }
+.warn-box li { font-size: 0.84rem; color: var(--ink-soft); line-height: 1.6; }
+
+/* ========== 历史轮次表 ========== */
+tr.is-baseline { background: var(--accent-soft); }
+.dirty { color: var(--bad); font-weight: 700; }
+.run-ops { display: flex; gap: 0.25rem; flex-wrap: wrap; }
+.run-label { max-width: 12rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mini {
+  font-size: 0.72rem; padding: 0.15rem 0.4rem; border-radius: 3px;
+  border: 1px solid var(--line-strong); background: var(--surface); color: var(--ink-soft);
+}
+.mini:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.mini:disabled { opacity: 0.4; cursor: not-allowed; }
+.mini.danger:hover:not(:disabled) { border-color: var(--bad); color: var(--bad); }
+
+/* ========== 趋势图 ========== */
+.trend-row {
+  display: grid; grid-template-columns: 8rem 1fr 9rem; gap: 0.9rem;
+  align-items: center; padding: 0.35rem 0; font-size: 0.84rem;
+}
+.trend-row.head { border-bottom: 1px solid var(--line); padding-bottom: 0.6rem; margin-bottom: 0.4rem; font-weight: 600; }
+.trend-name { color: var(--ink-soft); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trend-val { font-family: var(--mono); font-size: 0.8rem; color: var(--muted); text-align: right; }
+.trend-val strong { color: var(--ink); }
+/* 折线按严重度着色，与徽标和条形图保持同一套语义 */
+.spark { width: 100%; height: 28px; overflow: visible; }
+.spark polyline { stroke: var(--accent); }
+.spark circle { fill: var(--accent); }
+.spark.high polyline { stroke: var(--bad); }
+.spark.high circle { fill: var(--bad); }
+.spark.medium polyline { stroke: var(--warn); }
+.spark.medium circle { fill: var(--warn); }
+.spark.low polyline { stroke: var(--muted); }
+.spark.low circle { fill: var(--muted); }
+
 /* ========== 逐样本表：中文名与问题类型徽标 ========== */
 /* 样本名做成按钮，点击查看该样本全部切片 */
 .case-link {
@@ -301,9 +355,34 @@ input[type="text"], input[type="number"], select {
       <p class="hint" id="evalHint" style="margin:0.9rem 0 0">正在加载…</p>
     </div>
 
-    <div class="card" id="cmpCard" style="display:none">
-      <h3>与基线对比</h3>
-      <div id="cmpBody"></div>
+    <div class="card">
+      <h3>轮次对比</h3>
+      <div class="cmp-picker">
+        <label>基准 <select id="cmpA"></select></label>
+        <span class="arrow-lg">→</span>
+        <label>对比 <select id="cmpB"></select></label>
+        <button class="btn" id="btnCompare">对比</button>
+        <span class="hint" id="cmpHint">任选两轮进行对比，不必总以基线为准</span>
+      </div>
+      <div id="cmpBody" style="margin-top:1rem"></div>
+    </div>
+
+    <div class="card" id="trendCard" style="display:none">
+      <h3>趋势 · 各类问题随轮次的变化</h3>
+      <div id="trendBody"></div>
+    </div>
+
+    <div class="card" id="runsCard">
+      <h3>历史轮次</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>轮次</th><th>时间</th><th class="num">问题</th><th class="num">切片</th>
+            <th>代码指纹</th><th>参数</th><th>备注</th><th>操作</th>
+          </tr></thead>
+          <tbody id="runsRows"></tbody>
+        </table>
+      </div>
     </div>
 
     <div class="card" id="distCard" style="display:none">
@@ -379,6 +458,8 @@ let sourcesCache = [];      // 可导入产物缓存
 let currentCase = null;     // 切片预览中当前选中的样本
 let currentCaseData = null; // 当前样本的切片数据，切换筛选时复用避免重复切分
 let chunkFilter = "";       // 切片预览的检测器筛选，空串表示不筛选
+let runsCache = [];         // 历史轮次摘要，按时间倒序
+let baselineId = "";        // 当前作为对比基准的轮次标识
 
 // 检测器的中文短名与严重度。英文标识便于代码检索，但表格里必须给中文，
 // 否则一眼看不出是哪类问题，也就无从按类型着手修复。
@@ -498,8 +579,10 @@ $("btnEval").addEventListener("click", async () => {
       body: JSON.stringify({ ...runParams(), compare: true }),
     });
     lastReport = data.report;
-    // 显式标记为非基线数据，使标题与提示切换回「本轮结果」
-    renderOverview(data.report, data.comparison, false);
+    // 显式标记为本轮数据，使标题与提示切换回「本轮结果」
+    renderOverview(data.report, data.comparison, "current");
+    // 刷新历史列表，使新轮次立即出现在选择器与趋势图中
+    await loadRuns();
     toast(`评估完成：${data.report.finding_total} 条问题`);
   } catch (e) {
     toast("评估失败：" + e.message);
@@ -512,38 +595,52 @@ $("btnEval").addEventListener("click", async () => {
 
 // ========== 设为基线 ==========
 $("btnBaseline").addEventListener("click", async () => {
-  // 未跑过评估时无从固化，直接提示
-  if (!lastReport) return toast("请先运行一次评估");
+  // 未跑过评估时无从设定，直接提示
+  if (!lastReport) return toast("请先运行一次评估，或在历史列表里选一轮设为基准");
   try {
-    await api("/api/baseline", { method: "POST" });
-    toast("基线已更新为本轮结果");
+    // 基线只是指针，指向本轮即可
+    await api("/api/baseline", { method: "POST", body: JSON.stringify({ run_id: lastReport.run_id }) });
+    toast("基准已指向本轮");
+    // 刷新历史列表以更新基准标记
+    await loadRuns();
   } catch (e) {
-    toast("保存失败：" + e.message);
+    toast("设定失败：" + e.message);
   }
 });
 
 // ========== 概览渲染 ==========
-// isBaseline 为真表示展示的是既有基线而非本轮评估结果，两者渲染结构相同但语义不同，
-// 必须在标题与提示上区分清楚，否则容易把上次的成绩误读成这次的。
-function renderOverview(report, comparison, isBaseline) {
-  // 卡片标题随数据来源切换
-  $("overviewTitle").textContent = isBaseline ? "基线结果" : "本轮结果";
-  // 数据来源徽标：基线态提示尚未运行本轮评估
-  $("overviewBadge").innerHTML = isBaseline
-    ? '<span class="pill low">来自基线</span>'
-    : '<span class="pill kind">本轮</span>';
+// source 标明数据来源：current 本轮新跑、baseline 当前基准、history 查看的历史轮次。
+// 三者渲染结构相同但语义不同，必须在标题上区分，否则容易把别的轮次误读成本轮结果。
+function renderOverview(report, comparison, source) {
+  // 兼容旧调用：传布尔值时按基准处理
+  if (source === true) source = "baseline";
+  if (source === false || !source) source = "current";
+  // 标题与徽标随数据来源切换
+  const meta = {
+    current: { title: "本轮结果", badge: '<span class="pill kind">本轮</span>' },
+    baseline: { title: "当前基准", badge: '<span class="pill low">基准轮次</span>' },
+    history: { title: "历史轮次", badge: '<span class="pill low">历史</span>' },
+  }[source];
+  $("overviewTitle").textContent = meta.title;
+  // 轮次标识与备注一并展示，避免看不出这是哪一轮
+  const rid = report.run_id ? `<span class="mono hint">${esc(report.run_id)}</span>` : "";
+  const lbl = report.label ? `<span class="hint"> · ${esc(report.label)}</span>` : "";
+  $("overviewBadge").innerHTML = meta.badge + " " + rid + lbl;
   // 顶部三个总量指标
   $("statRow").innerHTML = `
     <div class="stat"><div class="stat-label">语料</div><div class="stat-value">${report.case_count}</div></div>
     <div class="stat"><div class="stat-label">切片</div><div class="stat-value">${report.chunk_total}</div></div>
     <div class="stat"><div class="stat-label">问题</div><div class="stat-value">${report.finding_total}</div></div>
   `;
-  // 参数配置在基线里可能缺失，取值时做防御
+  // 参数配置在旧数据里可能缺失，取值时做防御
   const cfg = report.config || {};
-  // 提示行说明数据的时间与参数；基线态额外提示如何得到本轮结果
-  $("evalHint").textContent = isBaseline
-    ? `基线生成于 ${report.generated_at}　参数 token=${cfg.chunk_token_num ?? "?"}　子分隔符=${JSON.stringify(cfg.children_delimiter ?? "")}　·　改完代码点「运行评估」即可与之对比`
-    : `运行于 ${report.generated_at}　参数 token=${cfg.chunk_token_num ?? "?"}　子分隔符=${JSON.stringify(cfg.children_delimiter ?? "")}`;
+  // 代码指纹是判断该轮对应什么代码状态的唯一依据，必须展示
+  const code = report.code || {};
+  const codeTxt = code.hash ? `　代码 ${code.hash}${code.git_dirty ? "（含未提交改动）" : ""}` : "";
+  // 提示行说明该轮的时间、参数与代码状态
+  $("evalHint").textContent =
+    `${(report.generated_at || "").replace("T", " ")}　token=${cfg.chunk_token_num ?? "?"}　`
+    + `子分隔符=${JSON.stringify(cfg.children_delimiter ?? "")}${codeTxt}`;
 
   // 与基线的对比区
   renderComparison(comparison);
@@ -606,22 +703,216 @@ function renderOverview(report, comparison, isBaseline) {
   $("caseCard").style.display = "";
 }
 
+// ========== 历史轮次 ==========
+// 加载轮次列表，同时驱动对比选择器、趋势图与历史表格
+async function loadRuns() {
+  try {
+    const data = await api("/api/runs");
+    runsCache = data.runs || [];
+    baselineId = data.baseline_id || "";
+    renderRunPickers();
+    renderRuns();
+    renderTrend();
+  } catch (e) {
+    toast("加载历史失败：" + e.message);
+  }
+}
+
+// 填充对比选择器。基准侧默认选当前基准，对比侧默认选最新一轮，
+// 这样打开就是最常用的「最新 vs 基准」，但两侧都可以改成任意轮次。
+function renderRunPickers() {
+  const opts = runsCache.map(r => {
+    const mark = r.run_id === baselineId ? "★ " : "";
+    const label = r.label ? ` · ${r.label}` : "";
+    return `<option value="${esc(r.run_id)}">${mark}${esc(r.run_id)}${esc(label)}（${r.finding_total} 问题）</option>`;
+  }).join("");
+  $("cmpA").innerHTML = opts;
+  $("cmpB").innerHTML = opts;
+  // 基准侧优先选中当前基准，没有基准则选最旧的一轮
+  if (baselineId) $("cmpA").value = baselineId;
+  else if (runsCache.length) $("cmpA").value = runsCache[runsCache.length - 1].run_id;
+  // 对比侧选最新一轮
+  if (runsCache.length) $("cmpB").value = runsCache[0].run_id;
+  // 只有一轮时无从对比，禁用按钮并说明原因
+  const few = runsCache.length < 2;
+  $("btnCompare").disabled = few;
+  $("cmpHint").textContent = few
+    ? "至少需要两轮历史才能对比。点右上角「运行评估」再跑一轮。"
+    : "任选两轮进行对比，不必总以基线为准";
+}
+
+// 渲染历史轮次表格
+function renderRuns() {
+  if (!runsCache.length) {
+    $("runsRows").innerHTML = `<tr><td colspan="8" class="empty">尚无历史轮次，点右上角「运行评估」开始</td></tr>`;
+    return;
+  }
+  $("runsRows").innerHTML = runsCache.map(r => {
+    // 代码指纹：含未提交改动时加标记，提醒该轮对应的代码未固化
+    const dirty = r.git_dirty ? '<span class="dirty" title="含未提交改动">*</span>' : "";
+    // 参数摘要，参数不同的轮次不可直接比较
+    const cfg = r.config || {};
+    const param = `token=${cfg.chunk_token_num ?? "?"}${cfg.children_delimiter ? " deli=" + esc(JSON.stringify(cfg.children_delimiter)) : ""}`;
+    return `<tr class="${r.run_id === baselineId ? "is-baseline" : ""}">
+      <td><span class="mono">${esc(r.run_id)}</span>${r.run_id === baselineId ? ' <span class="pill kind">基准</span>' : ""}</td>
+      <td class="mono" style="font-size:0.78rem">${esc((r.generated_at || "").replace("T", " ").slice(0, 19))}</td>
+      <td class="num"><strong>${r.finding_total}</strong></td>
+      <td class="num">${r.chunk_total}</td>
+      <td class="mono" style="font-size:0.76rem" title="${esc(r.git_commit || "")}">${esc(r.code_hash || "?")}${dirty}</td>
+      <td class="mono" style="font-size:0.74rem;color:var(--muted)">${param}</td>
+      <td class="run-label" style="font-size:0.8rem">${esc(r.label || "")}</td>
+      <td class="run-ops">
+        <button class="mini" data-act="view" data-run="${esc(r.run_id)}">查看</button>
+        <button class="mini" data-act="base" data-run="${esc(r.run_id)}" ${r.run_id === baselineId ? "disabled" : ""}>设为基准</button>
+        <button class="mini" data-act="label" data-run="${esc(r.run_id)}">备注</button>
+        <button class="mini danger" data-act="del" data-run="${esc(r.run_id)}">删除</button>
+      </td>
+    </tr>`;
+  }).join("");
+  // 绑定行内操作
+  $("runsRows").querySelectorAll("button.mini").forEach(btn => {
+    btn.addEventListener("click", () => runAction(btn.dataset.act, btn.dataset.run));
+  });
+}
+
+// 历史轮次的行内操作
+async function runAction(act, runId) {
+  try {
+    if (act === "view") {
+      // 查看某一轮的完整结果，概览区切换为该轮数据
+      const r = await api(`/api/runs/${runId}`);
+      renderOverview(r, null, r.run_id === baselineId ? "baseline" : "history");
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    } else if (act === "base") {
+      // 把该轮设为对比基准
+      await api("/api/baseline", { method: "POST", body: JSON.stringify({ run_id: runId }) });
+      toast("基准已指向 " + runId);
+      await loadRuns();
+    } else if (act === "label") {
+      // 打备注，便于日后辨认这一轮做了什么
+      const cur = (runsCache.find(r => r.run_id === runId) || {}).label || "";
+      const label = prompt("给这一轮写个备注（例如：修复 DOCX markdown 残留）", cur);
+      if (label === null) return;
+      await api(`/api/runs/${runId}/label`, { method: "POST", body: JSON.stringify({ label }) });
+      await loadRuns();
+    } else if (act === "del") {
+      // 删除是不可逆操作，必须显式确认
+      if (!confirm(`确定删除轮次 ${runId}？该操作不可撤销。`)) return;
+      await api(`/api/runs/${runId}`, { method: "DELETE" });
+      toast("已删除 " + runId);
+      await loadRuns();
+    }
+  } catch (e) {
+    toast("操作失败：" + e.message);
+  }
+}
+
+// ========== 趋势图 ==========
+// 用迷你折线展示各类问题随轮次的变化。趋势的意义在于看清累计效果，
+// 单次对比只能回答「这次变好没有」，趋势才能回答「这几次下来到底改善了多少」。
+function renderTrend() {
+  // 少于两轮无趋势可言
+  if (runsCache.length < 2) {
+    $("trendCard").style.display = "none";
+    return;
+  }
+  // 历史按时间倒序存储，绘图需要正序
+  const series = [...runsCache].reverse();
+  // 收集出现过的全部检测器
+  const names = new Set();
+  series.forEach(r => Object.keys(r.totals_by_detector || {}).forEach(n => names.add(n)));
+
+  // 总问题数的走势单独置顶，它是最概括的指标
+  const totals = series.map(r => r.finding_total || 0);
+  let html = `<div class="trend-row head">
+    <div class="trend-name">总问题数</div>
+    ${sparkline(totals, "accent")}
+    <div class="trend-val">${totals[0]} → <strong>${totals[totals.length - 1]}</strong> ${deltaTag(totals[totals.length - 1] - totals[0])}</div>
+  </div>`;
+
+  // 逐检测器的走势，按最新一轮的数量降序
+  html += [...names].map(name => {
+    const vals = series.map(r => (r.totals_by_detector || {})[name] || 0);
+    return { name, vals, last: vals[vals.length - 1] };
+  }).sort((a, b) => b.last - a.last).map(({ name, vals }) => {
+    const d = vals[vals.length - 1] - vals[0];
+    return `<div class="trend-row">
+      <div class="trend-name">${esc(detCn(name))}</div>
+      ${sparkline(vals, detSev(name))}
+      <div class="trend-val">${vals[0]} → <strong>${vals[vals.length - 1]}</strong> ${deltaTag(d)}</div>
+    </div>`;
+  }).join("");
+
+  $("trendBody").innerHTML = html;
+  $("trendCard").style.display = "";
+}
+
+// 生成迷你折线 SVG。用 SVG 而非图表库，保持零依赖且能跟随主题令牌着色。
+function sparkline(vals, tone) {
+  const w = 160, h = 28, pad = 3;
+  const max = Math.max(...vals, 1), min = Math.min(...vals, 0);
+  const span = max - min || 1;
+  // 把数值映射到画布坐标；只有一个点时居中绘制
+  const pts = vals.map((v, i) => {
+    const x = vals.length === 1 ? w / 2 : pad + i * (w - pad * 2) / (vals.length - 1);
+    const y = h - pad - (v - min) / span * (h - pad * 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+  // 末点单独画圆点，强调当前值
+  const [lx, ly] = pts[pts.length - 1].split(",");
+  return `<svg class="spark ${tone}" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="趋势">
+    <polyline points="${pts.join(" ")}" fill="none" stroke-width="1.6" vector-effect="non-scaling-stroke"/>
+    <circle cx="${lx}" cy="${ly}" r="2.4"/>
+  </svg>`;
+}
+
+// 变化量徽标：减少是改善，增加是劣化
+function deltaTag(d) {
+  if (d === 0) return `<span class="pill low">持平</span>`;
+  return `<span class="pill ${d < 0 ? "good" : "bad"}">${d > 0 ? "+" : ""}${d}</span>`;
+}
+
 // ========== 对比渲染 ==========
 function renderComparison(cmp) {
-  // 无基线或无对比数据时隐藏该区块
+  // 无对比数据时清空该区块内容，但保留选择器供手动对比
   if (!cmp) {
-    $("cmpCard").style.display = "none";
+    $("cmpBody").innerHTML = "";
     return;
   }
   const delta = cmp.finding_after - cmp.finding_before;
   // 命中减少是改善，增加是劣化
-  const dirClass = delta < 0 ? "delta-down" : (delta > 0 ? "delta-up" : "");
   const dirText = delta < 0 ? "改善" : (delta > 0 ? "劣化" : "持平");
+  const chunkDelta = (cmp.chunk_after || 0) - (cmp.chunk_before || 0);
 
-  let html = `<div class="stat-row" style="margin-bottom:1rem">
+  // 可比性警告必须排在结论之前：参数或语料不同的两轮，数字并列会直接导致误判
+  let html = "";
+  if (cmp.warnings && cmp.warnings.length) {
+    html += `<div class="warn-box">
+      <div class="warn-title">这两轮不完全可比</div>
+      <ul>${cmp.warnings.map(w => `<li>${esc(w)}</li>`).join("")}</ul>
+    </div>`;
+  }
+
+  // 对比的是哪两轮：带上备注与代码指纹，否则回头看不知道比的是什么
+  const ca = cmp.baseline_code || {}, cb = cmp.current_code || {};
+  html += `<div class="cmp-head">
+    <div><span class="mono">${esc(cmp.baseline_run_id || cmp.baseline_at)}</span>
+      ${cmp.baseline_label ? `<span class="hint"> · ${esc(cmp.baseline_label)}</span>` : ""}
+      <div class="hint mono">代码 ${esc(ca.hash || "?")}</div></div>
+    <span class="arrow-lg">→</span>
+    <div><span class="mono">${esc(cmp.current_run_id || cmp.current_at)}</span>
+      ${cmp.current_label ? `<span class="hint"> · ${esc(cmp.current_label)}</span>` : ""}
+      <div class="hint mono">代码 ${esc(cb.hash || "?")}${cb.git_dirty ? " *" : ""}</div></div>
+  </div>`;
+
+  html += `<div class="stat-row" style="margin-bottom:1rem">
     <div class="stat"><div class="stat-label">问题总数</div>
       <div class="stat-value">${cmp.finding_before} → ${cmp.finding_after}
         <span class="pill ${delta < 0 ? "good" : (delta > 0 ? "bad" : "low")}" style="font-size:0.7rem;vertical-align:middle">${delta >= 0 ? "+" : ""}${delta} ${dirText}</span>
+      </div></div>
+    <div class="stat"><div class="stat-label">切片总数</div>
+      <div class="stat-value">${cmp.chunk_before || 0} → ${cmp.chunk_after || 0}
+        ${chunkDelta !== 0 ? `<span class="pill bad" style="font-size:0.7rem;vertical-align:middle">${chunkDelta > 0 ? "+" : ""}${chunkDelta}</span>` : ""}
       </div></div>
   </div>`;
 
@@ -656,12 +947,28 @@ function renderComparison(cmp) {
   }
 
   if (!cmp.by_detector.length && !cmp.by_case.length) {
-    html += `<p class="hint" style="margin:0">与基线完全一致，无任何指标变化。</p>`;
+    html += `<p class="hint" style="margin:0">两轮结果完全一致，无任何指标变化。</p>`;
   }
 
   $("cmpBody").innerHTML = html;
-  $("cmpCard").style.display = "";
 }
+
+// 手动对比：读取两个选择器的轮次并请求对比
+$("btnCompare").addEventListener("click", async () => {
+  const a = $("cmpA").value, b = $("cmpB").value;
+  // 同一轮自比没有意义，直接提示而不发请求
+  if (a === b) return toast("两侧是同一轮次，请选不同的轮次");
+  const btn = $("btnCompare");
+  btn.disabled = true;
+  try {
+    const data = await api(`/api/compare?a=${encodeURIComponent(a)}&b=${encodeURIComponent(b)}`);
+    renderComparison(data.comparison);
+  } catch (e) {
+    toast("对比失败：" + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 // ========== 语料库 ==========
 async function loadCorpus() {
@@ -934,16 +1241,18 @@ $("btnImport").addEventListener("click", async () => {
   try {
     const b = await api("/api/baseline");
     if (b.exists) {
-      // 用与本轮结果相同的渲染函数，仅以 isBaseline 标记区分语义
-      renderOverview(b, null, true);
+      // 未设定基准时接口会回落到最新一轮，用 is_baseline 区分两种情形
+      renderOverview(b, null, b.is_baseline ? "baseline" : "history");
     } else {
-      // 尚无基线时给出明确的下一步指引
-      $("evalHint").textContent = "尚无基线。点右上角「运行评估」跑一轮，再点「设为基线」建立对比基准。";
+      // 尚无任何历史时给出明确的下一步指引
+      $("evalHint").textContent = "尚无历史轮次。点右上角「运行评估」跑第一轮。";
     }
   } catch (e) {
     // 接口异常不应让页面停在“加载中”，明确提示失败原因
-    $("evalHint").textContent = "加载基线失败：" + e.message;
+    $("evalHint").textContent = "加载失败：" + e.message;
   }
+  // 加载历史轮次，驱动对比选择器、趋势图与历史表格
+  await loadRuns();
 })();
 </script>
 </body>
