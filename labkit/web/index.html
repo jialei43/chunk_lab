@@ -245,6 +245,13 @@ input[type="text"], input[type="number"], select {
 .warn-box ul { margin: 0; padding-left: 1.1rem; }
 .warn-box li { font-size: 0.84rem; color: var(--ink-soft); line-height: 1.6; }
 
+/* 卡片标题上的轮次标识：滚动到页面下方时仍能看出数据属于哪一轮 */
+.run-tag {
+  font-family: var(--mono); font-size: 0.7rem; font-weight: 400;
+  color: var(--accent); background: var(--accent-soft);
+  padding: 0.1rem 0.4rem; border-radius: 3px; text-transform: none; letter-spacing: 0;
+}
+
 /* 切片预览的数据来源选择：实时切分 vs 历史快照 */
 .src-bar { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; font-size: 0.82rem; color: var(--muted); margin-bottom: 0.7rem; }
 
@@ -420,6 +427,10 @@ tr.is-baseline { background: var(--accent-soft); }
         <span id="overviewTitle">本轮结果</span>
         <span id="overviewBadge"></span>
       </h3>
+      <div class="src-bar" style="margin-bottom:0.9rem">
+        <label>查看轮次 <select id="viewRun"></select></label>
+        <span class="hint" id="viewRunHint"></span>
+      </div>
       <div class="stat-row" id="statRow">
         <div class="stat"><div class="stat-label">语料</div><div class="stat-value">—</div></div>
         <div class="stat"><div class="stat-label">切片</div><div class="stat-value">—</div></div>
@@ -460,12 +471,12 @@ tr.is-baseline { background: var(--accent-soft); }
     </div>
 
     <div class="card" id="distCard" style="display:none">
-      <h3>问题分布</h3>
+      <h3>问题分布 <span class="run-tag" id="distRunTag"></span></h3>
       <div class="bars" id="distBars"></div>
     </div>
 
     <div class="card" id="caseCard" style="display:none">
-      <h3>逐样本 · 点样本名看全部切片，点问题类型只看该类问题</h3>
+      <h3>逐样本 <span class="run-tag" id="caseRunTag"></span> · 点样本名看全部切片，点问题类型只看该类问题</h3>
       <div class="table-wrap">
         <table>
           <thead><tr><th>样本</th><th>类型</th><th class="num">原始块</th><th class="num">切片</th><th class="num">问题</th><th>问题类型（可点击）</th></tr></thead>
@@ -654,10 +665,10 @@ $("btnEval").addEventListener("click", async () => {
       body: JSON.stringify({ ...runParams(), compare: true }),
     });
     lastReport = data.report;
+    // 先刷新历史列表，使新轮次出现在选择器中，随后渲染才能正确选中它
+    await loadRuns();
     // 显式标记为本轮数据，使标题与提示切换回「本轮结果」
     renderOverview(data.report, data.comparison, "current");
-    // 刷新历史列表，使新轮次立即出现在选择器与趋势图中
-    await loadRuns();
     toast(`评估完成：${data.report.finding_total} 条问题`);
   } catch (e) {
     toast("评估失败：" + e.message);
@@ -701,6 +712,23 @@ function renderOverview(report, comparison, source) {
   const rid = report.run_id ? `<span class="mono hint">${esc(report.run_id)}</span>` : "";
   const lbl = report.label ? `<span class="hint"> · ${esc(report.label)}</span>` : "";
   $("overviewBadge").innerHTML = meta.badge + " " + rid + lbl;
+
+  // 下方的问题分布与逐样本表同属这一轮，但滚动后看不到顶部标识，
+  // 因此在各自标题上重复标注轮次，避免把某一轮的数据误读成另一轮的。
+  const tag = report.run_id
+    ? `${report.run_id}${report.label ? " · " + report.label : ""}`
+    : (report.generated_at || "").replace("T", " ").slice(0, 19);
+  $("distRunTag").textContent = tag;
+  $("caseRunTag").textContent = tag;
+  // 同步查看轮次选择器的选中项，并标注该轮相对最新轮的位置。
+  // 统一在此处理，避免各调用点各写一遍而漏改。
+  if (report.run_id && runsCache.length) {
+    $("viewRun").value = report.run_id;
+    const isLatest = runsCache[0].run_id === report.run_id;
+    $("viewRunHint").textContent = isLatest
+      ? "（最新一轮）"
+      : `（非最新，最新是 ${runsCache[0].run_id}）`;
+  }
   // 顶部三个总量指标
   $("statRow").innerHTML = `
     <div class="stat"><div class="stat-label">语料</div><div class="stat-value">${report.case_count}</div></div>
@@ -808,6 +836,14 @@ function renderRunPickers() {
   else if (runsCache.length) $("cmpA").value = runsCache[runsCache.length - 1].run_id;
   // 对比侧选最新一轮
   if (runsCache.length) $("cmpB").value = runsCache[0].run_id;
+
+  // 概览的「查看轮次」选择器：默认最新一轮。
+  // 此前默认展示基准轮，而基准可能很旧，容易被误当成最新数据。
+  $("viewRun").innerHTML = runsCache.map(r => {
+    const mark = r.run_id === baselineId ? "★ " : "";
+    const label = r.label ? ` · ${r.label}` : "";
+    return `<option value="${esc(r.run_id)}">${mark}${esc(r.run_id)}${esc(label)}</option>`;
+  }).join("");
   // 只有一轮时无从对比，禁用按钮并说明原因
   const few = runsCache.length < 2;
   $("btnCompare").disabled = few;
@@ -1219,6 +1255,19 @@ function renderComparison(cmp) {
   $("cmpBody").innerHTML = html;
 }
 
+// 切换查看的轮次：概览区整体改为展示该轮数据
+$("viewRun").addEventListener("change", async () => {
+  const runId = $("viewRun").value;
+  if (!runId) return;
+  try {
+    const r = await api(`/api/runs/${runId}`);
+    // 区分是基准轮还是普通历史轮，标题据此变化
+    renderOverview(r, null, r.run_id === baselineId ? "baseline" : "history");
+  } catch (e) {
+    toast("加载失败：" + e.message);
+  }
+});
+
 // 手动对比：读取两个选择器的轮次并请求对比
 $("btnCompare").addEventListener("click", async () => {
   const a = $("cmpA").value, b = $("cmpB").value;
@@ -1606,11 +1655,15 @@ $("btnImport").addEventListener("click", async () => {
   // 必须先取语料列表：渲染逐样本表时要靠它回填中文名，
   // 顺序反了旧基线就只剩英文 case_id。
   try { corpusCache = await api("/api/corpus"); } catch (e) { /* 预取失败不阻塞，进入对应页面时会重试 */ }
+  // 先加载历史轮次，它同时驱动查看选择器、对比选择器、趋势图与历史表格
+  await loadRuns();
   try {
-    const b = await api("/api/baseline");
-    if (b.exists) {
-      // 未设定基准时接口会回落到最新一轮，用 is_baseline 区分两种情形
-      renderOverview(b, null, b.is_baseline ? "baseline" : "history");
+    // 默认展示最新一轮。此前默认展示基准轮，而基准可能是很旧的一次，
+    // 打开页面看到旧数据却以为是最新结果，是个隐蔽但要命的误导。
+    if (runsCache.length) {
+      const latest = runsCache[0];
+      const r = await api(`/api/runs/${latest.run_id}`);
+      renderOverview(r, null, r.run_id === baselineId ? "baseline" : "history");
     } else {
       // 尚无任何历史时给出明确的下一步指引
       $("evalHint").textContent = "尚无历史轮次。点右上角「运行评估」跑第一轮。";
@@ -1619,8 +1672,6 @@ $("btnImport").addEventListener("click", async () => {
     // 接口异常不应让页面停在“加载中”，明确提示失败原因
     $("evalHint").textContent = "加载失败：" + e.message;
   }
-  // 加载历史轮次，驱动对比选择器、趋势图与历史表格
-  await loadRuns();
 })();
 </script>
 </body>
