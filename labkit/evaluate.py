@@ -321,6 +321,70 @@ def compare_reports(baseline, current):
     }
 
 
+def _finding_identity(case_id, finding):
+    """给一条问题生成跨轮次稳定的身份标识。
+
+    不能用 chunk_index：切分逻辑一改，序号整体错位，同一个问题会被算成
+    「旧的消失了 + 新的出现了」，差异列表里全是噪声。
+    证据文本取自原文片段，切分边界变动时它基本不变，是更可靠的身份。
+    证据为空时才回落到序号，此时精度有限但总比没有强。
+    """
+    # 取证据文本并去除首尾空白
+    ev = (finding.get("evidence") or "").strip()
+    # 有证据时用「样本 + 检测器 + 证据」作为身份
+    if ev:
+        return (case_id, finding.get("detector"), ev)
+    # 无证据时回落到序号，并显式标记以便调用方知道匹配可能不准
+    return (case_id, finding.get("detector"), f"#idx{finding.get('chunk_index')}")
+
+
+def diff_findings(before, after, detector=None, case_id=None):
+    """列出两轮之间具体新增与消失的问题条目。
+
+    这是从「+6」下钻到「是哪 6 条」的关键：只给变化量而不能定位到具体条目，
+    就无法按问题着手修复。
+    """
+    # 把一轮报告展开成 身份 -> 条目 的映射
+    def index_of(report):
+        # 收集该轮的全部问题条目
+        out = {}
+        # 逐样本遍历
+        for case in report.get("cases", []):
+            # 指定样本时只看该样本
+            cid = case.get("case_id")
+            if case_id and cid != case_id:
+                continue
+            # 逐条问题
+            for f in case.get("findings", []):
+                # 指定检测器时只看该类问题
+                if detector and f.get("detector") != detector:
+                    continue
+                # 以稳定身份为键；同一身份重复出现时保留首条即可
+                out.setdefault(_finding_identity(cid, f), {**f, "case_id": cid})
+        # 返回映射
+        return out
+
+    # 分别建立两轮的索引
+    idx_a, idx_b = index_of(before), index_of(after)
+    # B 有而 A 没有的是新增问题
+    added = [idx_b[k] for k in idx_b.keys() - idx_a.keys()]
+    # A 有而 B 没有的是已消失的问题
+    removed = [idx_a[k] for k in idx_a.keys() - idx_b.keys()]
+    # 按样本与序号排序，便于顺序阅读
+    added.sort(key=lambda f: (f.get("case_id", ""), f.get("chunk_index", 0)))
+    removed.sort(key=lambda f: (f.get("case_id", ""), f.get("chunk_index", 0)))
+    # 返回差异结果
+    return {
+        "detector": detector or "",  # 本次下钻的检测器
+        "case_id": case_id or "",  # 本次下钻的样本
+        "added": added,  # 新增的问题条目
+        "removed": removed,  # 消失的问题条目
+        "added_count": len(added),  # 新增数量
+        "removed_count": len(removed),  # 消失数量
+        "net": len(added) - len(removed),  # 净变化，应与对比表中的 delta 一致
+    }
+
+
 def format_comparison(cmp):
     """把比较结果渲染成终端文本，劣化项显式标注以便一眼看见。"""
     # 逐行累积

@@ -232,6 +232,43 @@ input[type="text"], input[type="number"], select {
 .warn-box ul { margin: 0; padding-left: 1.1rem; }
 .warn-box li { font-size: 0.84rem; color: var(--ink-soft); line-height: 1.6; }
 
+/* ========== 差异下钻面板 ========== */
+.diff-box {
+  margin-top: 1rem; padding-top: 1rem; border-top: 1px dashed var(--line);
+}
+.diff-head { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; font-size: 0.88rem; margin-bottom: 0.8rem; }
+.diff-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr)); gap: 1.2rem; }
+.diff-col-title {
+  font-size: 0.78rem; font-weight: 600; padding-bottom: 0.4rem;
+  border-bottom: 1px solid var(--line); margin-bottom: 0.5rem;
+}
+.diff-col-title.bad { color: var(--bad); }
+.diff-col-title.good { color: var(--good); }
+
+/* 单条差异：左边框颜色区分新增与消失 */
+.diff-item {
+  padding: 0.5rem 0.7rem; margin-bottom: 0.4rem; border-radius: 4px;
+  background: var(--sunk); border-left: 2px solid var(--line-strong);
+}
+.diff-item.add { border-left-color: var(--bad); }
+.diff-item.del { border-left-color: var(--good); }
+/* 定位按钮：点击跳到切片预览并按该类问题筛选 */
+.diff-loc {
+  background: none; border: none; padding: 0; color: var(--accent);
+  font-family: var(--mono); font-size: 0.76rem; font-weight: 600;
+}
+.diff-loc:hover { text-decoration: underline; }
+.diff-msg { font-size: 0.8rem; color: var(--ink-soft); margin-top: 0.15rem; }
+.diff-ev {
+  font-family: var(--mono); font-size: 0.74rem; color: var(--muted);
+  margin-top: 0.25rem; word-break: break-word; line-height: 1.5;
+}
+
+/* 可下钻的变化量徽标 */
+button.pill.drill { cursor: pointer; border: none; font-family: var(--sans); }
+button.pill.drill:hover { filter: brightness(0.94); text-decoration: underline; }
+button.pill.drill:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
 /* ========== 历史轮次表 ========== */
 tr.is-baseline { background: var(--accent-soft); }
 .dirty { color: var(--bad); font-weight: 700; }
@@ -365,6 +402,7 @@ tr.is-baseline { background: var(--accent-soft); }
         <span class="hint" id="cmpHint">任选两轮进行对比，不必总以基线为准</span>
       </div>
       <div id="cmpBody" style="margin-top:1rem"></div>
+      <div id="diffBox" class="diff-box" style="display:none"></div>
     </div>
 
     <div class="card" id="trendCard" style="display:none">
@@ -818,6 +856,8 @@ function renderTrend() {
   }
   // 历史按时间倒序存储，绘图需要正序
   const series = [...runsCache].reverse();
+  // 趋势展示的是首轮到最新轮的变化，下钻必须比这两轮
+  const firstId = series[0].run_id, lastId = series[series.length - 1].run_id;
   // 收集出现过的全部检测器
   const names = new Set();
   series.forEach(r => Object.keys(r.totals_by_detector || {}).forEach(n => names.add(n)));
@@ -827,8 +867,10 @@ function renderTrend() {
   let html = `<div class="trend-row head">
     <div class="trend-name">总问题数</div>
     ${sparkline(totals, "accent")}
-    <div class="trend-val">${totals[0]} → <strong>${totals[totals.length - 1]}</strong> ${deltaTag(totals[totals.length - 1] - totals[0])}</div>
+    <div class="trend-val">${totals[0]} → <strong>${totals[totals.length - 1]}</strong> ${deltaTag(totals[totals.length - 1] - totals[0], "", firstId, lastId)}</div>
   </div>`;
+  // 说明趋势跨越的区间，避免误以为是与基准对比
+  html = `<p class="hint" style="margin:0 0 0.8rem">从 <span class="mono">${esc(firstId)}</span> 到 <span class="mono">${esc(lastId)}</span> 共 ${series.length} 轮。点变化量可查看具体差异。</p>` + html;
 
   // 逐检测器的走势，按最新一轮的数量降序
   html += [...names].map(name => {
@@ -839,7 +881,7 @@ function renderTrend() {
     return `<div class="trend-row">
       <div class="trend-name">${esc(detCn(name))}</div>
       ${sparkline(vals, detSev(name))}
-      <div class="trend-val">${vals[0]} → <strong>${vals[vals.length - 1]}</strong> ${deltaTag(d)}</div>
+      <div class="trend-val">${vals[0]} → <strong>${vals[vals.length - 1]}</strong> ${deltaTag(d, name, firstId, lastId)}</div>
     </div>`;
   }).join("");
 
@@ -866,19 +908,102 @@ function sparkline(vals, tone) {
   </svg>`;
 }
 
-// 变化量徽标：减少是改善，增加是劣化
-function deltaTag(d) {
+// 变化量徽标：减少是改善，增加是劣化。
+// det 非空时徽标可点击，点开即列出该类问题具体新增/消失了哪些条目——
+// 只给变化量而不能定位到条目，就无法按问题着手修复。
+// a/b 指定下钻时比较哪两轮：趋势比的是首末轮，对比表比的是选中的两轮，二者不能混用。
+function deltaTag(d, det, a, b) {
   if (d === 0) return `<span class="pill low">持平</span>`;
-  return `<span class="pill ${d < 0 ? "good" : "bad"}">${d > 0 ? "+" : ""}${d}</span>`;
+  const cls = d < 0 ? "good" : "bad";
+  const txt = `${d > 0 ? "+" : ""}${d}`;
+  if (det === undefined || det === null) return `<span class="pill ${cls}">${txt}</span>`;
+  return `<button class="pill ${cls} drill" data-det="${esc(det)}"
+    ${a ? `data-a="${esc(a)}"` : ""} ${b ? `data-b="${esc(b)}"` : ""}
+    title="查看具体是哪些条目">${txt} ›</button>`;
 }
+
+// ========== 差异下钻 ==========
+// 记录当前对比的两轮，供下钻时复用
+let diffA = "", diffB = "";
+
+// 展开某个检测器在两轮之间的具体差异
+async function showDiff(detector, caseId, a, b) {
+  // 优先使用按钮指定的轮次，未指定时回落到当前对比的两轮
+  const refA = a || diffA, refB = b || diffB;
+  // 未确定对比轮次时无从下钻
+  if (!refA || !refB) return toast("请先选择两轮进行对比");
+  const box = $("diffBox");
+  box.style.display = "";
+  box.innerHTML = `<div class="empty"><span class="spin"></span> 正在比对…</div>`;
+  try {
+    const q = new URLSearchParams({ a: refA, b: refB, detector: detector || "" });
+    if (caseId) q.set("case", caseId);
+    const d = (await api(`/api/diff?${q}`)).diff;
+    renderDiff(d);
+  } catch (e) {
+    box.innerHTML = `<div class="empty" style="color:var(--bad)">比对失败：${esc(e.message)}</div>`;
+  }
+}
+
+// 渲染差异明细：新增与消失分列，每条可点击跳到切片预览定位
+function renderDiff(d) {
+  // 单条目的渲染，dir 决定配色与符号
+  const item = (f, dir) => `
+    <div class="diff-item ${dir}">
+      <button class="diff-loc" data-case="${esc(f.case_id)}" data-det="${esc(f.detector)}"
+              title="到切片预览中查看">${esc(f.case_id)} #${f.chunk_index}</button>
+      <div class="diff-msg">${esc(f.message || "")}</div>
+      ${f.evidence ? `<div class="diff-ev">${esc(f.evidence.slice(0, 120))}</div>` : ""}
+    </div>`;
+
+  const title = d.detector ? detCn(d.detector) : "全部问题";
+  $("diffBox").innerHTML = `
+    <div class="diff-head">
+      <strong>${esc(title)}</strong> 的具体差异
+      <span class="pill bad">新增 ${d.added_count}</span>
+      <span class="pill good">消失 ${d.removed_count}</span>
+      <span class="hint">净变化 ${d.net > 0 ? "+" : ""}${d.net}</span>
+      <button class="mini" id="diffClose">收起</button>
+    </div>
+    <div class="diff-cols">
+      <div>
+        <div class="diff-col-title bad">新增 ${d.added_count} 条（这些是变差的）</div>
+        ${d.added.length ? d.added.map(f => item(f, "add")).join("") : '<div class="hint" style="padding:0.5rem 0">无</div>'}
+      </div>
+      <div>
+        <div class="diff-col-title good">消失 ${d.removed_count} 条（这些是修好的）</div>
+        ${d.removed.length ? d.removed.map(f => item(f, "del")).join("") : '<div class="hint" style="padding:0.5rem 0">无</div>'}
+      </div>
+    </div>`;
+  // 收起按钮
+  $("diffClose").addEventListener("click", () => { $("diffBox").style.display = "none"; });
+  // 点条目跳到切片预览，并按该检测器筛选
+  $("diffBox").querySelectorAll(".diff-loc").forEach(btn => {
+    btn.addEventListener("click", () => gotoChunks(btn.dataset.case, btn.dataset.det));
+  });
+  // 滚动到差异区，避免展开在视野外
+  $("diffBox").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+// 事件委托：概览页内所有下钻徽标共用同一个处理器
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest(".drill");
+  if (btn) showDiff(btn.dataset.det, btn.dataset.case || "", btn.dataset.a, btn.dataset.b);
+});
 
 // ========== 对比渲染 ==========
 function renderComparison(cmp) {
   // 无对比数据时清空该区块内容，但保留选择器供手动对比
   if (!cmp) {
     $("cmpBody").innerHTML = "";
+    $("diffBox").style.display = "none";
     return;
   }
+  // 记录当前对比的两轮，供对比表内的下钻按钮使用
+  diffA = cmp.baseline_run_id || "";
+  diffB = cmp.current_run_id || "";
+  // 切换对比对象时收起上一次的差异面板，避免新旧数据混淆
+  $("diffBox").style.display = "none";
   const delta = cmp.finding_after - cmp.finding_before;
   // 命中减少是改善，增加是劣化
   const dirText = delta < 0 ? "改善" : (delta > 0 ? "劣化" : "持平");
@@ -923,7 +1048,8 @@ function renderComparison(cmp) {
     cmp.by_detector.sort((a, b) => b.delta - a.delta).forEach(d => {
       const c = d.delta > 0 ? "delta-up" : "delta-down";
       html += `<tr><td>${esc(detCn(d.detector))}</td><td class="num">${d.before}</td><td class="num">${d.after}</td>
-        <td class="num ${c}">${d.delta > 0 ? "+" : ""}${d.delta}</td></tr>`;
+        <td class="num ${c}"><button class="pill ${d.delta > 0 ? "bad" : "good"} drill" data-det="${esc(d.detector)}"
+            title="查看具体是哪些条目">${d.delta > 0 ? "+" : ""}${d.delta} ›</button></td></tr>`;
     });
     html += `</tbody></table></div>`;
   }
@@ -935,10 +1061,15 @@ function renderComparison(cmp) {
     cmp.by_case.forEach(c => {
       const fd = c.finding_after - c.finding_before;
       const cd = c.chunk_after - c.chunk_before;
+      // 命中数有变化时提供下钻入口，定位到该样本具体新增/消失了哪些问题
+      const fdCell = fd === 0
+        ? `<td class="num">—</td>`
+        : `<td class="num"><button class="pill ${fd > 0 ? "bad" : "good"} drill" data-det="" data-case="${esc(c.case_id)}"
+             title="查看该样本具体是哪些条目">${fd > 0 ? "+" : ""}${fd} ›</button></td>`;
       html += `<tr>
         <td>${esc(c.case_id)}</td>
         <td class="num">${c.finding_before}→${c.finding_after}</td>
-        <td class="num ${fd > 0 ? "delta-up" : (fd < 0 ? "delta-down" : "")}">${fd > 0 ? "+" : ""}${fd || "—"}</td>
+        ${fdCell}
         <td class="num">${c.chunk_before}→${c.chunk_after}</td>
         <td class="num ${cd !== 0 ? "delta-up" : ""}">${cd > 0 ? "+" : ""}${cd || "—"}</td>
       </tr>`;

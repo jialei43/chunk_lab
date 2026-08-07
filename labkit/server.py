@@ -14,7 +14,7 @@ from flask import Flask, jsonify, request, send_from_directory  # 导入 Flask �
 from . import runs  # 导入运行历史模块，负责轮次快照与基准指针
 from .detectors import DetectorConfig  # 导入检测阈值配置
 from .discover import scan_products  # 导入本机产物扫描
-from .evaluate import compare_reports, evaluate_all, inspect_case, load_cases  # 导入评估相关能力
+from .evaluate import compare_reports, diff_findings, evaluate_all, inspect_case, load_cases  # 导入评估相关能力
 from .ingest import ingest_from_path  # 导入按路径导入语料的能力
 
 # 前端静态文件目录
@@ -235,6 +235,27 @@ def api_compare():
         return jsonify({"ok": False, "message": "两侧是同一轮次，无法对比"}), 400
     # 返回对比结果
     return jsonify({"ok": True, "comparison": compare_reports(a, b)})
+
+
+@app.get("/api/diff")
+def api_diff():
+    """下钻两轮之间的具体差异：哪些问题是新增的，哪些消失了。
+
+    对比只给出「+6」这样的变化量，无法据此修复；本接口回答「是哪 6 条」。
+    """
+    # 解析基准轮次
+    a = runs.resolve_run(request.args.get("a") or "baseline")
+    # 解析对比对象
+    b = runs.resolve_run(request.args.get("b") or "latest")
+    # 任一不存在都无法比较
+    if a is None or b is None:
+        return jsonify({"ok": False, "message": "指定的轮次不存在"}), 404
+    # 可按检测器与样本进一步收窄范围
+    detector = request.args.get("detector") or None
+    # 样本筛选
+    case_id = request.args.get("case") or None
+    # 计算差异并返回
+    return jsonify({"ok": True, "diff": diff_findings(a, b, detector=detector, case_id=case_id)})
 
 
 @app.post("/api/baseline")
