@@ -245,6 +245,9 @@ input[type="text"], input[type="number"], select {
 .warn-box ul { margin: 0; padding-left: 1.1rem; }
 .warn-box li { font-size: 0.84rem; color: var(--ink-soft); line-height: 1.6; }
 
+/* 切片预览的数据来源选择：实时切分 vs 历史快照 */
+.src-bar { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; font-size: 0.82rem; color: var(--muted); margin-bottom: 0.7rem; }
+
 /* ========== 差异下钻面板 ========== */
 .diff-box {
   margin-top: 1rem; padding-top: 1rem; border-top: 1px dashed var(--line);
@@ -276,6 +279,26 @@ input[type="text"], input[type="number"], select {
   font-family: var(--mono); font-size: 0.74rem; color: var(--muted);
   margin-top: 0.25rem; word-break: break-word; line-height: 1.5;
 }
+
+/* ========== 文本级差异：并排展示切分内容的变化 ========== */
+.tdiff-item { margin-bottom: 0.9rem; }
+.tdiff-label { font-size: 0.78rem; color: var(--muted); margin-bottom: 0.3rem; }
+.tdiff-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr)); gap: 0.6rem; }
+.tdiff-side {
+  border: 1px solid var(--line); border-radius: 4px;
+  padding: 0.55rem 0.7rem; background: var(--surface); overflow-x: auto;
+}
+.tdiff-side.del { border-left: 2px solid var(--good); }
+.tdiff-side.add { border-left: 2px solid var(--bad); }
+.tdiff-tag { font-size: 0.7rem; font-family: var(--mono); color: var(--muted); margin-bottom: 0.3rem; }
+.tdiff-text {
+  font-size: 0.8rem; line-height: 1.65; white-space: pre-wrap;
+  word-break: break-word; max-height: 16rem; overflow-y: auto;
+}
+/* 只高亮真正变化的片段，公共前后缀保持常色以免淹没差异 */
+.tdiff-text mark { border-radius: 2px; padding: 0 0.12em; }
+.tdiff-text mark.del { background: var(--good-soft); color: var(--good); }
+.tdiff-text mark.add { background: var(--bad-soft); color: var(--bad); }
 
 /* 可下钻的变化量徽标 */
 button.pill.drill { cursor: pointer; border: none; font-family: var(--sans); }
@@ -511,6 +534,7 @@ let currentCaseData = null; // 当前样本的切片数据，切换筛选时复�
 let chunkFilter = "";       // 切片预览的检测器筛选，空串表示不筛选
 let runsCache = [];         // 历史轮次摘要，按时间倒序
 let baselineId = "";        // 当前作为对比基准的轮次标识
+let viewingRun = "";        // 切片预览查看的历史轮次，空串表示用当前代码实时切分
 
 // 检测器的中文短名与严重度。英文标识便于代码检索，但表格里必须给中文，
 // 否则一眼看不出是哪类问题，也就无从按类型着手修复。
@@ -1017,7 +1041,90 @@ function renderDiff(d) {
 document.addEventListener("click", (e) => {
   const btn = e.target.closest(".drill");
   if (btn) showDiff(btn.dataset.det, btn.dataset.case || "", btn.dataset.a, btn.dataset.b);
+  // 文本变化入口
+  const td = e.target.closest("[data-textdiff]");
+  if (td) showChunkDiff(td.dataset.textdiff);
 });
+
+// ========== 文本级差异：看切分边界到底怎么变的 ==========
+// 问题数只能说明「多了几条截断」，文本对比才能说明「这一段的边界从哪挪到了哪」。
+// 依赖每轮保存的切分文本快照——代码一改，旧结果就无法用当前代码重现。
+async function showChunkDiff(caseId) {
+  if (!diffA || !diffB) return toast("请先选择两轮进行对比");
+  const box = $("diffBox");
+  box.style.display = "";
+  box.innerHTML = `<div class="empty"><span class="spin"></span> 正在比对切分文本…</div>`;
+  try {
+    const q = new URLSearchParams({ a: diffA, b: diffB, case: caseId });
+    const d = await api(`/api/chunkdiff?${q}`);
+    renderChunkDiff(d);
+  } catch (e) {
+    // 旧轮次没有文本快照是常见情形，如实说明原因与解决办法
+    box.innerHTML = `<div class="diff-head"><strong>${esc(caseId)}</strong> 的切分文本对比
+      <button class="mini" onclick="document.getElementById('diffBox').style.display='none'">收起</button></div>
+      <div class="empty" style="color:var(--warn)">${esc(e.message)}<br>
+      <span class="hint">重新跑一轮评估即可为该轮生成文本快照。</span></div>`;
+  }
+}
+
+// 剥离公共前后缀，只高亮真正变化的中间部分。
+// 切分边界变化时两侧往往共享大段内容，全量标红会淹没真正的差异。
+function highlightPair(before, after) {
+  let s = 0;
+  // 找公共前缀长度
+  while (s < before.length && s < after.length && before[s] === after[s]) s++;
+  let e = 0;
+  // 找公共后缀长度，注意不与前缀重叠
+  while (e < before.length - s && e < after.length - s &&
+         before[before.length - 1 - e] === after[after.length - 1 - e]) e++;
+  // 拆成三段并对中间段加标记
+  const wrap = (txt, cls) => {
+    const head = esc(txt.slice(0, s));
+    const mid = esc(txt.slice(s, txt.length - e));
+    const tail = esc(txt.slice(txt.length - e));
+    return head + (mid ? `<mark class="${cls}">${mid}</mark>` : "") + tail;
+  };
+  return [wrap(before, "del"), wrap(after, "add")];
+}
+
+// 渲染文本差异：未变化的折叠为计数，变化的并排展示
+function renderChunkDiff(d) {
+  const q = d.diff;
+  // 逐条渲染变化
+  const items = q.changed.map(c => {
+    // 修改类：并排展示并高亮差异部分
+    if (c.kind === "modified") {
+      const [b, a] = highlightPair(c.before, c.after);
+      return `<div class="tdiff-item">
+        <div class="tdiff-label">修改　<span class="mono">#${c.before_index} → #${c.after_index}</span></div>
+        <div class="tdiff-cols">
+          <div class="tdiff-side del"><div class="tdiff-tag">变化前</div><div class="tdiff-text">${b}</div></div>
+          <div class="tdiff-side add"><div class="tdiff-tag">变化后</div><div class="tdiff-text">${a}</div></div>
+        </div></div>`;
+    }
+    // 新增或删除类：单侧展示
+    const isAdd = c.kind === "added";
+    return `<div class="tdiff-item">
+      <div class="tdiff-label">${isAdd ? "新增切片" : "切片消失"}　<span class="mono">#${isAdd ? c.after_index : c.before_index}</span></div>
+      <div class="tdiff-side ${isAdd ? "add" : "del"}">
+        <div class="tdiff-text">${esc(isAdd ? c.after : c.before)}</div>
+      </div></div>`;
+  }).join("");
+
+  $("diffBox").innerHTML = `
+    <div class="diff-head">
+      <strong>${esc(d.case_id)}</strong> 的切分文本对比
+      <span class="mono hint">${esc(d.a.run_id)} → ${esc(d.b.run_id)}</span>
+      <span class="pill low">切片 ${q.count_a} → ${q.count_b}</span>
+      <span class="pill good">内容未变 ${q.unchanged}</span>
+      <span class="pill bad">变化 ${q.changed_total}</span>
+      <button class="mini" id="diffClose">收起</button>
+    </div>
+    ${q.truncated ? `<p class="hint" style="color:var(--warn)">变化过多，仅展示前 ${q.changed.length} 条。</p>` : ""}
+    ${items || '<div class="hint">两轮的切分文本完全一致。</div>'}`;
+  $("diffClose").addEventListener("click", () => { $("diffBox").style.display = "none"; });
+  $("diffBox").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
 
 // ========== 对比渲染 ==========
 function renderComparison(cmp) {
@@ -1085,7 +1192,7 @@ function renderComparison(cmp) {
   // 逐样本的升降；切片数变化单列，用于捕捉「问题数不变但粒度剧变」的回归
   if (cmp.by_case.length) {
     html += `<h3 style="margin-top:1.2rem">按样本</h3><div class="table-wrap"><table>
-      <thead><tr><th>样本</th><th class="num">问题</th><th class="num">变化</th><th class="num">切片</th><th class="num">变化</th></tr></thead><tbody>`;
+      <thead><tr><th>样本</th><th class="num">问题</th><th class="num">变化</th><th class="num">切片</th><th class="num">变化</th><th>切分内容</th></tr></thead><tbody>`;
     cmp.by_case.forEach(c => {
       const fd = c.finding_after - c.finding_before;
       const cd = c.chunk_after - c.chunk_before;
@@ -1100,7 +1207,7 @@ function renderComparison(cmp) {
         ${fdCell}
         <td class="num">${c.chunk_before}→${c.chunk_after}</td>
         <td class="num ${cd !== 0 ? "delta-up" : ""}">${cd > 0 ? "+" : ""}${cd || "—"}</td>
-      </tr>`;
+        <td><button class="mini" data-textdiff="${esc(c.case_id)}">看文本变化</button></td>`;
     });
     html += `</tbody></table></div>`;
   }
@@ -1232,6 +1339,24 @@ async function selectCase(caseId, target) {
   $("chunkMeta").innerHTML = `<p class="hint" style="margin:0">${esc(caseId)}　切分中…</p>`;
 
   try {
+    // 选了历史轮次时读取那一轮存下来的切分文本，而非用当前代码重新切分。
+    // 代码改动后两者结果不同，历史快照才是那一轮的真实结果。
+    if (viewingRun) {
+      const h = await api(`/api/runs/${viewingRun}/chunks/${encodeURIComponent(caseId)}`);
+      // 历史快照没有 findings 关联，补空数组以复用同一套渲染
+      currentCaseData = {
+        case_id: caseId,
+        filename: (corpusCache.find(c => c.case_id === caseId) || {}).filename || caseId,
+        chunk_count: h.chunks.length,
+        finding_count: 0,
+        chunks: h.chunks.map(c => ({ ...c, content_len: (c.content || "").length, findings: [], has_image: false })),
+        _usedConfig: h.config || {},
+        _isHistory: true,
+      };
+      renderChunkView();
+      if (target) scrollToChunk(target);
+      return;
+    }
     // 有定位目标时优先用该条目所属轮次的参数，保证序号可比；否则用顶栏当前参数
     const p = (target && target.config) ? {
       chunk_token_num: target.config.chunk_token_num ?? runParams().chunk_token_num,
@@ -1288,6 +1413,22 @@ function renderChunkView() {
     ? `<p class="hint" style="margin:0.7rem 0 0;color:var(--warn)">本次按该问题所属轮次的参数切分（token=${used.chunk_token_num}，子分隔符=${JSON.stringify(used.children_delimiter || "")}），与顶栏当前参数不同，以保证序号能对上。</p>`
     : "";
 
+  // 数据来源选择：实时切分用的是当前代码，历史轮次是那一轮当时的真实结果。
+  // 代码改动后两者会不同，这正是需要保留文本快照的原因。
+  const srcOpts = runsCache.filter(r => r.has_chunks).map(r =>
+    `<option value="${esc(r.run_id)}" ${viewingRun === r.run_id ? "selected" : ""}>${esc(r.run_id)}${r.label ? " · " + esc(r.label) : ""}</option>`
+  ).join("");
+  const sourceBar = `
+    <div class="src-bar">
+      <label>查看：
+        <select id="chunkSource">
+          <option value="" ${!viewingRun ? "selected" : ""}>实时切分（当前代码）</option>
+          ${srcOpts}
+        </select>
+      </label>
+      ${viewingRun ? `<span class="pill low">历史快照，非实时结果</span>` : ""}
+    </div>`;
+
   // 筛选工具栏：全部 + 各问题类型
   const filterBar = `
     <div class="filter-bar">
@@ -1304,6 +1445,7 @@ function renderChunkView() {
       <div class="stat"><div class="stat-label">切片</div><div class="stat-value">${data.chunk_count}</div></div>
       <div class="stat"><div class="stat-label">问题</div><div class="stat-value">${data.finding_count}</div></div>
     </div>
+    ${sourceBar}
     ${filterBar}
     ${chunkFilter ? `<p class="hint" style="margin:0.7rem 0 0">正在只看「${esc(detCn(chunkFilter))}」：${shown.length} 个切片命中。点「全部切片」取消筛选。</p>` : ""}
     ${paramNote}`;
@@ -1315,6 +1457,14 @@ function renderChunkView() {
       renderChunkView();
     });
   });
+  // 绑定数据来源切换
+  const srcSel = $("chunkSource");
+  if (srcSel) {
+    srcSel.addEventListener("change", () => {
+      viewingRun = srcSel.value;
+      selectCase(currentCase);
+    });
+  }
 
   // 渲染切片流；筛选后无结果时给出明确提示
   $("chunkStream").innerHTML = shown.length

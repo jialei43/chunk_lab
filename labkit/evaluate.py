@@ -96,6 +96,9 @@ def evaluate_case(case, cfg=None, children_delimiter=""):
         "filename": case.get("filename", ""),  # 原始中文文件名，便于在报告中辨认是哪份文档
         "note": case.get("note", ""),  # 该样本的关注点说明
         "kind": case.get("kind", ""),  # 文档大类
+        # 切分文本随结果带出，由 save_run 取走单独压缩存储。
+        # 代码一改旧结果就无法重现，不存下来历史轮次就只剩数字。
+        "_records": records,  # 本样本的全部切片记录
         "chunk_count": len(records),  # 产出的 chunk 总数
         "block_count": case.get("block_count", 0),  # MinerU 原始块数，用于观察合并率
         "by_detector": by_detector,  # 各检测器命中数，回归比较的核心指标
@@ -168,6 +171,16 @@ def evaluate_all(only=None, cfg=None, children_delimiter=""):
     cases = load_cases(only=only)
     # 逐个评估
     results = [evaluate_case(c, cfg=cfg, children_delimiter=children_delimiter) for c in cases]
+    # 把切分文本从逐样本结果中抽出，集中交给 save_run 压缩存储，
+    # 避免它随报告 JSON 一起落盘把文件撑大
+    chunks_by_case = {}
+    # 逐样本取出并从结果中移除
+    for r in results:
+        # 切分失败的样本没有记录
+        recs = r.pop("_records", None)
+        # 有记录才收集
+        if recs:
+            chunks_by_case[r["case_id"]] = recs
     # 汇总各检测器在全语料上的总命中数，这是判断改动优劣的顶层指标
     totals = {}
     # 逐样本累加
@@ -189,6 +202,7 @@ def evaluate_all(only=None, cfg=None, children_delimiter=""):
         "finding_total": sum(r.get("finding_count", 0) for r in results),  # 全语料命中总数
         "totals_by_detector": totals,  # 各检测器全局命中数
         "cases": results,  # 逐样本明细
+        "_chunks": chunks_by_case,  # 切分文本，save_run 会取走并单独压缩存储
     }
 
 
@@ -388,6 +402,80 @@ def diff_findings(before, after, detector=None, case_id=None):
         "added_count": len(added),  # 新增数量
         "removed_count": len(removed),  # 消失数量
         "net": len(added) - len(removed),  # 净变化，应与对比表中的 delta 一致
+    }
+
+
+def diff_chunk_texts(chunks_a, chunks_b, limit=200):
+    """对比两轮的切分文本，按内容配对，找出真正变化的切片。
+
+    这是保留文本快照的核心价值：问题数只能告诉你「多了 6 条截断」，
+    文本对比才能告诉你「这一段的边界从哪挪到了哪」「内容被改成了什么样」。
+
+    配对策略与 diff_findings 同理——不能按序号配，序号会整体错位。
+    这里按正文内容配对：完全相同的算未变，剩下的按顺序配成「修改」，
+    多出来的算新增或删除。
+    """
+    # 防御：任一侧缺失文本快照时无法比较
+    if chunks_a is None or chunks_b is None:
+        return None
+    # 建立正文到序号列表的映射，用于快速识别未变化的切片
+    def by_content(chunks):
+        # 同一正文可能出现多次，故值为序号列表
+        m = {}
+        for c in chunks:
+            m.setdefault(c["content"], []).append(c)
+        return m
+
+    # 两侧的内容映射
+    map_a, map_b = by_content(chunks_a), by_content(chunks_b)
+    # 两侧共有的正文即未变化部分
+    common = map_a.keys() & map_b.keys()
+    # 计算未变化的切片数：取两侧出现次数的较小值
+    unchanged = sum(min(len(map_a[k]), len(map_b[k])) for k in common)
+
+    # 剩余部分按原顺序排列，准备配对
+    rest_a = [c for c in chunks_a if c["content"] not in common]
+    rest_b = [c for c in chunks_b if c["content"] not in common]
+    # 逐位配对成「修改」，超出的部分是纯新增或纯删除
+    changed = []
+    # 取较短长度作为配对数量
+    n = min(len(rest_a), len(rest_b))
+    # 逐对生成修改条目
+    for i in range(min(n, limit)):
+        # 记录两侧内容，前端据此做逐字对比
+        changed.append({
+            "kind": "modified",  # 变化类型：内容被修改
+            "before_index": rest_a[i]["index"],  # 变化前的序号
+            "after_index": rest_b[i]["index"],  # 变化后的序号
+            "before": rest_a[i]["content"],  # 变化前的正文
+            "after": rest_b[i]["content"],  # 变化后的正文
+        })
+    # A 侧多出的是被删除的切片
+    for c in rest_a[n:n + limit]:
+        changed.append({
+            "kind": "removed",  # 变化类型：该切片消失了
+            "before_index": c["index"],  # 原序号
+            "after_index": None,  # 无对应
+            "before": c["content"],  # 原正文
+            "after": "",  # 无内容
+        })
+    # B 侧多出的是新增的切片
+    for c in rest_b[n:n + limit]:
+        changed.append({
+            "kind": "added",  # 变化类型：新出现的切片
+            "before_index": None,  # 无对应
+            "after_index": c["index"],  # 新序号
+            "before": "",  # 无内容
+            "after": c["content"],  # 新正文
+        })
+    # 返回文本对比结果
+    return {
+        "count_a": len(chunks_a),  # 变化前的切片总数
+        "count_b": len(chunks_b),  # 变化后的切片总数
+        "unchanged": unchanged,  # 内容完全未变的切片数
+        "changed": changed[:limit],  # 变化明细，受 limit 限制以免响应过大
+        "changed_total": len(changed),  # 变化总数（未截断前）
+        "truncated": len(changed) > limit,  # 是否因超限被截断
     }
 
 

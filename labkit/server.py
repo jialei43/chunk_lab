@@ -14,7 +14,8 @@ from flask import Flask, jsonify, request, send_from_directory  # 导入 Flask �
 from . import runs  # 导入运行历史模块，负责轮次快照与基准指针
 from .detectors import DetectorConfig  # 导入检测阈值配置
 from .discover import scan_products  # 导入本机产物扫描
-from .evaluate import compare_reports, diff_findings, evaluate_all, inspect_case, load_cases  # 导入评估相关能力
+from .evaluate import (compare_reports, diff_chunk_texts, diff_findings, evaluate_all,
+                       inspect_case, load_cases)  # 导入评估相关能力
 from .ingest import ingest_from_path  # 导入按路径导入语料的能力
 
 # 前端静态文件目录
@@ -256,6 +257,70 @@ def api_diff():
     case_id = request.args.get("case") or None
     # 计算差异并返回
     return jsonify({"ok": True, "diff": diff_findings(a, b, detector=detector, case_id=case_id)})
+
+
+@app.get("/api/runs/<run_id>/chunks/<case_id>")
+def api_run_chunks(run_id, case_id):
+    """读取某一轮存下来的切分文本。
+
+    与实时切分的区别至关重要：实时切分用的是当前代码，代码一改就再也
+    得不到旧结果；这里返回的是那一轮当时真实的切分内容。
+    """
+    # 解析轮次引用，支持 baseline / latest / 具体标识
+    report = runs.resolve_run(run_id)
+    # 轮次不存在时返回 404
+    if report is None:
+        return jsonify({"ok": False, "message": f"轮次不存在：{run_id}"}), 404
+    # 读取该轮该样本的切分文本
+    chunks = runs.load_chunks(report.get("run_id", run_id), case_id)
+    # 旧轮次没有文本快照，明确告知而不是返回空数组造成误解
+    if chunks is None:
+        return jsonify({"ok": False, "message": "该轮次没有保存切分文本（在此功能之前产生）"}), 404
+    # 返回该轮的切分文本与当时的参数
+    return jsonify({
+        "ok": True,  # 请求成功
+        "run_id": report.get("run_id", run_id),  # 轮次标识
+        "case_id": case_id,  # 样本标识
+        "config": report.get("config", {}),  # 该轮的切分参数
+        "label": report.get("label", ""),  # 该轮备注
+        "chunks": chunks,  # 切分文本
+    })
+
+
+@app.get("/api/chunkdiff")
+def api_chunk_diff():
+    """对比两轮在某个样本上的切分文本差异。
+
+    回答的是「这一段的边界从哪挪到了哪」，而不只是「问题数变了多少」。
+    """
+    # 解析两侧轮次
+    a = runs.resolve_run(request.args.get("a") or "baseline")
+    b = runs.resolve_run(request.args.get("b") or "latest")
+    # 样本标识为必填
+    case_id = request.args.get("case")
+    # 缺少样本时无法比较
+    if not case_id:
+        return jsonify({"ok": False, "message": "缺少 case 参数"}), 400
+    # 任一轮次不存在都无法比较
+    if a is None or b is None:
+        return jsonify({"ok": False, "message": "指定的轮次不存在"}), 404
+    # 分别读取两轮的切分文本
+    ca = runs.load_chunks(a.get("run_id"), case_id)
+    cb = runs.load_chunks(b.get("run_id"), case_id)
+    # 任一侧缺快照时明确告知是哪一轮缺
+    if ca is None or cb is None:
+        missing = a.get("run_id") if ca is None else b.get("run_id")
+        return jsonify({"ok": False, "message": f"轮次 {missing} 没有保存切分文本，无法做文本对比"}), 404
+    # 计算文本差异
+    result = diff_chunk_texts(ca, cb)
+    # 附上两侧的轮次信息，便于前端标注比的是什么
+    return jsonify({
+        "ok": True,  # 请求成功
+        "case_id": case_id,  # 样本标识
+        "a": {"run_id": a.get("run_id"), "label": a.get("label", ""), "config": a.get("config", {})},  # 基准轮信息
+        "b": {"run_id": b.get("run_id"), "label": b.get("label", ""), "config": b.get("config", {})},  # 对比轮信息
+        "diff": result,  # 文本差异明细
+    })
 
 
 @app.post("/api/baseline")

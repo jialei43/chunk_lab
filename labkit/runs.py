@@ -9,6 +9,7 @@
   3. 每轮记录被测代码的内容指纹——没有它，历史轮次不知对应什么代码状态，对比就没有意义。
 """
 
+import gzip  # 导入 gzip 压缩切片文本快照，中文文本压缩率高且属标准库
 import hashlib  # 导入 hashlib 计算被测代码的内容指纹
 import json  # 导入 json 读写快照
 import subprocess  # 导入 subprocess 读取 ragflow 的 git 版本信息
@@ -119,12 +120,87 @@ def _save_index(index):
         json.dump(index, fh, ensure_ascii=False, indent=2)
 
 
+def chunks_path(run_id):
+    """某一轮的切片文本快照路径。"""
+    # 与报告同目录，用 .chunks.gz 后缀区分
+    return RUNS_DIR / f"{run_id}.chunks.gz"
+
+
+def save_chunks(run_id, chunks_by_case):
+    """保存该轮的切分文本快照。
+
+    这是历史可回溯的前提：离线驱动调的是当前代码，代码一改，旧轮次的切分
+    结果就再也无法重现。不存下来，历史轮次就只剩统计数字，看不到那时候
+    文本被切成了什么样，也就无法比较切分边界的变化。
+
+    只保留比较所需的字段并 gzip 压缩，中文文本压缩率约 3-4 倍。
+    """
+    # 确保目录存在
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    # 精简字段：正文与定位信息是比较所需，图像对象等一律不留
+    slim = {}
+    # 逐样本精简
+    for case_id, records in (chunks_by_case or {}).items():
+        # 每个切片只保留比较与展示必需的字段
+        slim[case_id] = [
+            {
+                "index": r["index"],  # 切片序号
+                "content": r["content"],  # 正文全文，比较切分边界的核心依据
+                "doc_type_kwd": r.get("doc_type_kwd", ""),  # 块类型
+                "important_kwd": r.get("important_kwd", []),  # 标题面包屑
+                "page_num_int": r.get("page_num_int", []),  # 页码
+                "is_child": r.get("is_child", False),  # 是否子块
+            }
+            for r in records
+        ]
+    # 以 gzip 写出，text mode 便于直接 json.dump
+    with gzip.open(chunks_path(run_id), "wt", encoding="utf-8") as fh:
+        # 不缩进以进一步减小体积，本文件面向程序读取
+        json.dump(slim, fh, ensure_ascii=False)
+    # 返回文件路径供调用方记录体积
+    return chunks_path(run_id)
+
+
+def load_chunks(run_id, case_id=None):
+    """读取某一轮的切分文本快照；指定样本时只返回该样本。"""
+    # 快照路径
+    path = chunks_path(run_id)
+    # 文件不存在说明该轮是旧版本产生的，没有文本快照
+    if not path.is_file():
+        return None
+    # 读取并解析
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        # 快照损坏时按缺失处理，不影响其它功能
+        return None
+    # 指定样本时只取该样本
+    if case_id:
+        return data.get(case_id)
+    # 否则返回全部
+    return data
+
+
 def save_run(report, label=""):
     """把一次评估结果存为不可变快照，返回其 run_id。"""
     # 以时间戳作为轮次标识，天然有序且可读
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     # 补充版本与语料指纹，这是历史轮次可解释的前提
     report = dict(report)
+    # 取出切分文本并单独压缩存储，不随报告 JSON 落盘以免撑大文件
+    chunks_by_case = report.pop("_chunks", None)
+    # 有文本时写出快照并记录体积，便于观察磁盘占用
+    if chunks_by_case:
+        # 写出压缩快照
+        path = save_chunks(run_id, chunks_by_case)
+        # 记录压缩后大小，前端可展示
+        report["chunks_bytes"] = path.stat().st_size
+        # 标记该轮含文本快照，供界面判断能否做文本对比
+        report["has_chunks"] = True
+    else:
+        # 无文本快照时明确标记，旧轮次即属此类
+        report["has_chunks"] = False
     # 记录被测代码的指纹
     report["code"] = code_fingerprint()
     # 记录语料指纹
@@ -157,6 +233,8 @@ def save_run(report, label=""):
         "git_dirty": report["code"]["git_dirty"],  # 是否含未提交改动
         "corpus_hash": report["corpus_hash"],  # 语料指纹
         "totals_by_detector": report.get("totals_by_detector", {}),  # 各检测器命中，供趋势图使用
+        "has_chunks": report.get("has_chunks", False),  # 是否含切分文本快照
+        "chunks_bytes": report.get("chunks_bytes", 0),  # 文本快照压缩后体积
     })
     # 写回索引
     _save_index(index)
@@ -243,6 +321,10 @@ def delete_run(run_id):
     # 删除文件（存在才删）
     if path.is_file():
         path.unlink()
+    # 一并删除切分文本快照，避免留下孤儿文件占用磁盘
+    cpath = chunks_path(run_id)
+    if cpath.is_file():
+        cpath.unlink()
     # 从索引中移除
     index = [r for r in _load_index() if r.get("run_id") != run_id]
     # 写回索引
