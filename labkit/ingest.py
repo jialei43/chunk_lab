@@ -6,6 +6,7 @@
 """
 
 import json  # 导入 json 用于读取块数以便写入描述文件
+import re  # 导入 re 清理文档名中的非法路径字符
 import shutil  # 导入 shutil 执行文件复制
 from pathlib import Path  # 导入 Path 统一处理路径
 
@@ -172,6 +173,46 @@ def ingest_case(case, overwrite=False):
         yaml.safe_dump(meta, fh, allow_unicode=True, sort_keys=False)
     # 返回目录与状态说明
     return dest_dir, f"已导入 {block_count} 块"
+
+
+def make_case_id(doc_name, backend):
+    """由文档名与 backend 生成语料目录名。
+
+    保留中文以便在报告中直接读懂是哪份文档，只清理会影响路径的字符。
+    带上 backend 后缀，使同一文档的不同 backend 产物能共存为对照样本。
+    """
+    # 把路径分隔符与常见特殊字符替换为下划线，避免产生非法目录名
+    safe = re.sub(r"[/\\:*?\"<>|\s]+", "_", doc_name).strip("_")
+    # 去掉可能残留的连续下划线，保持目录名整洁
+    safe = re.sub(r"_{2,}", "_", safe)
+    # 过长的目录名不便于阅读与命令行操作，截断到合理长度
+    safe = safe[:48] or "case"
+    # 拼上 backend 后缀，使同源不同 backend 的样本互不覆盖
+    return f"{safe}__{backend}"
+
+
+def ingest_from_path(source, filename, kind="", slide=False, note="", overwrite=False):
+    """从任意产物路径导入一个样本，供前端按需添加语料。
+
+    与清单驱动的 ingest_case 共用落盘逻辑，区别只在于样本描述由调用方给出。
+    """
+    # 统一转成 Path
+    source = Path(source)
+    # 由文档名与 backend 推导语料目录名；backend 取产物父目录名
+    case_id = make_case_id(Path(filename).stem, source.parent.name)
+    # 组装成 ingest_case 需要的结构后复用其落盘逻辑
+    case = {
+        "case_id": case_id,  # 语料目录名
+        "source": source,  # 产物路径
+        "filename": filename,  # 原始文件名，决定切分器的类型判断
+        "kind": kind or "unknown",  # 文档大类
+        "slide": slide,  # 是否启用 slide_mode
+        "note": note or f"经前端导入，backend={source.parent.name}",  # 备注
+    }
+    # 执行导入并返回结果
+    dest, status = ingest_case(case, overwrite=overwrite)
+    # 一并返回 case_id，便于前端立即定位到新样本
+    return case_id, status
 
 
 def ingest_all(overwrite=False):

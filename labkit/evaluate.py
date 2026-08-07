@@ -100,6 +100,62 @@ def evaluate_case(case, cfg=None, children_delimiter=""):
     }
 
 
+def inspect_case(case, cfg=None, children_delimiter=""):
+    """返回单个样本的完整切片内容，并把检测命中挂到对应切片上。
+
+    这是「预览切分效果」的数据源：前端据此逐块展示正文，
+    并在有问题的块上直接标注是哪类缺陷、证据是什么。
+    """
+    # 未指定配置时使用默认阈值
+    cfg = cfg or DetectorConfig()
+    # 执行离线切分；失败时把错误回传给前端而不是抛出 500
+    try:
+        # 按样本描述中的参数切分
+        chunks = run_offline_chunking(
+            case["content_list"],  # 缓存产物路径
+            case["filename"],  # 原始文件名
+            parser_config={  # 切分配置
+                "children_delimiter": children_delimiter,  # 父子分块分隔符
+                "chunk_token_num": cfg.chunk_token_num,  # token 预算
+            },
+            slide_mode=bool(case.get("slide_mode")),  # PPTX 按页切分开关
+        )
+    except Exception as e:
+        # 以结构化错误返回，前端可直接展示
+        return {"case_id": case["case_id"], "error": f"{type(e).__name__}: {e}", "chunks": []}
+    # 规范化为可序列化记录
+    records = normalize_chunks(chunks)
+    # 跑全部检测器
+    findings = run_detectors(records, case["case_id"], cfg)
+    # 按 chunk 序号归集命中，便于挂载到对应切片
+    by_index = {}
+    # 逐条归入对应切片
+    for f in findings:
+        # 同一切片可能命中多个检测器
+        by_index.setdefault(f.chunk_index, []).append(asdict(f))
+    # 逐块组装前端需要的结构
+    items = []
+    # 遍历全部切片
+    for r in records:
+        # 复制一份记录并挂上该块的问题列表
+        item = dict(r)
+        # 没有命中时为空列表，前端据此判断是否高亮
+        item["findings"] = by_index.get(r["index"], [])
+        # 父块正文体积可能很大，预览无需重复传输，只保留是否为子块的标记
+        item.pop("mom_content", None)
+        # 收入结果
+        items.append(item)
+    # 返回该样本的完整预览数据
+    return {
+        "case_id": case["case_id"],  # 样本标识
+        "filename": case.get("filename", ""),  # 原始文件名
+        "kind": case.get("kind", ""),  # 文档大类
+        "chunk_count": len(items),  # 切片总数
+        "finding_count": len(findings),  # 命中总数
+        "chunks": items,  # 逐块内容与标注
+    }
+
+
 def evaluate_all(only=None, cfg=None, children_delimiter=""):
     """评估全部语料，返回完整报告字典。"""
     # 未指定配置时使用默认阈值

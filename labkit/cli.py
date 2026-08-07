@@ -110,6 +110,16 @@ def cmd_smoke(args):
     return smoke_main(argv)
 
 
+def cmd_serve(args):
+    """启动本地 Web 控制台。"""
+    # 延迟导入，使不用 Web 界面时不必加载 Flask
+    from .server import serve
+    # 启动服务，阻塞直到手动中断
+    serve(host=args.host, port=args.port)
+    # 正常结束
+    return 0
+
+
 def build_parser():
     """构建命令行解析器。"""
     # 顶层解析器
@@ -153,6 +163,15 @@ def build_parser():
     p_base.add_argument("--children-delimiter", default="", help="父子分块分隔符")
     # 绑定处理函数
     p_base.set_defaults(func=cmd_baseline)
+
+    # serve 子命令
+    p_serve = sub.add_parser("serve", help="启动 Web 控制台")
+    # 监听地址，默认只绑回环，属开发时工具不对外暴露
+    p_serve.add_argument("--host", default="127.0.0.1", help="监听地址")
+    # 监听端口
+    p_serve.add_argument("--port", type=int, default=5099, help="监听端口")
+    # 绑定处理函数
+    p_serve.set_defaults(func=cmd_serve)
 
     # smoke 子命令
     p_smoke = sub.add_parser("smoke", help="单产物连通性验证")
