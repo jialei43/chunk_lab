@@ -73,6 +73,8 @@ def evaluate_case(case, cfg=None, children_delimiter=""):
         # 切分崩溃是最严重的问题，直接作为一条结果返回
         return {
             "case_id": case["case_id"],  # 样本标识
+            "filename": case.get("filename", ""),  # 原始中文文件名
+            "note": case.get("note", ""),  # 该样本的关注点说明
             "kind": case.get("kind", ""),  # 文档大类
             "error": f"{type(e).__name__}: {e}",  # 异常信息
             "chunk_count": 0,  # 无产出
@@ -91,6 +93,8 @@ def evaluate_case(case, cfg=None, children_delimiter=""):
     # 组装该样本的评估结果
     return {
         "case_id": case["case_id"],  # 样本标识
+        "filename": case.get("filename", ""),  # 原始中文文件名，便于在报告中辨认是哪份文档
+        "note": case.get("note", ""),  # 该样本的关注点说明
         "kind": case.get("kind", ""),  # 文档大类
         "chunk_count": len(records),  # 产出的 chunk 总数
         "block_count": case.get("block_count", 0),  # MinerU 原始块数，用于观察合并率

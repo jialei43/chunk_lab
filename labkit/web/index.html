@@ -211,6 +211,52 @@ input[type="text"], input[type="number"], select {
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .spin { animation: none; } .toast { transition: none; } }
 
+/* ========== 逐样本表：中文名与问题类型徽标 ========== */
+/* 样本名做成按钮，点击查看该样本全部切片 */
+.case-link {
+  background: none; border: none; padding: 0; color: var(--accent);
+  font-family: var(--mono); font-size: 0.84rem; font-weight: 600; text-align: left;
+}
+.case-link:hover { text-decoration: underline; }
+/* 样本的中文文件名，鼠标悬停可看完整关注点说明 */
+.case-cn {
+  font-size: 0.76rem; color: var(--muted); margin-top: 0.1rem;
+  max-width: 15rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* 问题类型徽标容器，数量多时自动换行 */
+.det-badges { display: flex; flex-wrap: wrap; gap: 0.3rem; max-width: 30rem; }
+
+/* 可点击的问题类型徽标：颜色编码严重度，点击直达该类问题的切片 */
+.det-badge {
+  font-size: 0.72rem; font-family: var(--sans);
+  padding: 0.12rem 0.45rem; border-radius: 3px;
+  border: 1px solid var(--line-strong); background: var(--surface); color: var(--ink-soft);
+  transition: transform 0.08s, border-color 0.12s;
+  white-space: nowrap;
+}
+.det-badge b { font-family: var(--mono); font-weight: 600; margin-left: 0.1rem; }
+.det-badge:hover { transform: translateY(-1px); border-color: var(--accent); color: var(--accent); }
+.det-badge:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.det-badge.high { color: var(--bad); background: var(--bad-soft); border-color: transparent; }
+.det-badge.medium { color: var(--warn); background: var(--warn-soft); border-color: transparent; }
+.det-badge.low { color: var(--muted); }
+
+/* 切片预览的筛选栏 */
+.filter-bar { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+.det-badge.filter { padding: 0.22rem 0.6rem; font-size: 0.78rem; }
+/* 当前选中的筛选项用强调色实底，明确表示正在筛选 */
+.det-badge.filter.on {
+  background: var(--accent); color: #fff; border-color: var(--accent);
+}
+.det-badge.filter.on b { color: #fff; }
+
+/* 被筛选命中的那条问题加左标线强调，便于在多问题切片中一眼定位 */
+.issue.focus {
+  border-left: 2px solid var(--accent); padding-left: 0.45rem;
+  background: var(--accent-soft); border-radius: 3px;
+}
+
 .delta-up { color: var(--bad); font-family: var(--mono); }
 .delta-down { color: var(--good); font-family: var(--mono); }
 .hint { font-size: 0.8rem; color: var(--muted); }
@@ -266,10 +312,10 @@ input[type="text"], input[type="number"], select {
     </div>
 
     <div class="card" id="caseCard" style="display:none">
-      <h3>逐样本（点击行查看切片）</h3>
+      <h3>逐样本 · 点样本名看全部切片，点问题类型只看该类问题</h3>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>样本</th><th>类型</th><th class="num">原始块</th><th class="num">切片</th><th class="num">问题</th></tr></thead>
+          <thead><tr><th>样本</th><th>类型</th><th class="num">原始块</th><th class="num">切片</th><th class="num">问题</th><th>问题类型（可点击）</th></tr></thead>
           <tbody id="caseRows"></tbody>
         </table>
       </div>
@@ -331,6 +377,51 @@ let lastReport = null;      // 最近一次评估报告
 let corpusCache = [];       // 语料列表缓存
 let sourcesCache = [];      // 可导入产物缓存
 let currentCase = null;     // 切片预览中当前选中的样本
+let currentCaseData = null; // 当前样本的切片数据，切换筛选时复用避免重复切分
+let chunkFilter = "";       // 切片预览的检测器筛选，空串表示不筛选
+
+// 检测器的中文短名与严重度。英文标识便于代码检索，但表格里必须给中文，
+// 否则一眼看不出是哪类问题，也就无从按类型着手修复。
+const DETECTOR_META = {
+  truncated_sentence: { cn: "句子截断", sev: "high" },
+  spaced_characters:  { cn: "字间空格", sev: "high" },
+  broken_table:       { cn: "表格破损", sev: "high" },
+  garbled_text:       { cn: "乱码", sev: "high" },
+  noise_residue:      { cn: "噪声残留", sev: "high" },
+  oversized_chunk:    { cn: "超长块", sev: "medium" },
+  undersized_chunk:   { cn: "碎片块", sev: "medium" },
+  heading_only:       { cn: "标题孤块", sev: "medium" },
+  duplicate_content:  { cn: "内容重复", sev: "medium" },
+  markdown_residue:   { cn: "Markdown 残留", sev: "medium" },
+  empty_image:        { cn: "图片空壳", sev: "medium" },
+  missing_breadcrumb: { cn: "缺面包屑", sev: "low" },
+  missing_position:   { cn: "缺定位", sev: "low" },
+};
+
+// 取检测器的中文名，未登记的检测器回落到英文标识
+function detCn(name) {
+  return (DETECTOR_META[name] || {}).cn || name;
+}
+
+// 取检测器的严重度，用于决定徽标配色
+function detSev(name) {
+  return (DETECTOR_META[name] || {}).sev || "low";
+}
+
+// 取样本的中文文件名。旧基线文件里没有 filename 字段，
+// 此时回退到语料库缓存中查找，保证历史基线也能显示中文名。
+function caseCn(c) {
+  if (c.filename) return c.filename;
+  const hit = corpusCache.find(x => x.case_id === c.case_id);
+  return hit ? hit.filename : "";
+}
+
+// 取样本的关注点说明，同样对旧基线做回退
+function caseNote(c) {
+  if (c.note) return c.note;
+  const hit = corpusCache.find(x => x.case_id === c.case_id);
+  return hit ? hit.note : "";
+}
 
 // ========== 工具函数 ==========
 
@@ -461,12 +552,12 @@ function renderOverview(report, comparison, isBaseline) {
   const totals = Object.entries(report.totals_by_detector).sort((a, b) => b[1] - a[1]);
   if (totals.length) {
     const max = totals[0][1];
-    // 高危检测器用红色，其余用强调色
-    const highSet = ["truncated_sentence", "broken_table", "garbled_text", "noise_residue", "spaced_characters"];
+    // 条形按严重度着色：高危红、中等黄、其余强调色
     $("distBars").innerHTML = totals.map(([name, count]) => {
-      const cls = highSet.includes(name) ? "high" : "";
+      const sev = detSev(name);
+      const cls = sev === "high" ? "high" : (sev === "medium" ? "mid" : "");
       return `<div class="bar-row">
-        <div class="bar-name" title="${esc(name)}">${esc(name)}</div>
+        <div class="bar-name" title="${esc(name)}">${esc(detCn(name))}</div>
         <div class="bar-track"><div class="bar-fill ${cls}" style="width:${(count / max * 100).toFixed(1)}%"></div></div>
         <div class="bar-count">${count}</div>
       </div>`;
@@ -476,25 +567,41 @@ function renderOverview(report, comparison, isBaseline) {
     $("distCard").style.display = "none";
   }
 
-  // 逐样本表格，点击行跳转到切片预览
+  // 逐样本表格：样本名带中文文件名，问题按类型拆开并可点击直达详情
   $("caseRows").innerHTML = report.cases.map(c => {
     if (c.error) {
-      return `<tr><td>${esc(c.case_id)}</td><td colspan="4" style="color:var(--bad)">切分失败：${esc(c.error)}</td></tr>`;
+      return `<tr><td>${esc(c.case_id)}</td><td colspan="5" style="color:var(--bad)">切分失败：${esc(c.error)}</td></tr>`;
     }
-    return `<tr class="clickable" data-case="${esc(c.case_id)}">
-      <td>${esc(c.case_id)}</td>
+    // 该样本的问题按类型拆成徽标，按个数降序，个数多的排前面
+    const dets = Object.entries(c.by_detector || {}).sort((a, b) => b[1] - a[1]);
+    // 每个徽标可点击，点后跳到切片预览并只显示该类问题
+    const badges = dets.length
+      ? dets.map(([name, n]) =>
+          `<button class="det-badge ${detSev(name)}" data-case="${esc(c.case_id)}" data-det="${esc(name)}"
+                   title="查看 ${esc(c.case_id)} 中的「${esc(detCn(name))}」问题">${esc(detCn(name))} <b>${n}</b></button>`
+        ).join("")
+      : `<span class="hint">无</span>`;
+
+    return `<tr>
+      <td>
+        <button class="case-link" data-case="${esc(c.case_id)}">${esc(c.case_id)}</button>
+        <div class="case-cn" title="${esc(caseNote(c))}">${esc(caseCn(c))}</div>
+      </td>
       <td><span class="pill kind">${esc(c.kind || "?")}</span></td>
       <td class="num">${c.block_count}</td>
       <td class="num">${c.chunk_count}</td>
-      <td class="num">${c.finding_count}</td>
+      <td class="num"><strong>${c.finding_count}</strong></td>
+      <td><div class="det-badges">${badges}</div></td>
     </tr>`;
   }).join("");
-  // 绑定行点击，直接跳到该样本的切片预览
-  $("caseRows").querySelectorAll("tr.clickable").forEach(tr => {
-    tr.addEventListener("click", () => {
-      document.querySelector('.tab[data-view="chunks"]').click();
-      loadChunkCaseList().then(() => selectCase(tr.dataset.case));
-    });
+
+  // 点样本名：查看该样本全部切片
+  $("caseRows").querySelectorAll(".case-link").forEach(btn => {
+    btn.addEventListener("click", () => gotoChunks(btn.dataset.case, ""));
+  });
+  // 点问题类型徽标：查看该样本中该类问题的切片
+  $("caseRows").querySelectorAll(".det-badge").forEach(btn => {
+    btn.addEventListener("click", () => gotoChunks(btn.dataset.case, btn.dataset.det));
   });
   $("caseCard").style.display = "";
 }
@@ -524,7 +631,7 @@ function renderComparison(cmp) {
       <thead><tr><th>检测器</th><th class="num">基线</th><th class="num">当前</th><th class="num">变化</th></tr></thead><tbody>`;
     cmp.by_detector.sort((a, b) => b.delta - a.delta).forEach(d => {
       const c = d.delta > 0 ? "delta-up" : "delta-down";
-      html += `<tr><td>${esc(d.detector)}</td><td class="num">${d.before}</td><td class="num">${d.after}</td>
+      html += `<tr><td>${esc(detCn(d.detector))}</td><td class="num">${d.before}</td><td class="num">${d.after}</td>
         <td class="num ${c}">${d.delta > 0 ? "+" : ""}${d.delta}</td></tr>`;
     });
     html += `</tbody></table></div>`;
@@ -597,6 +704,17 @@ async function loadChunkCaseList() {
   }
 }
 
+// ========== 从概览跳到切片预览，并按需带上问题类型筛选 ==========
+// detector 为空表示看全部切片，非空表示只看命中该检测器的切片。
+function gotoChunks(caseId, detector) {
+  // 记录筛选条件，供渲染时使用
+  chunkFilter = detector || "";
+  // 切到切片预览标签页
+  document.querySelector('.tab[data-view="chunks"]').click();
+  // 样本列表就绪后再加载目标样本
+  loadChunkCaseList().then(() => selectCase(caseId));
+}
+
 // ========== 切片预览：加载并渲染某个样本 ==========
 async function selectCase(caseId) {
   currentCase = caseId;
@@ -618,22 +736,70 @@ async function selectCase(caseId) {
       $("chunkStream").innerHTML = `<div class="empty" style="color:var(--bad)">切分失败：${esc(data.error)}</div>`;
       return;
     }
-    // 顶部元信息
-    $("chunkMeta").innerHTML = `
-      <div class="stat-row">
-        <div class="stat"><div class="stat-label">文件</div><div class="stat-value" style="font-size:0.95rem">${esc(data.filename)}</div></div>
-        <div class="stat"><div class="stat-label">切片</div><div class="stat-value">${data.chunk_count}</div></div>
-        <div class="stat"><div class="stat-label">问题</div><div class="stat-value">${data.finding_count}</div></div>
-      </div>`;
-    // 逐块渲染
-    $("chunkStream").innerHTML = data.chunks.map(renderChunk).join("");
+    // 缓存本样本数据，切换筛选时直接重渲染，无需重新切分
+    currentCaseData = data;
+    // 渲染元信息、筛选工具栏与切片流
+    renderChunkView();
   } catch (e) {
     $("chunkStream").innerHTML = `<div class="empty" style="color:var(--bad)">加载失败：${esc(e.message)}</div>`;
   }
 }
 
+// ========== 切片预览：按当前筛选渲染 ==========
+function renderChunkView() {
+  // 无数据时不渲染
+  const data = currentCaseData;
+  if (!data) return;
+
+  // 统计该样本各类问题的数量，作为筛选按钮的依据
+  const counts = {};
+  data.chunks.forEach(c => c.findings.forEach(f => {
+    counts[f.detector] = (counts[f.detector] || 0) + 1;
+  }));
+  // 按数量降序排列筛选项
+  const dets = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+
+  // 依据当前筛选挑出要展示的切片
+  const shown = chunkFilter
+    ? data.chunks.filter(c => c.findings.some(f => f.detector === chunkFilter))
+    : data.chunks;
+
+  // 筛选工具栏：全部 + 各问题类型
+  const filterBar = `
+    <div class="filter-bar">
+      <button class="det-badge filter ${chunkFilter === "" ? "on" : ""}" data-det="">全部切片 <b>${data.chunk_count}</b></button>
+      ${dets.map(([name, n]) =>
+        `<button class="det-badge filter ${detSev(name)} ${chunkFilter === name ? "on" : ""}" data-det="${esc(name)}">${esc(detCn(name))} <b>${n}</b></button>`
+      ).join("")}
+    </div>`;
+
+  // 顶部元信息与筛选栏
+  $("chunkMeta").innerHTML = `
+    <div class="stat-row" style="margin-bottom:0.85rem">
+      <div class="stat"><div class="stat-label">文件</div><div class="stat-value" style="font-size:0.95rem">${esc(data.filename)}</div></div>
+      <div class="stat"><div class="stat-label">切片</div><div class="stat-value">${data.chunk_count}</div></div>
+      <div class="stat"><div class="stat-label">问题</div><div class="stat-value">${data.finding_count}</div></div>
+    </div>
+    ${filterBar}
+    ${chunkFilter ? `<p class="hint" style="margin:0.7rem 0 0">正在只看「${esc(detCn(chunkFilter))}」：${shown.length} 个切片命中。点「全部切片」取消筛选。</p>` : ""}`;
+
+  // 绑定筛选按钮
+  $("chunkMeta").querySelectorAll(".det-badge.filter").forEach(btn => {
+    btn.addEventListener("click", () => {
+      chunkFilter = btn.dataset.det;
+      renderChunkView();
+    });
+  });
+
+  // 渲染切片流；筛选后无结果时给出明确提示
+  $("chunkStream").innerHTML = shown.length
+    ? shown.map(c => renderChunk(c, chunkFilter)).join("")
+    : `<div class="empty">该筛选下没有切片</div>`;
+}
+
 // 渲染单个切片卡片：元信息 + 正文 + 问题标注
-function renderChunk(c) {
+// highlight 指定当前筛选的检测器，命中它的那条问题会被强调，便于在多问题切片中一眼定位
+function renderChunk(c, highlight) {
   // 依据最高严重度决定左边框颜色
   const sevs = c.findings.map(f => f.severity);
   const cls = sevs.includes("high") ? "flagged" : (sevs.length ? "flagged-mid" : "");
@@ -642,10 +808,13 @@ function renderChunk(c) {
   const body = isTable ? c.content : esc(c.content);
   // 面包屑
   const crumb = (c.important_kwd || []).join(" > ");
-  // 问题列表
-  const issues = c.findings.map(f => `
-    <div class="issue">
-      <span class="pill ${sevClass(f.severity)}">${esc(f.detector)}</span>
+  // 问题列表；被筛选的类型排在最前并加强调样式
+  const sorted = highlight
+    ? [...c.findings].sort((a, b) => (b.detector === highlight) - (a.detector === highlight))
+    : c.findings;
+  const issues = sorted.map(f => `
+    <div class="issue ${highlight && f.detector === highlight ? "focus" : ""}">
+      <span class="pill ${sevClass(f.severity)}">${esc(detCn(f.detector))}</span>
       <span>${esc(f.message)}</span>
       ${f.evidence ? `<span class="ev">${esc(f.evidence.slice(0, 90))}</span>` : ""}
     </div>`).join("");
@@ -759,6 +928,9 @@ $("btnImport").addEventListener("click", async () => {
 // 已经有基线数据却让页面空着等人点按钮是没有道理的，
 // 因此打开即渲染基线的完整结果，运行评估后再替换为本轮数据并附上对比。
 (async function init() {
+  // 必须先取语料列表：渲染逐样本表时要靠它回填中文名，
+  // 顺序反了旧基线就只剩英文 case_id。
+  try { corpusCache = await api("/api/corpus"); } catch (e) { /* 预取失败不阻塞，进入对应页面时会重试 */ }
   try {
     const b = await api("/api/baseline");
     if (b.exists) {
@@ -772,8 +944,6 @@ $("btnImport").addEventListener("click", async () => {
     // 接口异常不应让页面停在“加载中”，明确提示失败原因
     $("evalHint").textContent = "加载基线失败：" + e.message;
   }
-  // 顺带预取语料列表，使切换到切片预览时无需等待
-  try { corpusCache = await api("/api/corpus"); } catch (e) { /* 忽略预取失败，进入对应页面时会重试 */ }
 })();
 </script>
 </body>

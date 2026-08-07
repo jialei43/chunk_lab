@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-08T01:22:00",
+  "generated_at": "2026-08-08T02:31:47",
   "config": {
     "chunk_token_num": 512,
     "children_delimiter": "",
@@ -20,6 +20,8 @@
   "cases": [
     {
       "case_id": "annual_cnipa",
+      "filename": "国家知识产权局2025年度报告.pdf",
+      "note": "年报，hybrid backend 产物，与 annual_csrc 形成 backend 对照",
       "kind": "pdf_annual",
       "chunk_count": 578,
       "block_count": 940,
@@ -346,6 +348,8 @@
     },
     {
       "case_id": "annual_csrc",
+      "filename": "中国证券监督管理委员会年报（2024年）.pdf",
+      "note": "年报，表格与图表密集，vlm backend 产物",
       "kind": "pdf_annual",
       "chunk_count": 897,
       "block_count": 1203,
@@ -953,6 +957,8 @@
     },
     {
       "case_id": "docx_cert_manual",
+      "filename": "附件4：支付系统测试数字证书制作指导手册.docx",
+      "note": "操作手册 DOCX，检验 DOCX 目录治理与步骤列表完整性",
       "kind": "docx",
       "chunk_count": 89,
       "block_count": 151,
@@ -1151,6 +1157,8 @@
     },
     {
       "case_id": "docx_union_bad",
+      "filename": "正文-关于修订工会委员会财务管理办法的通知.docx",
+      "note": "产物目录名自带「有问题的」标记，是已知的问题样本，应当能被检测器命中",
       "kind": "docx",
       "chunk_count": 55,
       "block_count": 78,
@@ -1357,6 +1365,8 @@
     },
     {
       "case_id": "law_bill_hybrid",
+      "filename": "最高人民法院关于审理票据纠纷案件若干问题的规定（2020修正）.pdf",
+      "note": "backend 对照 A：hybrid 产物 137 块，与 law_bill_vlm 同源不同 backend",
       "kind": "pdf_law",
       "chunk_count": 122,
       "block_count": 137,
@@ -1425,6 +1435,8 @@
     },
     {
       "case_id": "law_bill_vlm",
+      "filename": "最高人民法院关于审理票据纠纷案件若干问题的规定（2020修正）.pdf",
+      "note": "backend 对照 B：vlm 产物 111 块，同一文档比 hybrid 少 26 块，用于检验切分逻辑对 backend 差异的鲁棒性",
       "kind": "pdf_law",
       "chunk_count": 100,
       "block_count": 111,
@@ -1477,6 +1489,8 @@
     },
     {
       "case_id": "law_criminal",
+      "filename": "中华人民共和国刑法（2020修正）.pdf",
+      "note": "长法律文本，条文层级密集，检验标题边界与条文完整性",
       "kind": "pdf_law",
       "chunk_count": 970,
       "block_count": 1223,
@@ -1554,6 +1568,8 @@
     },
     {
       "case_id": "patent_cn",
+      "filename": "2006-cn-092586.pdf",
+      "note": "专利文献，权利要求编号与附图说明结构特殊",
       "kind": "pdf_patent",
       "chunk_count": 242,
       "block_count": 497,
@@ -1743,6 +1759,8 @@
     },
     {
       "case_id": "pptx_pytorch",
+      "filename": "01-PyTorch基本使用.pptx",
+      "note": "教学 PPT，含代码块与公式，检验碎字与代码折行",
       "kind": "pptx",
       "chunk_count": 91,
       "block_count": 946,
@@ -2053,6 +2071,8 @@
     },
     {
       "case_id": "pptx_training",
+      "filename": "知识平台使用培训20260723.pptx",
+      "note": "培训 PPT，slide_mode 的主要验证样本，含多个表格",
       "kind": "pptx",
       "chunk_count": 40,
       "block_count": 263,
@@ -2180,6 +2200,8 @@
     },
     {
       "case_id": "twocol_diag",
+      "filename": "mineru_two_column_diagnostic.pdf",
+      "note": "双栏 PDF 基准样例，阶段一保真度验证用的就是它，切分边界已与生产逐块比对过",
       "kind": "pdf_twocolumn",
       "chunk_count": 14,
       "block_count": 23,
@@ -2233,6 +2255,8 @@
     },
     {
       "case_id": "xlsx_9sheet",
+      "filename": "复杂表格样例_9sheet.xlsx",
+      "note": "多 sheet 复杂表格，检验表格独立成块与表头重复",
       "kind": "xlsx",
       "chunk_count": 65,
       "block_count": 18,
@@ -2242,6 +2266,8 @@
     },
     {
       "case_id": "xlsx_ghost_row",
+      "filename": "复杂表格样例_9sheet_幽灵行2.xlsx",
+      "note": "已知的幽灵行问题样本，与 xlsx_9sheet 形成对照",
       "kind": "xlsx",
       "chunk_count": 9,
       "block_count": 18,
