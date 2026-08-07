@@ -42,9 +42,21 @@ def _config_from_request(payload):
 
 @app.get("/")
 def index():
-    """返回单页前端。"""
-    # 直接发送 index.html
-    return send_from_directory(WEB_DIR, "index.html")
+    """返回单页前端。
+
+    显式禁用缓存：这是开发时工具，前端改动频繁，浏览器缓存会让人对着
+    旧页面反复怀疑功能没生效，排查成本远高于这点带宽。
+    """
+    # 取出静态文件响应
+    resp = send_from_directory(WEB_DIR, "index.html")
+    # 禁止任何层级的缓存，保证每次打开都是最新页面
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    # 兼容仅识别旧式头部的代理
+    resp.headers["Pragma"] = "no-cache"
+    # 明确标记为已过期
+    resp.headers["Expires"] = "0"
+    # 返回响应
+    return resp
 
 
 @app.get("/api/corpus")
