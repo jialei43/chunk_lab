@@ -171,6 +171,19 @@ td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-alig
 }
 .chunk.flagged { border-left-color: var(--bad); }
 .chunk.flagged-mid { border-left-color: var(--warn); }
+/* 从差异面板跳转过来时短暂高亮，让目标块在长列表中一眼可见 */
+.chunk.locate {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  animation: locateFade 2.4s ease-out;
+}
+@keyframes locateFade {
+  0%, 55% { background: var(--accent-soft); }
+  100% { background: var(--surface); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .chunk.locate { animation: none; background: var(--accent-soft); }
+}
 
 .chunk-head { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; font-size: 0.72rem; color: var(--muted); font-family: var(--mono); }
 .chunk-idx { color: var(--accent); font-weight: 600; }
@@ -947,11 +960,13 @@ async function showDiff(detector, caseId, a, b) {
 
 // 渲染差异明细：新增与消失分列，每条可点击跳到切片预览定位
 function renderDiff(d) {
-  // 单条目的渲染，dir 决定配色与符号
+  // 单条目的渲染，dir 决定配色与符号。
+  // 新增条目属于对比轮、消失条目属于基准轮，定位时须各用其所属轮次的参数。
   const item = (f, dir) => `
     <div class="diff-item ${dir}">
       <button class="diff-loc" data-case="${esc(f.case_id)}" data-det="${esc(f.detector)}"
-              title="到切片预览中查看">${esc(f.case_id)} #${f.chunk_index}</button>
+              data-idx="${f.chunk_index}" data-dir="${dir}"
+              title="跳到该切片">${esc(f.case_id)} #${f.chunk_index} ›</button>
       <div class="diff-msg">${esc(f.message || "")}</div>
       ${f.evidence ? `<div class="diff-ev">${esc(f.evidence.slice(0, 120))}</div>` : ""}
     </div>`;
@@ -977,9 +992,22 @@ function renderDiff(d) {
     </div>`;
   // 收起按钮
   $("diffClose").addEventListener("click", () => { $("diffBox").style.display = "none"; });
-  // 点条目跳到切片预览，并按该检测器筛选
+  // 点条目跳到切片预览并定位到该块
   $("diffBox").querySelectorAll(".diff-loc").forEach(btn => {
-    btn.addEventListener("click", () => gotoChunks(btn.dataset.case, btn.dataset.det));
+    btn.addEventListener("click", () => {
+      // 从渲染时缓存的差异数据里取回该条目的证据，用于校验定位是否落在正确的块
+      const dir = btn.dataset.dir;
+      const idx = parseInt(btn.dataset.idx);
+      const list = dir === "add" ? d.added : d.removed;
+      const f = list.find(x => x.case_id === btn.dataset.case && x.chunk_index === idx) || {};
+      // 新增条目属于对比轮，消失条目属于基准轮，取对应轮次的切分参数
+      const config = dir === "add" ? d.after_config : d.before_config;
+      gotoChunks(btn.dataset.case, btn.dataset.det, {
+        index: idx,
+        evidence: f.evidence || "",
+        config: config || {},
+      });
+    });
   });
   // 滚动到差异区，避免展开在视野外
   $("diffBox").scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -1142,19 +1170,59 @@ async function loadChunkCaseList() {
   }
 }
 
-// ========== 从概览跳到切片预览，并按需带上问题类型筛选 ==========
-// detector 为空表示看全部切片，非空表示只看命中该检测器的切片。
-function gotoChunks(caseId, detector) {
+// ========== 从概览跳到切片预览，并按需带上筛选与定位 ==========
+// detector 为空表示看全部切片；target 指定要定位到的切片；
+// cfg 指定用哪套参数切分——差异条目的序号只在其所属轮次的参数下成立，
+// 用当前顶栏参数切分会导致序号对不上，定位到错误的块。
+function gotoChunks(caseId, detector, target) {
   // 记录筛选条件，供渲染时使用
   chunkFilter = detector || "";
   // 切到切片预览标签页
   document.querySelector('.tab[data-view="chunks"]').click();
-  // 样本列表就绪后再加载目标样本
-  loadChunkCaseList().then(() => selectCase(caseId));
+  // 样本列表就绪后再加载目标样本，加载完成再执行定位
+  loadChunkCaseList().then(() => selectCase(caseId, target));
+}
+
+// 滚动到指定切片并短暂高亮。
+// 序号可能因参数或代码变化而对不上，因此先用证据文本校验，
+// 校验不通过时退而搜索包含该证据的切片，仍找不到才如实告知。
+function scrollToChunk(target) {
+  // 无定位目标时不处理
+  if (!target) return;
+  // 先按序号找
+  let el = document.getElementById(`chunk-${target.index}`);
+  // 证据存在时校验该块确实包含它，避免定位到错块
+  const ev = (target.evidence || "").trim();
+  if (el && ev) {
+    // 取该块正文做包含判断；证据可能被截断，故取前 20 字比对
+    const body = el.querySelector(".chunk-body");
+    const probe = ev.replace(/^…/, "").slice(0, 20);
+    // 不匹配说明序号已错位，转为按证据搜索
+    if (probe && body && !body.textContent.includes(probe)) el = null;
+  }
+  // 序号失效时遍历全部切片按证据查找
+  if (!el && ev) {
+    const probe = ev.replace(/^…/, "").slice(0, 20);
+    el = [...document.querySelectorAll(".chunk")].find(
+      node => node.querySelector(".chunk-body")?.textContent.includes(probe));
+    // 找到了但序号不同，说明切分已变化，明确告知以免误解
+    if (el) toast(`该问题现在位于 #${el.dataset.idx}（原 #${target.index}，切分已变化）`);
+  }
+  // 确实找不到：多半是这条问题在当前参数下已不存在
+  if (!el) {
+    toast(`未找到 #${target.index}，该问题在当前参数下可能已不存在`);
+    return;
+  }
+  // 滚动到目标并加高亮，动画结束后自动移除
+  el.scrollIntoView({ behavior: "smooth", block: "center" });
+  el.classList.add("locate");
+  setTimeout(() => el.classList.remove("locate"), 2400);
 }
 
 // ========== 切片预览：加载并渲染某个样本 ==========
-async function selectCase(caseId) {
+// target 形如 {index, evidence, config}：指定加载后要定位到的切片，
+// 其中 config 是该条目所属轮次的切分参数，必须用它切分序号才对得上。
+async function selectCase(caseId, target) {
   currentCase = caseId;
   // 更新左侧选中态
   $("chunkCaseList").querySelectorAll(".case-item").forEach(b => {
@@ -1164,7 +1232,11 @@ async function selectCase(caseId) {
   $("chunkMeta").innerHTML = `<p class="hint" style="margin:0">${esc(caseId)}　切分中…</p>`;
 
   try {
-    const p = runParams();
+    // 有定位目标时优先用该条目所属轮次的参数，保证序号可比；否则用顶栏当前参数
+    const p = (target && target.config) ? {
+      chunk_token_num: target.config.chunk_token_num ?? runParams().chunk_token_num,
+      children_delimiter: target.config.children_delimiter ?? "",
+    } : runParams();
     const q = new URLSearchParams({
       chunk_token_num: p.chunk_token_num,
       children_delimiter: p.children_delimiter,
@@ -1176,8 +1248,12 @@ async function selectCase(caseId) {
     }
     // 缓存本样本数据，切换筛选时直接重渲染，无需重新切分
     currentCaseData = data;
+    // 记录本次切分实际使用的参数，供界面标注
+    currentCaseData._usedConfig = p;
     // 渲染元信息、筛选工具栏与切片流
     renderChunkView();
+    // 渲染完成后再定位，此时 DOM 已就绪
+    if (target) scrollToChunk(target);
   } catch (e) {
     $("chunkStream").innerHTML = `<div class="empty" style="color:var(--bad)">加载失败：${esc(e.message)}</div>`;
   }
@@ -1202,6 +1278,16 @@ function renderChunkView() {
     ? data.chunks.filter(c => c.findings.some(f => f.detector === chunkFilter))
     : data.chunks;
 
+  // 若本次切分用的参数与顶栏不同（从差异面板跳转时会发生），必须显式说明，
+  // 否则用户会困惑于为什么切片数和顶栏参数对不上。
+  const used = data._usedConfig || {};
+  const cur = runParams();
+  const mismatch = used.chunk_token_num !== undefined &&
+    (used.chunk_token_num !== cur.chunk_token_num || (used.children_delimiter || "") !== cur.children_delimiter);
+  const paramNote = mismatch
+    ? `<p class="hint" style="margin:0.7rem 0 0;color:var(--warn)">本次按该问题所属轮次的参数切分（token=${used.chunk_token_num}，子分隔符=${JSON.stringify(used.children_delimiter || "")}），与顶栏当前参数不同，以保证序号能对上。</p>`
+    : "";
+
   // 筛选工具栏：全部 + 各问题类型
   const filterBar = `
     <div class="filter-bar">
@@ -1219,7 +1305,8 @@ function renderChunkView() {
       <div class="stat"><div class="stat-label">问题</div><div class="stat-value">${data.finding_count}</div></div>
     </div>
     ${filterBar}
-    ${chunkFilter ? `<p class="hint" style="margin:0.7rem 0 0">正在只看「${esc(detCn(chunkFilter))}」：${shown.length} 个切片命中。点「全部切片」取消筛选。</p>` : ""}`;
+    ${chunkFilter ? `<p class="hint" style="margin:0.7rem 0 0">正在只看「${esc(detCn(chunkFilter))}」：${shown.length} 个切片命中。点「全部切片」取消筛选。</p>` : ""}
+    ${paramNote}`;
 
   // 绑定筛选按钮
   $("chunkMeta").querySelectorAll(".det-badge.filter").forEach(btn => {
@@ -1257,7 +1344,7 @@ function renderChunk(c, highlight) {
       ${f.evidence ? `<span class="ev">${esc(f.evidence.slice(0, 90))}</span>` : ""}
     </div>`).join("");
 
-  return `<div class="chunk ${cls}">
+  return `<div class="chunk ${cls}" id="chunk-${c.index}" data-idx="${c.index}">
     <div class="chunk-head">
       <span class="chunk-idx">#${c.index}</span>
       <span>${esc(c.doc_type_kwd || "text")}</span>

@@ -377,6 +377,12 @@ def diff_findings(before, after, detector=None, case_id=None):
     return {
         "detector": detector or "",  # 本次下钻的检测器
         "case_id": case_id or "",  # 本次下钻的样本
+        # 两轮各自的切分参数：条目里的 chunk_index 只在对应参数下才成立，
+        # 前端据此用同样的参数重新切分，才能精确定位到那一块
+        "before_config": before.get("config") or {},  # 基准轮的参数，removed 条目属于它
+        "after_config": after.get("config") or {},  # 对比轮的参数，added 条目属于它
+        "before_run_id": before.get("run_id", ""),  # 基准轮标识
+        "after_run_id": after.get("run_id", ""),  # 对比轮标识
         "added": added,  # 新增的问题条目
         "removed": removed,  # 消失的问题条目
         "added_count": len(added),  # 新增数量
