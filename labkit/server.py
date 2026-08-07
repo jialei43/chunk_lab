@@ -171,14 +171,22 @@ def api_get_baseline():
     # 不存在时明确返回空
     if baseline is None:
         return jsonify({"exists": False})
-    # 只返回摘要字段，避免传输整份明细
+    # 剥离每个样本的 findings 明细：概览页只用逐样本统计，明细在切片预览里按需加载，
+    # 带上会让响应体积膨胀数十倍而没有对应收益
+    cases = [
+        {k: v for k, v in c.items() if k != "findings"}
+        for c in baseline.get("cases", [])
+    ]
+    # 返回可直接渲染的完整结构，使页面打开即有内容而不是空白等待
     return jsonify({
         "exists": True,  # 基线存在
         "generated_at": baseline.get("generated_at", ""),  # 生成时间
+        "config": baseline.get("config", {}),  # 生成基线时使用的参数
         "case_count": baseline.get("case_count", 0),  # 样本数
         "chunk_total": baseline.get("chunk_total", 0),  # 切片总数
         "finding_total": baseline.get("finding_total", 0),  # 命中总数
         "totals_by_detector": baseline.get("totals_by_detector", {}),  # 各检测器命中
+        "cases": cases,  # 逐样本统计
     })
 
 

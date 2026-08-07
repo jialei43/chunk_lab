@@ -243,13 +243,16 @@ input[type="text"], input[type="number"], select {
   <!-- ---------- 概览 ---------- -->
   <div class="view active" id="view-overview">
     <div class="card">
-      <h3>本轮结果</h3>
+      <h3 style="display:flex;align-items:center;gap:0.6rem">
+        <span id="overviewTitle">本轮结果</span>
+        <span id="overviewBadge"></span>
+      </h3>
       <div class="stat-row" id="statRow">
         <div class="stat"><div class="stat-label">语料</div><div class="stat-value">—</div></div>
         <div class="stat"><div class="stat-label">切片</div><div class="stat-value">—</div></div>
         <div class="stat"><div class="stat-label">问题</div><div class="stat-value">—</div></div>
       </div>
-      <p class="hint" id="evalHint" style="margin:0.9rem 0 0">尚未运行。点右上角「运行评估」开始。</p>
+      <p class="hint" id="evalHint" style="margin:0.9rem 0 0">正在加载…</p>
     </div>
 
     <div class="card" id="cmpCard" style="display:none">
@@ -404,7 +407,8 @@ $("btnEval").addEventListener("click", async () => {
       body: JSON.stringify({ ...runParams(), compare: true }),
     });
     lastReport = data.report;
-    renderOverview(data.report, data.comparison);
+    // 显式标记为非基线数据，使标题与提示切换回「本轮结果」
+    renderOverview(data.report, data.comparison, false);
     toast(`评估完成：${data.report.finding_total} 条问题`);
   } catch (e) {
     toast("评估失败：" + e.message);
@@ -428,14 +432,27 @@ $("btnBaseline").addEventListener("click", async () => {
 });
 
 // ========== 概览渲染 ==========
-function renderOverview(report, comparison) {
+// isBaseline 为真表示展示的是既有基线而非本轮评估结果，两者渲染结构相同但语义不同，
+// 必须在标题与提示上区分清楚，否则容易把上次的成绩误读成这次的。
+function renderOverview(report, comparison, isBaseline) {
+  // 卡片标题随数据来源切换
+  $("overviewTitle").textContent = isBaseline ? "基线结果" : "本轮结果";
+  // 数据来源徽标：基线态提示尚未运行本轮评估
+  $("overviewBadge").innerHTML = isBaseline
+    ? '<span class="pill low">来自基线</span>'
+    : '<span class="pill kind">本轮</span>';
   // 顶部三个总量指标
   $("statRow").innerHTML = `
     <div class="stat"><div class="stat-label">语料</div><div class="stat-value">${report.case_count}</div></div>
     <div class="stat"><div class="stat-label">切片</div><div class="stat-value">${report.chunk_total}</div></div>
     <div class="stat"><div class="stat-label">问题</div><div class="stat-value">${report.finding_total}</div></div>
   `;
-  $("evalHint").textContent = `运行于 ${report.generated_at}　参数 token=${report.config.chunk_token_num}　子分隔符=${JSON.stringify(report.config.children_delimiter)}`;
+  // 参数配置在基线里可能缺失，取值时做防御
+  const cfg = report.config || {};
+  // 提示行说明数据的时间与参数；基线态额外提示如何得到本轮结果
+  $("evalHint").textContent = isBaseline
+    ? `基线生成于 ${report.generated_at}　参数 token=${cfg.chunk_token_num ?? "?"}　子分隔符=${JSON.stringify(cfg.children_delimiter ?? "")}　·　改完代码点「运行评估」即可与之对比`
+    : `运行于 ${report.generated_at}　参数 token=${cfg.chunk_token_num ?? "?"}　子分隔符=${JSON.stringify(cfg.children_delimiter ?? "")}`;
 
   // 与基线的对比区
   renderComparison(comparison);
@@ -738,15 +755,25 @@ $("btnImport").addEventListener("click", async () => {
   }
 });
 
-// ========== 启动：拉取基线摘要作为初始上下文 ==========
+// ========== 启动：直接渲染基线内容 ==========
+// 已经有基线数据却让页面空着等人点按钮是没有道理的，
+// 因此打开即渲染基线的完整结果，运行评估后再替换为本轮数据并附上对比。
 (async function init() {
   try {
     const b = await api("/api/baseline");
     if (b.exists) {
-      $("evalHint").textContent =
-        `当前基线：${b.generated_at}　${b.case_count} 个语料 / ${b.chunk_total} 切片 / ${b.finding_total} 问题。点「运行评估」与之对比。`;
+      // 用与本轮结果相同的渲染函数，仅以 isBaseline 标记区分语义
+      renderOverview(b, null, true);
+    } else {
+      // 尚无基线时给出明确的下一步指引
+      $("evalHint").textContent = "尚无基线。点右上角「运行评估」跑一轮，再点「设为基线」建立对比基准。";
     }
-  } catch (e) { /* 基线缺失属正常初始状态，静默处理 */ }
+  } catch (e) {
+    // 接口异常不应让页面停在“加载中”，明确提示失败原因
+    $("evalHint").textContent = "加载基线失败：" + e.message;
+  }
+  // 顺带预取语料列表，使切换到切片预览时无需等待
+  try { corpusCache = await api("/api/corpus"); } catch (e) { /* 忽略预取失败，进入对应页面时会重试 */ }
 })();
 </script>
 </body>
