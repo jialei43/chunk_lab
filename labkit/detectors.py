@@ -26,8 +26,12 @@ LIST_PREFIX_PATTERN = re.compile(r"^\s*(?:[（(]?\d+[）)\.、]|[一二三四五
 # 列表结构的行数下限与末行长度上限：多行且末行很短时视为罗列结构，不按整句判截断
 LIST_LIKE_MIN_LINES = 2
 LIST_LIKE_MAX_TAIL = 25
-# CJK 字间空格模式：连续三个以上「单个汉字 + 空格」，是艺术字或字间距被解析成空格的典型症状
-SPACED_CJK_PATTERN = re.compile(r"(?:[一-鿿]\s){3,}[一-鿿]")
+# CJK 字间空格模式：连续多个「单个汉字 + 空格」。
+# 门槛定得较高（6 个字以上）：封面标题的艺术字排版本就是这种形态且属正常，
+# 短片段一律放行，只有正文中出现长串字间空格才可能是解析异常。
+SPACED_CJK_PATTERN = re.compile(r"(?:[一-鿿]\s){6,}[一-鿿]")
+# 触发字间空格检测所需的正文长度：标题类短块即便有字间空格也是排版选择，不是缺陷
+SPACED_MIN_BODY = 40
 # Markdown 强调标记残留模式：成对的 ** 或 __，以及 HTML 强调标签
 MARKDOWN_RESIDUE_PATTERN = re.compile(r"\*\*[^*\n]+\*\*|__[^_\n]+__|</?(?:strong|em|b|i)>", re.IGNORECASE)
 # 纯页码模式：整块只有阿拉伯数字或罗马数字，是典型的页眉页脚残留
@@ -72,18 +76,29 @@ def strip_breadcrumb(record):
     """
     # 取出正文全文
     content = record["content"]
-    # 取出面包屑列表，正常情况下第一个元素是完整面包屑字符串
+    # 取出面包屑列表；它是多级标题，切分器用 " > " 连接后前置到正文
     kws = record.get("important_kwd") or []
     # 无面包屑时正文即全文
     if not kws:
         return content
-    # 取第一个面包屑做前缀匹配
-    head = kws[0]
-    # 正文确实以面包屑开头时才剥离，避免误删正文内容
+    # 按切分器的拼接方式还原完整面包屑，多级标题必须整体剥离。
+    # 只剥第一级会残留 " > 二级标题"，导致正文首字符变成 ">"，
+    # 进而让所有基于正文首尾的判据全部失准。
+    head = " > ".join(kws)
+    # 正文以完整面包屑开头时整体剥离
     if head and content.startswith(head):
         # 去掉面包屑后再去掉紧随其后的换行与空白
         return content[len(head):].lstrip("\n").lstrip()
-    # 前缀不匹配说明格式与预期不符，保持原样交由后续判据处理
+    # 回退：拼接格式若有出入，则在首级标题命中时剥掉整个首行
+    if kws[0] and content.startswith(kws[0]):
+        # 面包屑总是独占一行，剥到第一个换行即可
+        nl = content.find("\n")
+        # 存在换行说明面包屑行之后还有正文
+        if nl >= 0:
+            return content[nl + 1:].lstrip()
+        # 整块只有面包屑没有正文，交由标题孤块检测器处理
+        return ""
+    # 前缀完全不匹配说明格式与预期不符，保持原样交由后续判据处理
     return content
 
 
@@ -93,12 +108,71 @@ def _is_text_chunk(record):
     return not record.get("doc_type_kwd")
 
 
+def _looks_structural_ending(body):
+    """判断块尾是否属于「本就不带句号」的结构性内容。
+
+    版权页、编号、代码、联系方式这类内容天然不以标点收尾，
+    单看末字符会把它们全判成截断。
+    """
+    # 取末行做形态判断，整块过长时只关心结尾
+    tail = body.split("\n")[-1]
+    # 出版与著录信息：ISBN、CIP、书号等
+    if re.search(r"ISBN|CIP|版本馆|出版社|书号", tail):
+        return True
+    # 联系方式：电话、邮箱、网址
+    if re.search(r"(电话|传真|邮箱|邮编|地址)\s*[:：]|@\w+\.|https?://", tail):
+        return True
+    # 代码痕迹：赋值、调用、箭头、注释符
+    if re.search(r"[=（(]\s*\)|\w\(\)|-->|#\s|\bprint\(|\bdef\b|\breturn\b|\.\w+\(", tail):
+        return True
+    # 整行以拉丁字母与数字为主（英文标题、拼音、编号），中文标点判据不适用
+    latin = sum(1 for ch in tail if ch.isascii() and (ch.isalnum() or ch in " .-,:"))
+    if tail and latin / len(tail) > 0.8:
+        return True
+    # 导航路径：用破折号或箭头连接的层级
+    if re.search(r"——|——|›|→|>\s*\S+\s*>", tail):
+        return True
+    # 其余情况不属于结构性结尾
+    return False
+
+
+def _is_continuation(next_record):
+    """判断下一块是否为当前块的直接延续。
+
+    这是判定截断的核心信号：真正的截断意味着后文紧接着被切开的半句。
+    若下一块另起标题、另起编号，说明当前块只是自然结束、不带句号而已。
+    """
+    # 没有下一块说明是文档结尾，不构成截断
+    if next_record is None:
+        return False
+    # 表格与图片块不是文本的延续
+    if not _is_text_chunk(next_record):
+        return False
+    # 取下一块剥离面包屑后的正文开头
+    nxt = strip_breadcrumb(next_record).lstrip()
+    # 空正文无从判断
+    if not nxt:
+        return False
+    # 下一块以编号或项目符号开头，属另起一条，不是延续
+    if LIST_PREFIX_PATTERN.match(nxt):
+        return False
+    # 首字符是汉字或小写英文字母时才认为文意仍在继续；
+    # 大写字母、数字、括号等多为新条目的开头
+    first = nxt[0]
+    return ("一" <= first <= "鿿") or ("a" <= first <= "z")
+
+
 def detect_truncated_sentence(records, case_id, cfg):
-    """检测正文被拦腰截断：块尾不是句子终止符。"""
+    """检测正文被拦腰截断。
+
+    判据不只看末字符——那个信号太弱，会把 ISBN、代码、电话这类
+    天然不带句号的内容全部误判。真正的截断必须同时满足：
+    末尾无终止标点、结尾不是结构性内容、且下一块确实是它的延续。
+    """
     # 收集本检测器的全部命中
     findings = []
-    # 逐块检查
-    for r in records:
+    # 逐块检查，需要访问相邻块故用索引遍历
+    for i, r in enumerate(records):
         # 只检查正文块，表格与图片的结尾形态不适用句子判据
         if not _is_text_chunk(r):
             continue
@@ -118,14 +192,26 @@ def detect_truncated_sentence(records, case_id, cfg):
         # 多行且末行很短时视为罗列结构（如年报的数据条目），整句判据不适用
         if len(lines) >= LIST_LIKE_MIN_LINES and len(lines[-1]) <= LIST_LIKE_MAX_TAIL:
             continue
-        # 记录一条截断问题，证据取末尾片段便于人工判断
+        # 版权页、编号、代码、联系方式等本就不带句号，不构成截断
+        if _looks_structural_ending(body):
+            continue
+        # 取下一块用于判断文意是否仍在继续
+        nxt = records[i + 1] if i + 1 < len(records) else None
+        # 下一块的标题路径变了说明进入新章节，当前块是章节结尾而非被截断
+        if nxt is not None and (r.get("important_kwd") or []) != (nxt.get("important_kwd") or []):
+            continue
+        # 下一块不是延续时，当前块只是没带句号，不是被切断
+        if not _is_continuation(nxt):
+            continue
+        # 记录一条截断问题，证据同时给出本块结尾与下块开头，便于人工确认确实被切开
+        nxt_head = strip_breadcrumb(nxt).lstrip()[:20]
         findings.append(Finding(
             detector="truncated_sentence",  # 检测器名
             severity="high",  # 截断直接损害召回与阅读，定为高severity
             case_id=case_id,  # 样本标识
             chunk_index=r["index"],  # chunk 序号
-            message=f"正文末尾无句子终止符，疑似被截断（末字符 {body[-1]!r}）",  # 问题描述
-            evidence="…" + body[-40:],  # 证据取最后 40 字
+            message=f"正文疑似被切断，下一块紧接着继续（末字符 {body[-1]!r}）",  # 问题描述
+            evidence="…" + body[-30:] + " ⏎▸ " + nxt_head,  # 证据拼接前后文，可直接判断是否真断
         ))
     # 返回全部命中
     return findings
@@ -437,10 +523,11 @@ def detect_duplicate_content(records, case_id, cfg):
 
 
 def detect_spaced_characters(records, case_id, cfg):
-    """检测字间异常空格：连续多个「单汉字 + 空格」是艺术字或字间距被误解析的症状。
+    """检测正文中的长串字间空格。
 
-    首轮评估在年报封面发现「年 度 报 告」「局 长 致 辞」这类形态。它会同时破坏
-    全文检索的分词与召回，属于内容层缺陷而非排版偏好。
+    封面标题「年 度 报 告」这类是艺术字的正常排版，不是缺陷，因此设了两道门槛：
+    片段需连续 6 个字以上，且所在块要有足够正文长度。只有长正文里夹着长串
+    字间空格，才可能是解析异常而非排版选择。
     """
     # 收集命中
     findings = []
@@ -451,7 +538,10 @@ def detect_spaced_characters(records, case_id, cfg):
             continue
         # 取剥离面包屑后的正文
         body = strip_breadcrumb(r)
-        # 在正文中查找字间空格片段
+        # 短块多为封面或标题，其字间空格属排版选择，直接放行
+        if len(body.strip()) < SPACED_MIN_BODY:
+            continue
+        # 在正文中查找长串字间空格片段
         match = SPACED_CJK_PATTERN.search(body)
         # 未命中则该块正常
         if not match:
@@ -459,10 +549,10 @@ def detect_spaced_characters(records, case_id, cfg):
         # 记录问题，证据直接给出命中的片段
         findings.append(Finding(
             detector="spaced_characters",  # 检测器名
-            severity="high",  # 破坏分词与召回，属内容层缺陷
+            severity="medium",  # 影响分词与召回，但常见于排版而非解析错误，不再定为高severity
             case_id=case_id,
             chunk_index=r["index"],
-            message="正文存在汉字间空格，疑似艺术字或字间距被解析成空格",
+            message="长正文中出现连续字间空格，可能影响分词与召回",
             evidence=match.group(0),  # 证据取命中片段本身
         ))
     # 返回全部命中
