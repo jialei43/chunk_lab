@@ -22,4 +22,4 @@ if [ ! -x "$PY" ]; then
 fi
 
 # PYTHONPATH 同时包含 ragflow 仓库根（供 rag.* / common.* 绝对导入）与 chunk-lab 根（供 labkit 包导入）
-PYTHONPATH="$RAGFLOW:$LAB" exec "$PY" -m labkit.smoke "$@"
+PYTHONPATH="$RAGFLOW:$LAB" exec "$PY" -m labkit.cli "$@"
