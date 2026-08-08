@@ -2757,7 +2757,7 @@ function renderParseTasks(tasks) {
       </div>
       <div class="task-msg">${esc(t.error || t.message || "")}</div>
       ${t.block_count ? `<div class="hint">原始块数 ${t.block_count}${t.case_id ? `　样本 ${esc(t.case_id)}` : ""}</div>` : ""}
-      ${t.product ? `<div class="hint mono" style="font-size:0.72rem;word-break:break-all">产物 ${esc(t.product)}</div>` : ""}
+      ${renderTaskProducts(t)}
       ${bar}
       ${renderTaskLog(t)}
     </div>`;
@@ -2775,6 +2775,29 @@ function renderParseTasks(tasks) {
 }
 
 // 渲染任务日志。失败的任务默认展开——那正是需要看日志的时候。
+// 产物路径行。本地一任务一产物，云端一批可能几十个，
+// 全部平铺会把任务列表撑得没法看，故多产物时折叠起来，展开才逐个列出。
+function renderTaskProducts(t) {
+  // 产物路径统一用等宽小字，长路径允许断行
+  const cls = 'class="hint mono" style="font-size:0.72rem;word-break:break-all"';
+  // 云端批量任务的产物清单
+  const list = t.products || [];
+  // 多产物：折叠展示，摘要给出数量，展开后每行「文件名 → 路径」
+  if (list.length > 1) {
+    const rows = list.map(p =>
+      `<div ${cls} style="margin-top:0.25rem">${esc(p.name)}<br>${esc(p.path)}</div>`
+    ).join("");
+    return `<details style="margin-top:0.3rem">
+      <summary class="hint" style="cursor:pointer">产物 ${list.length} 个</summary>
+      ${rows}
+    </details>`;
+  }
+  // 单产物：直接给出路径，与本地任务的展示保持一致
+  const single = list.length === 1 ? list[0].path : t.product;
+  // 没有产物时不占位
+  return single ? `<div ${cls}>产物 ${esc(single)}</div>` : "";
+}
+
 function renderTaskLog(t) {
   const logs = t.logs || [];
   if (!logs.length) return "";

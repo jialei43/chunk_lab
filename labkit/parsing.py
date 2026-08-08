@@ -290,8 +290,14 @@ def start_cloud_parse(file_paths, auto_import=True, kind="", note="", lang="ch")
             results = parse_files(paths, MINERU_OUT, on_progress=on_progress)
             # 统计成功数
             ok = [r for r in results if r.get("ok")]
+            # 回填产物清单。云端一批对应多个产物，与本地「一任务一产物」不同，
+            # 只记一个的话其余文件解析完了却不知道落在哪，故逐个列全
+            products = [{"name": r["name"], "path": str(r["product"])} for r in ok]
             _update(task_id, message=f"云端解析完成：成功 {len(ok)}/{len(results)}",
-                    progress=1.0)
+                    progress=1.0,
+                    products=products,  # 全部产物，供界面列出
+                    # 同时填首个产物，兼容按单产物取值的既有逻辑
+                    product=products[0]["path"] if products else None)
 
             # 按需入库
             if auto_import:
