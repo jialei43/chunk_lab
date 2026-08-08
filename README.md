@@ -41,8 +41,20 @@ CHUNKLAB_DATA_DIR=/path/to/data ./run.sh eval
 ## 运行：Web 控制台（推荐）
 
 ```bash
-./run.sh serve      # 打开 http://127.0.0.1:5099
+./serve.sh start     # 后台启动
+./serve.sh stop      # 停止
+./serve.sh restart   # 重启
+./serve.sh status    # 查看是否在运行
+./serve.sh log       # 跟随查看日志
+
+./run.sh serve       # 前台运行（Ctrl+C 停止）
 ```
+
+启动后打开 http://127.0.0.1:5099　换端口：`CHUNKLAB_PORT=6000 ./serve.sh start`
+
+**改代码即时生效**，不必手动重启：服务默认开启热加载，改 `labkit/` 下的 Python 或前端页面后约 2 秒自动重启（实测）。不需要时用 `./run.sh serve --no-reload` 关掉，可省下重载器多起一个进程的开销。
+
+`serve.sh` 以端口占用而非 PID 文件判断服务状态，并且停止时会结束**全部**占用该端口的进程——热加载模式下 Flask 重载器有父子两个进程，只杀子进程的话父进程会立刻把它重新拉起，看着停了实际没停。
 
 四个页面覆盖日常全部操作：
 

@@ -677,8 +677,12 @@ def api_case_detail(case_id):
     return jsonify(data)
 
 
-def serve(host="127.0.0.1", port=5099, debug=False):
-    """启动本地服务。默认只监听回环地址，不对外暴露。"""
+def serve(host="127.0.0.1", port=5099, debug=False, reload=True):
+    """启动本地服务。默认只监听回环地址，不对外暴露。
+
+    reload 打开后改代码即时生效，不必手动重启。代价是 Flask 的重载器会
+    再起一个子进程，模块加载一次约十几秒；关掉它可以省下这份开销。
+    """
     # 启动时把旧版单文件基线收编为首个历史轮次，保证升级前后基准不断档
     migrated = runs.migrate_legacy_baseline()
     # 确有迁移时提示，便于使用者知道历史从何而来
@@ -686,5 +690,17 @@ def serve(host="127.0.0.1", port=5099, debug=False):
         print(f"已把旧版基线迁移为历史轮次：{migrated}")
     # 提示访问地址，便于直接点击打开
     print(f"chunk-lab 控制台：http://{host}:{port}")
-    # 启动 Flask 开发服务器；关闭 reloader 避免语料评估被重复触发
-    app.run(host=host, port=port, debug=debug, use_reloader=False)
+    # 明确告知热加载状态，避免改了代码不生效却不知道原因
+    print(f"热加载：{'已开启，改 labkit/ 下的代码会自动重启' if reload else '已关闭'}")
+    # 只监视本项目代码。默认重载器会盯着 sys.modules 里的全部文件，
+    # 那包含整个 ragflow 与站点包，动辄上万个文件，既慢又会因无关变动误触发。
+    extra_files = None
+    # 开启热加载时收集需要监视的文件清单
+    if reload:
+        # 前端页面改动也应触发重启，否则要手动刷新缓存才生效
+        extra_files = [str(p) for p in (WEB_DIR).rglob("*.html")]
+    # 启动 Flask 开发服务器
+    app.run(host=host, port=port, debug=debug,
+            use_reloader=reload,  # 热加载开关
+            reloader_type="stat",  # 用轮询而非 watchdog，避免额外依赖
+            extra_files=extra_files)  # 额外监视前端文件
