@@ -14,7 +14,7 @@ import yaml  # 导入 yaml 读取语料描述文件
 import logging  # 导入 logging 记录归因等辅助步骤的降级情况
 
 from .attribution import attribute_findings, summarize_attribution  # 导入问题归因
-from .detectors import DetectorConfig, run_detectors  # 导入检测配置与执行入口
+from .detectors import ALL_DETECTORS, DetectorConfig, run_detectors  # 导入检测器清单、配置与执行入口
 from .offline import build_parser_config, normalize_chunks, run_offline_chunking  # 导入离线切分驱动
 from .paths import BASELINE_DIR, CORPUS_DIR, REPORT_DIR  # 导入语料、基线与报告目录常量
 
@@ -214,6 +214,9 @@ def evaluate_all(only=None, cfg=None, parser_config=None):
         "case_count": len(results),  # 评估的样本数
         "chunk_total": sum(r.get("chunk_count", 0) for r in results),  # 全语料 chunk 总数
         "finding_total": sum(r.get("finding_count", 0) for r in results),  # 全语料命中总数
+        # 本轮启用的检测器清单。规则集一变，问题总数就不可比——
+        # 去掉一条规则会让数字下降，看起来像改善，实际与代码无关。
+        "detectors": sorted(fn.__name__.replace("detect_", "") for fn in ALL_DETECTORS),
         "totals_by_detector": totals,  # 各检测器全局命中数
         "cases": results,  # 逐样本明细
         "_chunks": chunks_by_case,  # 切分文本，save_run 会取走并单独压缩存储
@@ -322,6 +325,21 @@ def compare_reports(baseline, current):
     # 语料增删会改变总量，此时只应看逐样本变化而非总数
     if baseline.get("corpus_hash") and current.get("corpus_hash") and baseline["corpus_hash"] != current["corpus_hash"]:
         warnings.append("语料构成已变化，总数对比无意义，请只看两侧都存在的样本")
+    # 规则集变化会直接改变问题总数，且与被测代码毫无关系，必须显式指出
+    det_a = set(baseline.get("detectors") or [])
+    det_b = set(current.get("detectors") or [])
+    # 两侧都记录了规则集时才比较，旧轮次没有该字段
+    if det_a and det_b and det_a != det_b:
+        # 分别列出新增与移除的规则
+        added, removed = sorted(det_b - det_a), sorted(det_a - det_b)
+        # 组装提示
+        parts = []
+        if removed:
+            parts.append(f"移除了 {', '.join(removed)}")
+        if added:
+            parts.append(f"新增了 {', '.join(added)}")
+        warnings.append(f"两轮的检测规则集不同（{'；'.join(parts)}），问题总数的变化包含规则增减，不能全部归因于代码改动")
+
     # 代码指纹相同却出现差异，说明变化另有来源（语料或参数），值得提醒
     code_a = (baseline.get("code") or {}).get("hash")
     code_b = (current.get("code") or {}).get("hash")

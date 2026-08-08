@@ -26,12 +26,9 @@ LIST_PREFIX_PATTERN = re.compile(r"^\s*(?:[（(]?\d+[）)\.、]|[一二三四五
 # 列表结构的行数下限与末行长度上限：多行且末行很短时视为罗列结构，不按整句判截断
 LIST_LIKE_MIN_LINES = 2
 LIST_LIKE_MAX_TAIL = 25
-# CJK 字间空格模式：连续多个「单个汉字 + 空格」。
-# 门槛定得较高（6 个字以上）：封面标题的艺术字排版本就是这种形态且属正常，
-# 短片段一律放行，只有正文中出现长串字间空格才可能是解析异常。
-SPACED_CJK_PATTERN = re.compile(r"(?:[一-鿿]\s){6,}[一-鿿]")
-# 触发字间空格检测所需的正文长度：标题类短块即便有字间空格也是排版选择，不是缺陷
-SPACED_MIN_BODY = 40
+# 说明：曾有「字间空格」检测器，检查正文中连续的「单汉字 + 空格」。
+# 经使用者判定，这类形态属于正常排版（封面艺术字、字间距样式），
+# 不构成切分缺陷，故已移除，不要再加回来。
 # Markdown 强调标记残留模式：成对的 ** 或 __，以及 HTML 强调标签
 MARKDOWN_RESIDUE_PATTERN = re.compile(r"\*\*[^*\n]+\*\*|__[^_\n]+__|</?(?:strong|em|b|i)>", re.IGNORECASE)
 # 纯页码模式：整块只有阿拉伯数字或罗马数字，是典型的页眉页脚残留
@@ -522,43 +519,6 @@ def detect_duplicate_content(records, case_id, cfg):
     return findings
 
 
-def detect_spaced_characters(records, case_id, cfg):
-    """检测正文中的长串字间空格。
-
-    封面标题「年 度 报 告」这类是艺术字的正常排版，不是缺陷，因此设了两道门槛：
-    片段需连续 6 个字以上，且所在块要有足够正文长度。只有长正文里夹着长串
-    字间空格，才可能是解析异常而非排版选择。
-    """
-    # 收集命中
-    findings = []
-    # 逐块检查
-    for r in records:
-        # 表格 HTML 中的空格属正常排版，只检查正文块
-        if not _is_text_chunk(r):
-            continue
-        # 取剥离面包屑后的正文
-        body = strip_breadcrumb(r)
-        # 短块多为封面或标题，其字间空格属排版选择，直接放行
-        if len(body.strip()) < SPACED_MIN_BODY:
-            continue
-        # 在正文中查找长串字间空格片段
-        match = SPACED_CJK_PATTERN.search(body)
-        # 未命中则该块正常
-        if not match:
-            continue
-        # 记录问题，证据直接给出命中的片段
-        findings.append(Finding(
-            detector="spaced_characters",  # 检测器名
-            severity="medium",  # 影响分词与召回，但常见于排版而非解析错误，不再定为高severity
-            case_id=case_id,
-            chunk_index=r["index"],
-            message="长正文中出现连续字间空格，可能影响分词与召回",
-            evidence=match.group(0),  # 证据取命中片段本身
-        ))
-    # 返回全部命中
-    return findings
-
-
 def detect_markdown_residue(records, case_id, cfg):
     """检测 Markdown 强调标记残留：** __ 与 strong/em 标签不应进入入库正文。
 
@@ -860,7 +820,6 @@ ALL_DETECTORS = [
     detect_missing_position,  # 定位信息缺失
     detect_empty_image,  # 图片空壳
     detect_duplicate_content,  # 相邻块重复
-    detect_spaced_characters,  # 汉字间异常空格
     detect_markdown_residue,  # Markdown 标记残留
     detect_table_split,  # 表格被拆散（表头与表体分离）
     detect_dangling_reference,  # 指代缺失上下文

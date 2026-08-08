@@ -51,15 +51,6 @@ DETECTOR_INFO = {
             "rag/app/mineru_chunker.py::_clean_slide_text（PPTX 路径已清洗，可参照）",
         ],
     },
-    "spaced_characters": {
-        "cn": "字间空格",
-        "sev": "medium",
-        "desc": "长正文中出现连续的单字加空格，影响分词与召回。封面艺术字属正常排版，已豁免。",
-        "code": [
-            "rag/app/mineru_chunker.py::format_block_text（正文规范化）",
-            "deepdoc/parser/mineru_parser.py（上游 MinerU 文本提取）",
-        ],
-    },
     "missing_breadcrumb": {
         "cn": "缺面包屑",
         "sev": "low",
