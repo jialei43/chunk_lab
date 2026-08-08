@@ -238,6 +238,14 @@ input[type="text"], input[type="number"], select {
   .cfg-row { grid-template-columns: 1fr; gap: 0.25rem; }
 }
 
+/* 自动识别结果提示 */
+.detect-box {
+  padding: 0.6rem 0.8rem; border-radius: 5px; font-size: 0.85rem;
+  margin: 0.2rem 0 0.8rem;
+}
+.detect-box.ok { background: var(--good-soft); border: 1px solid var(--good); color: var(--ink); }
+.detect-box.warn { background: var(--warn-soft); border: 1px solid var(--warn); color: var(--ink); }
+
 /* ========== 下载文件清单 ========== */
 .dl-list { margin-top: 0.5rem; border-top: 1px dashed var(--line); padding-top: 0.5rem; }
 .dl-row { padding: 0.28rem 0; }
@@ -649,8 +657,9 @@ tr.is-baseline { background: var(--accent-soft); }
       <div class="parse-form">
         <div class="cfg-row">
           <label class="cfg-label">列表页地址</label>
-          <div class="cfg-input" style="grid-column:span 2">
-            <input type="text" id="crawlUrl" placeholder="https://example.com/reports/" style="width:100%;max-width:34rem">
+          <div class="cfg-input" style="grid-column:span 2;display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+            <input type="text" id="crawlUrl" placeholder="https://example.com/reports/" style="flex:1;min-width:20rem;max-width:34rem">
+            <button class="btn" id="btnDetect">自动识别</button>
           </div>
         </div>
         <div class="cfg-row">
@@ -672,6 +681,8 @@ tr.is-baseline { background: var(--accent-soft); }
             只按扩展名会全部漏掉。填正则可补上，与扩展名取并集。
           </div>
         </div>
+        <div id="detectResult" style="display:none"></div>
+
         <div class="cfg-row" style="border-top:1px dashed var(--line);padding-top:0.6rem;margin-top:0.4rem">
           <label class="cfg-label">JSON 字段</label>
           <div class="cfg-input"><input type="text" id="crawlJsonField" placeholder="announcements.adjunctUrl" style="width:100%"></div>
@@ -2323,6 +2334,42 @@ function updateRateHint() {
 }
 $("crawlDelay").addEventListener("input", updateRateHint);
 updateRateHint();
+
+// 自动识别列表页结构：省去手工翻 JSON 找字段、猜静态域名的过程。
+// 识别结果会实际发请求验证，确认真能下载才回填，不给出下不动的配置。
+$("btnDetect").addEventListener("click", async () => {
+  const url = $("crawlUrl").value.trim();
+  if (!url) return toast("请先填写列表页地址");
+  const btn = $("btnDetect");
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span> 识别中…';
+  const box = $("detectResult");
+  box.style.display = "";
+  box.innerHTML = `<div class="hint">正在请求并分析响应结构…</div>`;
+  try {
+    const r = await api("/api/crawl/detect", { method: "POST", body: JSON.stringify({ url }) });
+    // 回填识别出的配置
+    const c = r.config || {};
+    if (c.json_field !== undefined) $("crawlJsonField").value = c.json_field || "";
+    if (c.url_prefix !== undefined) $("crawlUrlPrefix").value = c.url_prefix || "";
+    if (c.page_param !== undefined) $("crawlPageParam").value = c.page_param || "";
+    // 识别成功与仅有线索是两种情况，配色区分开
+    const filled = c.json_field || c.url_prefix || c.page_param;
+    box.innerHTML = `<div class="detect-box ${filled ? "ok" : "warn"}">
+      <div>${esc(r.message)}</div>
+      ${filled ? `<div class="hint mono" style="margin-top:0.3rem">
+        字段 ${esc(c.json_field || "—")}　前缀 ${esc(c.url_prefix || "（相对拼接）")}　翻页 ${esc(c.page_param || "—")}
+      </div>` : ""}
+      ${(r.samples || []).length ? `<div class="hint mono" style="margin-top:0.3rem;word-break:break-all">
+        示例：${esc(r.samples[0])}</div>` : ""}
+    </div>`;
+  } catch (e) {
+    box.innerHTML = `<div class="detect-box warn">识别失败：${esc(e.message)}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "自动识别";
+  }
+});
 
 $("btnCrawl").addEventListener("click", () => submitCrawl(false));
 $("btnCrawlDry").addEventListener("click", () => submitCrawl(true));

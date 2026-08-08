@@ -14,6 +14,7 @@ import markdown  # 导入 markdown 把评估报告渲染成 HTML 供页面预览
 from flask import Flask, Response, jsonify, request, send_from_directory  # 导入 Flask 及其响应工具
 
 from . import annotations, crawling, runs  # 导入标注、爬取与运行历史模块
+from .detect import detect  # 导入列表页结构自动识别
 from .preview import attach_source, attach_source_from_path, find_source, render_chunk  # 导入原文截图能力
 from .detectors import DetectorConfig  # 导入检测阈值配置
 from .discover import scan_products  # 导入本机产物扫描
@@ -377,6 +378,26 @@ def api_crawl():
     )
     # 返回任务标识供前端轮询
     return jsonify({"ok": True, "task_id": task_id})
+
+
+@app.post("/api/crawl/detect")
+def api_crawl_detect():
+    """探测列表页结构，返回可直接填入表单的配置。
+
+    手工填字段路径与地址前缀很折磨，而这些都能从响应本身推断出来。
+    """
+    # 读取请求体
+    payload = request.get_json(silent=True) or {}
+    # 起始页为必填
+    url = (payload.get("url") or "").strip()
+    # 缺少 URL 时明确提示
+    if not url:
+        return jsonify({"ok": False, "message": "请先填写列表页地址"}), 400
+    # 只接受 http(s)
+    if not url.startswith(("http://", "https://")):
+        return jsonify({"ok": False, "message": "仅支持 http/https 地址"}), 400
+    # 执行探测；内部已捕获网络异常并转为可读信息
+    return jsonify(detect(url))
 
 
 @app.get("/api/crawl")
