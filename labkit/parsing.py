@@ -13,6 +13,7 @@
 
 import queue  # 导入 queue 作为解析任务的串行队列
 import logging  # 导入 logging 捕获解析过程的日志
+import shutil  # 导入 shutil 复制回捞到的产物
 import time  # 导入 time 判断产物新鲜度
 import threading  # 导入 threading 在后台执行耗时解析
 import uuid  # 导入 uuid 生成任务标识
@@ -107,12 +108,16 @@ MINERU_SERVER_OUTPUTS = (
 )
 
 
-def salvage_product(stem, within_hours=6):
+def salvage_product(stem, within_hours=6, copy_to=None):
     """从 MinerU 服务端输出目录回捞指定文件的产物。
 
     存在的理由：解析一份大 PDF 可能要几十分钟，客户端一旦中断，
     ragflow 侧的临时目录会留空，而服务端其实已经跑完。
     不回捞的话那份算力就白费了，还得从头再跑一遍。
+
+    copy_to 给定时会把整套产物复制过去。这一步不能省：
+    中断留下的空目录若原样保留，事后看到「解析过但目录是空的」
+    只会让人以为解析失败，而实际上产物是有的。
     """
     # 截止时间，过旧的产物多半属于别的批次
     cutoff = time.time() - within_hours * 3600
@@ -124,9 +129,26 @@ def salvage_product(stem, within_hours=6):
         # 按文件名匹配产物，取最近产生的一份
         matches = [p for p in root.rglob(f"{stem}_content_list.json")
                    if p.stat().st_mtime >= cutoff]
-        # 有命中则返回最新的
+        # 有命中则取最新的一份
         if matches:
-            return max(matches, key=lambda p: p.stat().st_mtime)
+            found = max(matches, key=lambda p: p.stat().st_mtime)
+            # 未要求复制时直接返回原位置
+            if copy_to is None:
+                return found
+            # 把整套产物复制到指定目录，使产物目录与正常解析后一致
+            dest = Path(copy_to)
+            dest.mkdir(parents=True, exist_ok=True)
+            # 复制同目录下的全部产物文件与图片目录
+            for item in found.parent.iterdir():
+                target = dest / item.name
+                # 目录（images）整体复制，已存在则跳过避免重复写
+                if item.is_dir():
+                    if not target.exists():
+                        shutil.copytree(item, target)
+                else:
+                    shutil.copy2(item, target)
+            # 返回复制后的产物路径
+            return dest / found.name
     # 没找到
     return None
 
