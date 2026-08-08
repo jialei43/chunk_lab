@@ -78,6 +78,87 @@ def save_one(case_id, chunk_index, verdict, detector="", note="", excerpt=""):
     return data[str(chunk_index)]
 
 
+def _region_path(case_id):
+    """某个样本的区域标注文件路径。
+
+    与切片标注分开存：切片标注以序号为键、一片一条，而区域标注是人直接在
+    原文版面上圈出来的，同一份文档可以有很多条，且不属于任何一个切片——
+    切分器压根没在那儿切出块来，正是要记录的事实。
+    """
+    # 与切片标注同目录，靠后缀区分
+    return ANNOTATION_DIR / f"{case_id}.regions.json"
+
+
+def load_regions(case_id):
+    """读取某样本的全部区域标注，无标注时返回空列表。"""
+    # 区域标注文件路径
+    path = _region_path(case_id)
+    # 尚未标注过属正常情况
+    if not path.is_file():
+        return []
+    # 文件损坏不应让整个预览不可用，降级为空
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        # 仅接受列表结构
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_region(case_id, region, detector="", note=""):
+    """新增一条区域标注，返回写入的条目。
+
+    region 形如 [页码, x0, x1, top, bottom]，单位与切片坐标一致（PDF 点），
+    这样人工圈出的范围能直接和切分器给出的位置作比较。
+    """
+    # 坐标必须完整，否则日后无法还原到版面上
+    if not isinstance(region, (list, tuple)) or len(region) < 5:
+        raise ValueError("区域坐标应形如 [页码, x0, x1, top, bottom]")
+    # 逐个转成整数，拒绝非数值
+    try:
+        pn, x0, x1, top, bottom = (int(v) for v in region[:5])
+    except (TypeError, ValueError):
+        raise ValueError("区域坐标必须是数值")
+    # 零面积区域标了也没有意义
+    if x1 <= x0 or bottom <= top:
+        raise ValueError("区域范围为空")
+    # 确保目录存在
+    ANNOTATION_DIR.mkdir(parents=True, exist_ok=True)
+    # 读取已有区域
+    items = load_regions(case_id)
+    # 组装条目
+    item = {
+        "id": f"r{len(items) + 1}_{int(datetime.now().timestamp())}",  # 稳定标识，供删除时定位
+        "region": [pn, x0, x1, top, bottom],  # 区域坐标
+        "detector": detector,  # 人工判定的问题类型
+        "note": note,  # 备注，说明为什么圈这里
+        "at": datetime.now().isoformat(timespec="seconds"),  # 标注时间
+    }
+    # 追加并写回
+    items.append(item)
+    with _region_path(case_id).open("w", encoding="utf-8") as fh:
+        json.dump(items, fh, ensure_ascii=False, indent=2)
+    # 返回写入的条目
+    return item
+
+
+def delete_region(case_id, region_id):
+    """按标识删除一条区域标注，返回是否删掉了东西。"""
+    # 读取已有区域
+    items = load_regions(case_id)
+    # 过滤掉目标
+    kept = [x for x in items if x.get("id") != region_id]
+    # 数量没变说明没找到
+    if len(kept) == len(items):
+        return False
+    # 写回
+    with _region_path(case_id).open("w", encoding="utf-8") as fh:
+        json.dump(kept, fh, ensure_ascii=False, indent=2)
+    # 确实删掉了
+    return True
+
+
 def delete_one(case_id, chunk_index):
     """删除一条标注。"""
     # 读取已有标注

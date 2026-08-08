@@ -114,6 +114,39 @@ def index():
     return resp
 
 
+@app.get("/vendor/<path:name>")
+def vendor(name):
+    """提供随仓库自带的第三方前端库（pdf.js）。
+
+    刻意不走 CDN：本工具常在没有外网的环境里用，CDN 挂掉会让整个预览页白屏。
+    与生产 lzcj_web 用的是同一版本，渲染差异不会成为排查干扰项。
+    """
+    # 第三方库版本固定，可以放心让浏览器长期缓存
+    resp = send_from_directory(WEB_DIR / "vendor", name)
+    # 缓存一天，避免每次刷新都重传 1MB 的 worker
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    # 返回响应
+    return resp
+
+
+@app.get("/api/preview/<case_id>/file")
+def api_preview_file(case_id):
+    """返回样本关联的原始文件本身，供前端 pdf.js 直接加载。
+
+    与 /shot 的分工：/shot 由服务端裁好单个切片的图，这里给的是整份原文，
+    左侧全文视图要靠它才能翻页与缩放。
+    """
+    # 文件名由查询参数带入，与 /shot 保持一致
+    filename = request.args.get("filename", "")
+    # 定位已关联的原文
+    src = find_source(case_id, filename)
+    # 未关联时返回 404，前端据此提示去关联原文
+    if src is None:
+        return jsonify({"ok": False, "message": "该样本尚未关联原始文件"}), 404
+    # 按目录与文件名下发；conditional 让浏览器可用 If-Modified-Since 复用缓存
+    return send_from_directory(src.parent, src.name, conditional=True)
+
+
 @app.get("/api/config")
 def api_config():
     """返回可配置字段的定义与默认值，供前端渲染配置面板。
@@ -372,6 +405,45 @@ def api_annotate(case_id):
         return jsonify({"ok": False, "message": str(e)}), 400
     # 返回写入的条目
     return jsonify({"ok": True, "annotation": item})
+
+
+@app.get("/api/annotations/<case_id>/regions")
+def api_regions(case_id):
+    """读取某样本在原文上圈出的全部异常区域。"""
+    # 直接返回列表
+    return jsonify(annotations.load_regions(case_id))
+
+
+@app.post("/api/annotations/<case_id>/regions")
+def api_add_region(case_id):
+    """记录一块人工圈出的异常区域。
+
+    与切片标注的分工：切片标注是对切分器已产出的块做判定，这里记的是
+    切分器压根没在那儿切出块来的地方——正是检测规则该补的方向。
+    """
+    # 读取请求体
+    payload = request.get_json(silent=True) or {}
+    # 坐标非法时明确报错而不是写入无法还原的数据
+    try:
+        item = annotations.save_region(
+            case_id,  # 样本标识
+            payload.get("region") or [],  # 区域坐标
+            detector=payload.get("detector", ""),  # 人工判定的问题类型
+            note=payload.get("note", ""),  # 备注
+        )
+    except ValueError as e:
+        return jsonify({"ok": False, "message": str(e)}), 400
+    # 返回写入的条目
+    return jsonify({"ok": True, "region": item})
+
+
+@app.delete("/api/annotations/<case_id>/regions/<region_id>")
+def api_del_region(case_id, region_id):
+    """删除一条区域标注。"""
+    # 执行删除并回报是否命中
+    ok = annotations.delete_region(case_id, region_id)
+    # 未命中时返回 404，便于界面区分「删掉了」与「本来就没有」
+    return (jsonify({"ok": True}), 200) if ok else (jsonify({"ok": False, "message": "没有这条标注"}), 404)
 
 
 @app.delete("/api/annotations/<case_id>/<int:chunk_index>")

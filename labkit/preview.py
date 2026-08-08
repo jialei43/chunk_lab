@@ -13,6 +13,7 @@
 import base64  # 导入 base64 把图片编码进 JSON 响应
 import io  # 导入 io 在内存中保存图片
 import shutil  # 导入 shutil 复制关联的原始文件
+from functools import lru_cache  # 导入 lru_cache 缓存整页渲染结果
 
 from .paths import DATA_ROOT, ensure_ragflow_importable  # 导入目录常量与路径注入
 
@@ -24,6 +25,48 @@ SOURCE_DIR = DATA_ROOT / "sources"
 RENDER_SCALE = 2
 # 截图在命中区域四周留出的边距（页面坐标下的比例），便于看清上下文
 MARGIN_RATIO = 0.02
+# 整页图像的缓存页数。A4 在 144 DPI 下约 1191×1684 像素、单页约 6MB，
+# 12 页约 70MB——够覆盖切片列表一屏内的跨页范围，又不至于把内存吃光
+PAGE_CACHE_SIZE = 12
+
+
+@lru_cache(maxsize=PAGE_CACHE_SIZE)
+def _page_image_cached(path_str, mtime, page_idx):
+    """渲染并缓存单页图像。
+
+    缓存键带上 mtime：文件被重新解析或替换后，旧图像必须失效，
+    否则会拿着上一份原文的截图去解释新的切分结果。
+
+    切片列表一屏就有几十条、且大量落在同一页，不缓存的话每条都要重渲整页，
+    实测这是缩略图加载慢的主因。
+    """
+    # 延迟导入，未用到截图的场景不承担其加载开销
+    import pdfplumber
+    # 打开并渲染目标页
+    with pdfplumber.open(path_str) as pdf:
+        # 页码越界由调用方保证，这里直接取
+        return pdf.pages[page_idx].to_image(resolution=72 * RENDER_SCALE).original
+
+
+def _page_image(src, page_idx):
+    """取某页的渲染图像，按文件修改时间自动失效。"""
+    # 以修改时间参与缓存键，文件一变缓存即失效
+    return _page_image_cached(str(src), src.stat().st_mtime_ns, page_idx)
+
+
+def _page_scale(page, pw, ph):
+    """求「PDF 点 → 渲染像素」的缩放比。
+
+    page.width/height 是 PDF 点（1 点 = 1/72 英寸），与切分器写入的坐标同单位；
+    pw/ph 是实际渲染出来的像素。两者相除即得比例，故换算不依赖 RENDER_SCALE，
+    将来改渲染分辨率也不会让坐标错位。
+    """
+    # 页宽为 0 的畸形页面会让除法炸掉，退化为 1:1
+    sx = pw / float(page.width) if page.width else 1.0
+    # 页高同理
+    sy = ph / float(page.height) if page.height else 1.0
+    # 返回横纵比例
+    return sx, sy
 
 
 def source_path(case_id, filename):
@@ -129,15 +172,20 @@ def render_chunk(case_id, filename, positions, page_hint=None):
                     continue
                 # 取目标页
                 page = pdf.pages[idx]
-                # 渲染整页为图片
-                pil = page.to_image(resolution=72 * RENDER_SCALE).original
+                # 取整页图像。同一页往往被几十个切片同时命中，
+                # 每次都重渲一遍会让缩略图列表慢得没法用，故走缓存
+                pil = _page_image(src, idx)
                 # 页面像素尺寸
                 pw, ph = pil.size
-                # 切分器写入的坐标是千分比，换算成像素
-                left = max(0, int(x0 / 1000 * pw - pw * MARGIN_RATIO))
-                right = min(pw, int(x1 / 1000 * pw + pw * MARGIN_RATIO))
-                upper = max(0, int(top / 1000 * ph - ph * MARGIN_RATIO))
-                lower = min(ph, int(bottom / 1000 * ph + ph * MARGIN_RATIO))
+                # 坐标单位是 PDF 点（72 DPI 像素）——生产的 add_positions 直接存
+                # 原值、不做归一化，而 bridge 用 zoomin=1 渲染页面。按页面尺寸求
+                # 比例即可换算到当前渲染分辨率，与 RENDER_SCALE 解耦。
+                sx, sy = _page_scale(page, pw, ph)
+                # 换算成像素，并向四周留出边距便于看清上下文
+                left = max(0, int(x0 * sx - pw * MARGIN_RATIO))
+                right = min(pw, int(x1 * sx + pw * MARGIN_RATIO))
+                upper = max(0, int(top * sy - ph * MARGIN_RATIO))
+                lower = min(ph, int(bottom * sy + ph * MARGIN_RATIO))
                 # 区域退化时跳过，避免产生零尺寸图片
                 if right <= left or lower <= upper:
                     continue

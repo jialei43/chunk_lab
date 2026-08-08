@@ -164,11 +164,52 @@ td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-alig
 
 .chunk-stream { display: flex; flex-direction: column; gap: 0.6rem; max-height: 78vh; overflow-y: auto; padding-right: 0.3rem; }
 
+/* ========== 原文与切片左右对照 ========== */
+/* 两栏等宽：原文与切片是相互印证的关系，谁也不比谁次要 */
+.doc-split { display: grid; grid-template-columns: 1fr 1fr; gap: 0.7rem; align-items: start; }
+/* 无原文可渲染时收起左栏，右栏独占整宽 */
+.doc-split.no-pdf { grid-template-columns: 1fr; }
+.doc-split.no-pdf .pdf-pane { display: none; }
+.pdf-pane {
+  background: var(--surface); border: 1px solid var(--line); border-radius: 6px;
+  display: flex; flex-direction: column; max-height: 78vh; overflow: hidden;
+}
+.pdf-toolbar {
+  display: flex; align-items: center; gap: 0.35rem; padding: 0.45rem 0.6rem;
+  border-bottom: 1px solid var(--line); flex-shrink: 0; flex-wrap: wrap;
+}
+.pdf-toolbar .spacer { flex: 1; }
+.pdf-toolbar .mono { font-size: 0.72rem; color: var(--muted); }
+/* 处于框选状态时按钮保持高亮，避免忘了自己还在标记模式 */
+.pdf-toolbar .mini.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+.pdf-scroll { overflow: auto; flex: 1; padding: 0.6rem; background: var(--sunk); }
+/* 每页一个定位上下文，高亮框绝对定位其中 */
+.pdf-page { position: relative; margin: 0 auto 0.7rem; box-shadow: 0 1px 4px rgba(0,0,0,0.18); }
+.pdf-page canvas { display: block; }
+/* 覆盖层承载高亮框与框选交互，默认不拦截滚动与选择 */
+.pdf-layer { position: absolute; inset: 0; pointer-events: none; }
+/* 框选模式下才接管鼠标 */
+.pdf-page.marking .pdf-layer { pointer-events: auto; cursor: crosshair; }
+/* 切片命中区域：描边 + 淡填充，既圈得出范围又不挡住原文 */
+.pdf-box {
+  position: absolute; border: 2px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-radius: 2px; transition: opacity 0.2s;
+}
+/* 人工框选出来的异常区域用警示色，与切片命中区分开 */
+.pdf-box.manual { border-color: var(--bad); background: color-mix(in srgb, var(--bad) 14%, transparent); }
+/* 正在拖拽的框 */
+.pdf-box.drawing { border-style: dashed; }
+
 .chunk {
   background: var(--surface); border: 1px solid var(--line);
   border-left: 3px solid var(--line-strong); border-radius: 5px;
   padding: 0.75rem 0.95rem; display: flex; flex-direction: column; gap: 0.5rem;
 }
+/* 卡片可点：点它就在左侧原文里定位 */
+.chunk { cursor: pointer; }
+/* 当前正在对照的切片 */
+.chunk.on { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
 .chunk.flagged { border-left-color: var(--bad); }
 .chunk.flagged-mid { border-left-color: var(--warn); }
 /* 从差异面板跳转过来时短暂高亮，让目标块在长列表中一眼可见 */
@@ -631,7 +672,7 @@ tr.is-baseline { background: var(--accent-soft); }
 
   <!-- ---------- 切片预览 ---------- -->
   <div class="view" id="view-chunks">
-    <div class="split">
+    <div class="split" id="chunkLayout">
       <div class="card" style="margin:0">
         <h3>样本</h3>
         <div class="case-list" id="chunkCaseList"><div class="empty">加载中…</div></div>
@@ -640,7 +681,27 @@ tr.is-baseline { background: var(--accent-soft); }
         <div class="card" style="margin-bottom:0.7rem" id="chunkMeta">
           <p class="hint" style="margin:0">从左侧选一个样本，查看它的实际切分结果。有问题的切片会被标注。</p>
         </div>
-        <div class="chunk-stream" id="chunkStream"></div>
+        <!-- 原文与切片左右对照。没有可渲染的原文时（Office 文档、未关联原文）
+             左栏自动收起，右栏独占，不留一块空白占着地方 -->
+        <div class="doc-split" id="docSplit">
+          <div class="pdf-pane" id="pdfPane">
+            <div class="pdf-toolbar">
+              <button class="mini" id="pdfZoomOut" title="缩小">−</button>
+              <span class="mono" id="pdfZoomLabel">—</span>
+              <button class="mini" id="pdfZoomIn" title="放大">+</button>
+              <button class="mini" id="pdfFitWidth">适应宽度</button>
+              <button class="mini" id="pdfFitPage">适应页面</button>
+              <span class="spacer"></span>
+              <!-- 框选标记：切分器没报的问题，人工在原文上圈出来 -->
+              <button class="mini" id="pdfMarkMode" title="在原文上框出切分器漏判的区域">框选标记</button>
+              <span class="mono hint" id="pdfPageLabel">—</span>
+            </div>
+            <div class="pdf-scroll" id="pdfScroll">
+              <div class="empty" id="pdfEmpty">选择样本后加载原文</div>
+            </div>
+          </div>
+          <div class="chunk-stream" id="chunkStream"></div>
+        </div>
       </div>
     </div>
   </div>
@@ -946,6 +1007,8 @@ tr.is-baseline { background: var(--accent-soft); }
 
 <div class="toast" id="toast"></div>
 
+<!-- pdf.js 随仓库自带，不走 CDN：本工具常在没有外网的环境里用 -->
+<script src="/vendor/pdf.min.js"></script>
 <script>
 // ========== 全局状态 ==========
 let lastReport = null;      // 最近一次评估报告
@@ -956,6 +1019,8 @@ let currentCaseData = null; // 当前样本的切片数据，切换筛选时复�
 let chunkFilter = "";       // 切片预览的检测器筛选，空串表示不筛选
 let caseAnnotations = {};   // 当前样本的人工标注，键为切片序号
 let shotCache = {};         // 截图缓存，避免同一切片重复渲染
+// pdf.js 的 worker 同样走本地 vendor，与主库版本必须一致否则会报版本不匹配
+pdfjsLib.GlobalWorkerOptions.workerSrc = "/vendor/pdf.worker.min.js";
 let runsCache = [];         // 历史轮次摘要，按时间倒序
 let baselineId = "";        // 当前作为对比基准的轮次标识
 let viewingRun = "";        // 切片预览查看的历史轮次，空串表示用当前代码实时切分
@@ -1993,6 +2058,405 @@ function scrollToChunk(target) {
 // ========== 切片预览：加载并渲染某个样本 ==========
 // target 形如 {index, evidence, config}：指定加载后要定位到的切片，
 // 其中 config 是该条目所属轮次的切分参数，必须用它切分序号才对得上。
+// ========== 左侧原文视图 ==========
+// 用 pdf.js 渲染整份原文，与右侧切片左右对照。切分器写入的坐标单位是
+// PDF 点，pdf.js 的 viewport scale 正好是「点 → CSS 像素」的倍率，
+// 故高亮框可以直接按 坐标 × scale 定位，无需另做换算。
+const pdfView = (() => {
+  // 当前文档对象，切样本时替换
+  let doc = null;
+  // 当前缩放倍率
+  let scale = 1;
+  // 每页的 DOM 与渲染状态，下标从 1 开始
+  let pages = [];
+  // 视口观察器，只渲染进入视野的页，151 页的文档才不会一次性卡住
+  let observer = null;
+  // 本次加载的序号，用于丢弃已被新样本取代的异步结果
+  let epoch = 0;
+  // 框选标记模式开关
+  let marking = false;
+  // 框选完成后的回调，由外部注入以便写入标注体系
+  let onMark = null;
+
+  // 屏幕像素密度，高分屏下按它放大画布才不会糊
+  const dpr = () => Math.min(window.devicePixelRatio || 1, 2);
+
+  // 清空视图并释放文档，避免切换样本后旧页面残留
+  function reset(message) {
+    // 断开观察，防止旧页面的回调继续触发渲染
+    if (observer) { observer.disconnect(); observer = null; }
+    // 释放 pdf.js 文档持有的 worker 资源
+    if (doc) { doc.destroy(); doc = null; }
+    // 清空页面记录
+    pages = [];
+    // 占位文案，说明当前为什么没有原文
+    $("pdfScroll").innerHTML = `<div class="empty" id="pdfEmpty">${esc(message || "选择样本后加载原文")}</div>`;
+    // 页码与缩放归位
+    $("pdfPageLabel").textContent = "—";
+    $("pdfZoomLabel").textContent = "—";
+  }
+
+  // 左栏整体收起：Office 文档没有 bbox、未关联原文时都用它
+  function hide(reason) {
+    // 收起左栏，右侧切片独占整宽
+    $("docSplit").classList.add("no-pdf");
+    // 同时清掉旧文档
+    reset(reason);
+  }
+
+  // 渲染单页到画布
+  async function renderPage(n) {
+    // 该页尚未建立或已在渲染中时跳过
+    const rec = pages[n];
+    if (!rec || rec.rendering || rec.scale === scale) return;
+    // 标记渲染中，避免滚动抖动导致重复触发
+    rec.rendering = true;
+    // 记下本次的加载序号，异步返回后据此判断是否已过期
+    const mine = epoch;
+    // 取页对象
+    const page = await doc.getPage(n);
+    // 过期则直接丢弃结果
+    if (mine !== epoch) return;
+    // 用本页的真实尺寸校正占位估计值，尺寸不一的文档才不会错位
+    const base = page.getViewport({ scale: 1 });
+    rec.baseW = base.width;
+    rec.baseH = base.height;
+    // CSS 尺寸按当前缩放，画布像素再乘像素密度
+    const vp = page.getViewport({ scale: scale * dpr() });
+    const canvas = rec.canvas;
+    // 画布实际像素
+    canvas.width = vp.width;
+    canvas.height = vp.height;
+    // CSS 尺寸回到逻辑像素，高亮框才能按 坐标 × scale 对上
+    canvas.style.width = `${vp.width / dpr()}px`;
+    canvas.style.height = `${vp.height / dpr()}px`;
+    // 页容器尺寸跟随画布，覆盖层才能与页面重合
+    rec.el.style.width = canvas.style.width;
+    rec.el.style.height = canvas.style.height;
+    // 执行渲染
+    await page.render({ canvasContext: canvas.getContext("2d"), viewport: vp }).promise;
+    // 过期结果不写入状态
+    if (mine !== epoch) return;
+    // 记下已渲染的缩放，避免同一缩放重复渲染
+    rec.scale = scale;
+    rec.rendering = false;
+  }
+
+  // 按当前缩放重建所有页的占位尺寸，并重渲已在视野内的页
+  function relayout() {
+    // 无文档时无事可做
+    if (!doc) return;
+    // 逐页更新占位尺寸：先撑开高度，滚动条位置才不会跳。
+    // 这里刻意不调 getPage——151 页的文档每次缩放都要等 151 次异步解析，
+    // 缩放会卡住好几秒。改用建占位时记下的尺寸，页真正渲染时再校正。
+    for (let n = 1; n <= doc.numPages; n++) {
+      const rec = pages[n];
+      if (!rec) continue;
+      // 按缓存的原始尺寸乘缩放
+      rec.el.style.width = `${rec.baseW * scale}px`;
+      rec.el.style.height = `${rec.baseH * scale}px`;
+      // 标记为需要重渲
+      rec.scale = null;
+    }
+    // 缩放标签
+    $("pdfZoomLabel").textContent = `${Math.round(scale * 100)}%`;
+    // 重渲当前视野内的页
+    visiblePages().forEach(n => renderPage(n));
+    // 高亮框按新缩放重新定位
+    redrawBoxes();
+  }
+
+  // 当前滚动位置附近的页号
+  function visiblePages() {
+    // 容器可视区域
+    const box = $("pdfScroll").getBoundingClientRect();
+    // 与可视区域相交的页都算，附带前后各一页作预取
+    const hit = [];
+    for (let n = 1; n < pages.length; n++) {
+      const rec = pages[n];
+      if (!rec) continue;
+      const r = rec.el.getBoundingClientRect();
+      if (r.bottom >= box.top - r.height && r.top <= box.bottom + r.height) hit.push(n);
+    }
+    return hit;
+  }
+
+  // 加载一份原文
+  async function load(caseId, filename) {
+    // 每次加载递增序号，旧的异步渲染据此作废
+    epoch += 1;
+    // 非 PDF 无法渲染：Office 文档的 MinerU 块本来也没有 bbox，
+    // 强行转 PDF 会大幅拖慢流程，此前已决定不做
+    if (!/\.pdf$/i.test(filename || "")) {
+      hide(`仅 PDF 支持原文对照，该样本是 ${esc((filename || "").split(".").pop() || "未知格式")}`);
+      return;
+    }
+    // 展开左栏
+    $("docSplit").classList.remove("no-pdf");
+    // 清掉上一份
+    reset("正在加载原文…");
+    // 拉取失败时给出可操作的提示而不是空白
+    try {
+      // 原文由服务端按样本定位，前端只管拿
+      const url = `/api/preview/${encodeURIComponent(caseId)}/file?filename=${encodeURIComponent(filename)}`;
+      // 先探一次，未关联原文时能拿到明确的 404
+      const head = await fetch(url, { method: "HEAD" });
+      if (!head.ok) {
+        hide("该样本尚未关联原始文件，可在「语料库」里关联后再看对照");
+        return;
+      }
+      // 交给 pdf.js 加载
+      const task = pdfjsLib.getDocument({ url });
+      const d = await task.promise;
+      // 加载期间切换了样本则丢弃
+      if (!$("docSplit") || d.numPages === undefined) return;
+      doc = d;
+      // 建立每页的占位容器，内容按需渲染
+      const scroll = $("pdfScroll");
+      scroll.innerHTML = "";
+      pages = [null];
+      // 先按 100% 求首页尺寸，用于「适应宽度」的初始计算
+      const first = await doc.getPage(1);
+      const base = first.getViewport({ scale: 1 });
+      // 初始缩放取适应宽度，与生产预览的默认行为一致
+      scale = fitWidthScale(base.width);
+      // 逐页建占位
+      for (let n = 1; n <= doc.numPages; n++) {
+        const el = document.createElement("div");
+        el.className = "pdf-page";
+        el.dataset.page = String(n);
+        // 画布承载页面内容
+        const canvas = document.createElement("canvas");
+        // 覆盖层承载高亮框与框选
+        const layer = document.createElement("div");
+        layer.className = "pdf-layer";
+        el.appendChild(canvas);
+        el.appendChild(layer);
+        scroll.appendChild(el);
+        // baseW/baseH 是 100% 缩放下的页面尺寸。先按首页估计，
+        // 页真正渲染时再用自己的尺寸校正——逐页 getPage 求真值要等 151 次异步解析
+        pages[n] = {
+          el, canvas, layer, scale: null, rendering: false,
+          baseW: base.width, baseH: base.height,
+        };
+      }
+      // 建立视口观察，进入视野才渲染
+      observer = new IntersectionObserver(entries => {
+        entries.forEach(e => {
+          if (e.isIntersecting) renderPage(Number(e.target.dataset.page));
+        });
+      }, { root: scroll, rootMargin: "200px 0px" });
+      // 观察每一页
+      for (let n = 1; n <= doc.numPages; n++) observer.observe(pages[n].el);
+      // 应用初始缩放并渲染首屏
+      relayout();
+      // 页码显示总页数
+      $("pdfPageLabel").textContent = `共 ${doc.numPages} 页`;
+    } catch (e) {
+      hide(`原文加载失败：${e.message}`);
+    }
+  }
+
+  // 适应宽度对应的缩放：容器宽度减去内边距与滚动条余量
+  function fitWidthScale(pageWidthPt) {
+    // 可用宽度
+    const avail = $("pdfScroll").clientWidth - 28;
+    // 页宽为 0 时退回 100%
+    return pageWidthPt > 0 ? Math.max(0.2, avail / pageWidthPt) : 1;
+  }
+
+  // 高亮框：记录当前要画的位置，缩放后据此重画
+  let boxes = [];
+
+  // 依据 boxes 重新绘制所有高亮框
+  function redrawBoxes() {
+    // 先清空所有覆盖层里的切片高亮，人工标记的框单独保留
+    pages.forEach(rec => {
+      if (rec) rec.layer.querySelectorAll(".pdf-box:not(.manual)").forEach(b => b.remove());
+    });
+    // 逐个位置画框
+    boxes.forEach(pos => {
+      // 位置形如 [页码, x0, x1, top, bottom]，页码从 1 开始
+      const [pn, x0, x1, top, bottom] = pos;
+      const rec = pages[pn];
+      // 页码越界时跳过
+      if (!rec) return;
+      // 坐标单位是 PDF 点，乘当前缩放即得 CSS 像素
+      const div = document.createElement("div");
+      div.className = "pdf-box";
+      div.style.left = `${x0 * scale}px`;
+      div.style.top = `${top * scale}px`;
+      div.style.width = `${Math.max(2, (x1 - x0) * scale)}px`;
+      div.style.height = `${Math.max(2, (bottom - top) * scale)}px`;
+      rec.layer.appendChild(div);
+    });
+  }
+
+  // 定位到某个切片：滚动到首个位置所在页并高亮全部位置
+  function focus(positions) {
+    // 无文档或无坐标时不动
+    if (!doc || !positions || !positions.length) return false;
+    // 记下待高亮的位置
+    boxes = positions.filter(p => p && p.length >= 5);
+    // 一个有效坐标都没有时不动
+    if (!boxes.length) return false;
+    // 画框
+    redrawBoxes();
+    // 滚动到首个位置：让它出现在视口上方三分之一处，便于同时看到上下文
+    const [pn, , , top] = boxes[0];
+    const rec = pages[pn];
+    if (!rec) return false;
+    // 先确保该页已渲染
+    renderPage(pn);
+    // 目标滚动位置 = 页顶偏移 + 块在页内的偏移 - 三分之一视口高
+    const scroll = $("pdfScroll");
+    const y = rec.el.offsetTop + top * scale - scroll.clientHeight / 3;
+    scroll.scrollTo({ top: Math.max(0, y), behavior: "smooth" });
+    // 更新页码提示
+    $("pdfPageLabel").textContent = `第 ${pn} / ${doc.numPages} 页`;
+    return true;
+  }
+
+  // 缩放：围绕当前滚动比例调整，避免缩放后跳到别处
+  async function zoom(next) {
+    // 无文档时无事可做
+    if (!doc) return;
+    // 限定在合理区间，过小看不清、过大爆内存
+    const target = Math.min(4, Math.max(0.25, next));
+    // 缩放前的滚动比例
+    const scroll = $("pdfScroll");
+    const ratio = scroll.scrollTop / Math.max(1, scroll.scrollHeight);
+    // 应用新缩放
+    scale = target;
+    relayout();
+    // 按比例还原滚动位置
+    scroll.scrollTop = ratio * scroll.scrollHeight;
+  }
+
+  // 框选标记：在覆盖层上拖出一个矩形，回调交给外部落库
+  function setMarking(on, cb) {
+    // 记录模式与回调
+    marking = on;
+    onMark = cb || onMark;
+    // 每页的覆盖层据此决定是否接管鼠标
+    pages.forEach(rec => { if (rec) rec.el.classList.toggle("marking", marking); });
+    // 按钮高亮跟随状态
+    $("pdfMarkMode").classList.toggle("on", marking);
+  }
+
+  // 在覆盖层上处理拖拽框选。用事件委托挂在滚动容器上，
+  // 页是动态创建的，逐页绑定会随样本切换不断泄漏监听器
+  function bindMarking() {
+    const scroll = $("pdfScroll");
+    // 拖拽状态
+    let start = null, ghost = null, hostRec = null;
+    // 按下：记录起点
+    scroll.addEventListener("mousedown", e => {
+      // 非框选模式不拦截
+      if (!marking) return;
+      // 找到落在哪一页
+      const pageEl = e.target.closest(".pdf-page");
+      if (!pageEl) return;
+      // 取该页记录
+      hostRec = pages[Number(pageEl.dataset.page)];
+      if (!hostRec) return;
+      // 阻止默认的文本选择
+      e.preventDefault();
+      // 起点相对页面左上角
+      const r = pageEl.getBoundingClientRect();
+      start = { x: e.clientX - r.left, y: e.clientY - r.top };
+      // 建一个虚线框跟随拖拽
+      ghost = document.createElement("div");
+      ghost.className = "pdf-box manual drawing";
+      hostRec.layer.appendChild(ghost);
+    });
+    // 移动：更新框大小
+    scroll.addEventListener("mousemove", e => {
+      // 未在拖拽时忽略
+      if (!start || !ghost) return;
+      const r = hostRec.el.getBoundingClientRect();
+      const x = e.clientX - r.left, y = e.clientY - r.top;
+      // 支持任意方向拖拽
+      ghost.style.left = `${Math.min(start.x, x)}px`;
+      ghost.style.top = `${Math.min(start.y, y)}px`;
+      ghost.style.width = `${Math.abs(x - start.x)}px`;
+      ghost.style.height = `${Math.abs(y - start.y)}px`;
+    });
+    // 抬起：结束拖拽并回调
+    scroll.addEventListener("mouseup", e => {
+      // 未在拖拽时忽略
+      if (!start || !ghost) return;
+      const r = hostRec.el.getBoundingClientRect();
+      const x = e.clientX - r.left, y = e.clientY - r.top;
+      // 太小的框多半是误点，直接丢弃
+      if (Math.abs(x - start.x) < 8 || Math.abs(y - start.y) < 8) {
+        ghost.remove();
+      } else {
+        // 定稿：去掉虚线
+        ghost.classList.remove("drawing");
+        // 换算回 PDF 点，与切片坐标同一单位，便于日后比对
+        const pos = [
+          Number(hostRec.el.dataset.page),
+          Math.round(Math.min(start.x, x) / scale),
+          Math.round(Math.max(start.x, x) / scale),
+          Math.round(Math.min(start.y, y) / scale),
+          Math.round(Math.max(start.y, y) / scale),
+        ];
+        // 交给外部落库；外部取消时把框撤掉
+        if (onMark) onMark(pos, () => ghost.remove());
+      }
+      // 复位拖拽状态
+      start = null; ghost = null; hostRec = null;
+    });
+  }
+
+  // 清掉人工框（切换样本时用）
+  function clearManual() {
+    pages.forEach(rec => {
+      if (rec) rec.layer.querySelectorAll(".pdf-box.manual").forEach(b => b.remove());
+    });
+  }
+
+  // 画出已有的人工标记，用于重新加载样本后恢复
+  function drawManual(positions) {
+    // 逐个画框
+    (positions || []).forEach(pos => {
+      const [pn, x0, x1, top, bottom] = pos;
+      const rec = pages[pn];
+      if (!rec) return;
+      const div = document.createElement("div");
+      div.className = "pdf-box manual";
+      div.style.left = `${x0 * scale}px`;
+      div.style.top = `${top * scale}px`;
+      div.style.width = `${Math.max(2, (x1 - x0) * scale)}px`;
+      div.style.height = `${Math.max(2, (bottom - top) * scale)}px`;
+      rec.layer.appendChild(div);
+    });
+  }
+
+  // 暴露给外部的接口
+  return {
+    load, focus, zoom, setMarking, bindMarking, clearManual, drawManual, hide,
+    // 适应宽度：按首页宽度重算缩放
+    async fitWidth() {
+      if (!doc) return;
+      const vp = (await doc.getPage(1)).getViewport({ scale: 1 });
+      await zoom(fitWidthScale(vp.width));
+    },
+    // 适应页面：让首页完整落入可视高度
+    async fitPage() {
+      if (!doc) return;
+      const vp = (await doc.getPage(1)).getViewport({ scale: 1 });
+      const avail = $("pdfScroll").clientHeight - 28;
+      await zoom(avail / vp.height);
+    },
+    // 当前缩放，供外部按步长调整
+    get scale() { return scale; },
+    // 是否已有可用文档
+    get ready() { return !!doc; },
+  };
+})();
+
 async function selectCase(caseId, target) {
   currentCase = caseId;
   // 更新左侧选中态
@@ -2001,6 +2465,12 @@ async function selectCase(caseId, target) {
   });
   $("chunkStream").innerHTML = `<div class="empty"><span class="spin"></span> 正在切分…</div>`;
   $("chunkMeta").innerHTML = `<p class="hint" style="margin:0">${esc(caseId)}　切分中…</p>`;
+
+  // 原文与切分互不依赖，同时开始加载：切分要跑一遍切分器，
+  // 等它结束再拉原文会让左栏白等好几秒
+  const caseInfo = corpusCache.find(c => c.case_id === caseId) || {};
+  // 原文就绪后把已有的人工标记画回去，否则刷新一次页面标记就看不见了
+  pdfView.load(caseId, caseInfo.filename || "").then(() => restoreRegions(caseId));
 
   try {
     // 选了历史轮次时读取那一轮存下来的切分文本，而非用当前代码重新切分。
@@ -2036,6 +2506,9 @@ async function selectCase(caseId, target) {
     // 缓存人工标注与截图状态
     caseAnnotations = data.annotations || {};
     shotCache = {};
+    // 换样本就重新给自动缩略图一次机会：上一个样本取不到，
+    // 不代表这一个也取不到
+    autoShotOff = false;
     // 记录本次切分实际使用的参数，供界面标注
     currentCaseData._usedConfig = p;
     // 渲染元信息、筛选工具栏与切片流
@@ -2135,6 +2608,8 @@ function renderChunkView() {
   $("chunkStream").innerHTML = shown.length
     ? shown.map(c => renderChunk(c, chunkFilter)).join("")
     : `<div class="empty">该筛选下没有切片</div>`;
+  // DOM 换新后重新挂观察，滚到眼前的切片才去取缩略图
+  observeShots();
 }
 
 // ========== 人工标注与原文截图 ==========
@@ -2182,7 +2657,98 @@ document.addEventListener("click", async (e) => {
   // 原文截图
   const shot = e.target.closest("[data-shot]");
   if (shot) return loadShot(parseInt(shot.dataset.shot));
+  // 点切片卡片：在左侧原文里定位并高亮该切片占的版面区域。
+  // 放在按钮判断之后，卡片内的按钮才不会被这里抢走点击。
+  const card = e.target.closest(".chunk[data-idx]");
+  if (card) return focusChunkInPdf(parseInt(card.dataset.idx), card);
 });
+
+// 在原文视图里定位某个切片
+function focusChunkInPdf(idx, card) {
+  // 取该切片的数据
+  const c = (currentCaseData && currentCaseData.chunks || []).find(x => x.index === idx);
+  // 没有数据或原文未就绪时不动作
+  if (!c || !pdfView.ready) return;
+  // 选中态只保留一个，便于看清当前对照的是哪一条
+  $("chunkStream").querySelectorAll(".chunk.on").forEach(el => el.classList.remove("on"));
+  card.classList.add("on");
+  // 交给原文视图滚动定位；没有坐标的切片如实提示而不是静默无反应
+  if (!pdfView.focus(c.position_int || [])) {
+    toast("该切片没有坐标，无法在原文中定位");
+  }
+}
+
+// ========== 原文视图工具栏 ==========
+// 缩放按步长调整；1.25 倍一档，比固定加减更符合看文档时的手感
+$("pdfZoomIn").addEventListener("click", () => pdfView.zoom(pdfView.scale * 1.25));
+$("pdfZoomOut").addEventListener("click", () => pdfView.zoom(pdfView.scale / 1.25));
+$("pdfFitWidth").addEventListener("click", () => pdfView.fitWidth());
+$("pdfFitPage").addEventListener("click", () => pdfView.fitPage());
+
+// 框选标记模式开关
+let pdfMarking = false;
+$("pdfMarkMode").addEventListener("click", () => {
+  // 原文没加载时无从框选
+  if (!pdfView.ready) return toast("先选一个 PDF 样本");
+  // 取反并应用
+  pdfMarking = !pdfMarking;
+  pdfView.setMarking(pdfMarking, onPdfMarked);
+  // 提示当前进入了什么状态，避免拖不动时以为是坏了
+  toast(pdfMarking ? "框选标记：在原文上拖出一块区域" : "已退出框选标记");
+});
+// 拖拽交互只需绑定一次，页是动态建的，逐页绑会随样本切换泄漏监听器
+pdfView.bindMarking();
+
+// 框选完成后的落库：把区域记成一条「切分器漏判」的人工标注
+async function onPdfMarked(pos, cancel) {
+  // 问题类型必须由人来定，否则统计时无从归类
+  const det = await pickDetector("这块区域是什么问题？");
+  // 放弃时把框撤掉，不留下没有归属的框
+  if (!det) return cancel();
+  // 失败时同样撤框，避免界面显示的与已保存的不一致
+  try {
+    await api(`/api/annotations/${encodeURIComponent(currentCase)}/regions`, {
+      method: "POST",
+      body: JSON.stringify({
+        region: pos,    // 区域坐标，与切片坐标同为 PDF 点
+        detector: det,  // 人工指定的问题类型
+      }),
+    });
+    toast(`已标记该区域为「${det}」`);
+  } catch (e) {
+    cancel();
+    toast(`标记失败：${e.message}`);
+  }
+}
+
+// 让人从已知问题类型里挑一个，也允许自己填
+async function pickDetector(title) {
+  // 候选取自检测器元数据，与切片标注用的是同一套问题类型，
+  // 人工标记才能和规则检出的结果放在一起统计
+  const known = Object.keys(DETECTOR_META);
+  // 中英对照列出，填的时候不用去猜英文名
+  const hint = known.length
+    ? `\n\n可填：\n${known.map(k => `  ${k}（${detCn(k)}）`).join("\n")}`
+    : "";
+  // 用原生 prompt：这是本地工具，为选一个值做一套弹窗不划算
+  const v = prompt(`${title}${hint}`, "");
+  // 去掉空白；空值表示放弃
+  return (v || "").trim();
+}
+
+// 加载样本已有的区域标注并画到原文上
+async function restoreRegions(caseId) {
+  // 原文没就绪时无处可画
+  if (!pdfView.ready) return;
+  // 拉取失败不应影响预览主流程
+  try {
+    const items = await api(`/api/annotations/${encodeURIComponent(caseId)}/regions`);
+    // 切样本时先清掉上一份的框
+    pdfView.clearManual();
+    // 画出全部区域
+    pdfView.drawManual((items || []).map(x => x.region));
+  } catch (e) { /* 区域标注是附加信息，拉不到就不画 */ }
+}
 
 // 写入一条标注
 async function doAnnotate(verdict, idx, detector) {
@@ -2226,18 +2792,49 @@ async function undoAnnotate(idx) {
   }
 }
 
-// 加载并展示原文截图
-async function loadShot(idx) {
+// 本样本是否还值得自动取缩略图。
+// Office 文档、未关联原文的样本，每个切片都会以同样的理由失败，
+// 撞上第一次就该停手，否则上千个切片会发上千次注定失败的请求。
+let autoShotOff = false;
+
+// 缩略图懒加载：只有滚到眼前的切片才渲染。
+// 一个样本上千个切片，进页面就全渲染既慢又没人看得过来。
+const shotObserver = new IntersectionObserver(entries => {
+  entries.forEach(e => {
+    // 离开视野的不处理
+    if (!e.isIntersecting) return;
+    // 取出切片序号
+    const idx = parseInt(e.target.dataset.autoshot);
+    // 一个容器只自动取一次，取完就不必再观察
+    shotObserver.unobserve(e.target);
+    // 本样本已判定取不到时直接跳过
+    if (autoShotOff) return;
+    // 自动模式：失败时不在每张卡片上铺红字
+    loadShot(idx, true);
+  });
+}, { rootMargin: "300px 0px" });
+
+// 让当前渲染出来的切片都进入观察
+function observeShots() {
+  // 每次重渲后重新收集，旧节点已被替换
+  $("chunkStream").querySelectorAll("[data-autoshot]").forEach(el => shotObserver.observe(el));
+}
+
+// 加载并展示原文截图。auto 为真表示由滚动触发，失败时保持安静。
+async function loadShot(idx, auto) {
   const box = document.getElementById(`shot-${idx}`);
   if (!box) return;
-  // 已加载过则折叠，再点展开
+  // 已加载过：手动点击时折叠/展开，自动触发时不动已有内容
   if (shotCache[idx]) {
-    box.innerHTML = box.innerHTML ? "" : shotCache[idx];
+    if (!auto) box.innerHTML = box.innerHTML ? "" : shotCache[idx];
     return;
   }
   const rec = (currentCaseData.chunks || []).find(c => c.index === idx);
   if (!rec) return;
-  box.innerHTML = `<div class="hint"><span class="spin"></span> 正在渲染原文…</div>`;
+  // 自动加载时用一个矮占位，避免每张卡片都跳一下高度
+  box.innerHTML = auto
+    ? `<div class="hint" style="font-size:0.72rem">渲染中…</div>`
+    : `<div class="hint"><span class="spin"></span> 正在渲染原文…</div>`;
   try {
     const r = await api(`/api/preview/${encodeURIComponent(currentCase)}/shot`, {
       method: "POST",
@@ -2245,6 +2842,15 @@ async function loadShot(idx) {
     });
     // 前置条件不满足时如实说明，并在缺原文时给出关联入口
     if (!r.ok) {
+      // 缺原文、非 PDF 这类失败对整个样本都成立，自动模式下就此收手，
+      // 免得剩下的切片继续发注定失败的请求
+      if (auto && ["no_source", "not_pdf", "no_pdfplumber"].includes(r.reason)) {
+        autoShotOff = true;
+        box.innerHTML = "";
+        return;
+      }
+      // 自动模式下的其它失败只清占位，不在每张卡片上铺红字
+      if (auto) { box.innerHTML = ""; return; }
       box.innerHTML = `<div class="hint" style="color:var(--warn)">${esc(r.message)}
         ${r.reason === "no_source" ? ' <button class="mini" id="attachSrc">关联原始文件</button>' : ""}</div>`;
       const b = document.getElementById("attachSrc");
@@ -2258,7 +2864,8 @@ async function loadShot(idx) {
     shotCache[idx] = html;
     box.innerHTML = html;
   } catch (err) {
-    box.innerHTML = `<div class="hint" style="color:var(--bad)">截图失败：${esc(err.message)}</div>`;
+    // 自动模式下静默失败，只清掉占位
+    box.innerHTML = auto ? "" : `<div class="hint" style="color:var(--bad)">截图失败：${esc(err.message)}</div>`;
   }
 }
 
@@ -2315,7 +2922,8 @@ function renderChunk(c, highlight) {
     <div class="chunk-body ${isTable ? "is-table" : ""}">${body}</div>
     ${issues ? `<div class="chunk-issues">${issues}</div>` : ""}
     ${renderAnnotation(c)}
-    <div class="chunk-shot" id="shot-${c.index}"></div>
+    <!-- 有坐标的切片才自动取缩略图；没坐标的取了也是空，白发一次请求 -->
+    <div class="chunk-shot" id="shot-${c.index}"${(c.position_int || []).length ? ` data-autoshot="${c.index}"` : ""}></div>
   </div>`;
 }
 
