@@ -423,6 +423,20 @@ a.mini { text-decoration: none; display: inline-block; line-height: 1.5; }
 
 /* 切片预览的数据来源选择：实时切分 vs 历史快照 */
 .src-bar { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; font-size: 0.82rem; color: var(--muted); margin-bottom: 0.7rem; }
+/* 按编号跳转：整组贴在数据来源那一行的右端 */
+.jump-box { display: flex; align-items: center; gap: 0.3rem; }
+/* 编号输入框窄一些即可，四位数足够容纳上千个切片 */
+.jump-box input {
+  width: 4.5rem; font-family: var(--mono); font-size: 0.8rem;
+  padding: 0.16rem 0.35rem; border: 1px solid var(--line-strong);
+  border-radius: 4px; background: var(--surface); color: var(--ink);
+}
+/* 去掉数字输入框的上下微调箭头：它会挤占本就不宽的输入区 */
+.jump-box input::-webkit-outer-spin-button,
+.jump-box input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.jump-box input[type="number"] { -moz-appearance: textfield; appearance: textfield; }
+/* 翻页按钮做成紧凑方块，与输入框等高 */
+.jump-box .step { padding: 0.16rem 0.45rem; font-family: var(--mono); }
 
 /* ========== 人工标注与原文截图 ========== */
 .chunk-anno {
@@ -1081,6 +1095,9 @@ let currentCase = null;     // 切片预览中当前选中的样本
 let currentCaseData = null; // 当前样本的切片数据，切换筛选时复用避免重复切分
 let chunkFilter = "";       // 切片预览的检测器筛选，空串表示不筛选
 let caseAnnotations = {};   // 当前样本的人工标注，键为切片序号
+// 最近一次手动跳转定位到的切片序号，null 表示本样本还没跳过。
+// 既用于重绘后回填输入框，也作为上一片／下一片的移动基准。
+let chunkJumpIndex = null;
 let shotCache = {};         // 截图缓存，避免同一切片重复渲染
 // pdf.js 的 worker 同样走本地 vendor，与主库版本必须一致否则会报版本不匹配
 pdfjsLib.GlobalWorkerOptions.workerSrc = "/vendor/pdf.worker.min.js";
@@ -2542,6 +2559,84 @@ function scrollToChunk(target) {
   setTimeout(() => el.classList.remove("locate"), 2400);
 }
 
+// ========== 按编号跳转到指定切片 ==========
+// 输入框按全局编号定位，翻页按钮在当前可见列表内移动，两者最终都走
+// gotoChunkIndex，保证校验、取消筛选、滚动高亮的行为完全一致。
+
+// 当前页面上实际渲染出来的切片，顺序与 renderChunkView 一致
+function visibleChunks() {
+  // 未选样本时为空
+  const chunks = (currentCaseData && currentCaseData.chunks) || [];
+  // 有筛选时只有命中该类的切片在 DOM 里，无筛选时全部都在
+  return chunkFilter ? currentFilterChunks() : chunks;
+}
+
+// 定位到指定编号的切片，成功返回真
+function gotoChunkIndex(idx) {
+  // 未选样本时无从定位
+  const chunks = (currentCaseData && currentCaseData.chunks) || [];
+  if (!chunks.length) return toast("请先选择一个样本");
+  // 目标必须真实存在；编号未必从 0 起、也未必连续，因此按实际数据判断而非算范围
+  const hit = chunks.find(c => c.index === idx);
+  if (!hit) {
+    // 报出实际的首尾编号，比笼统的「不存在」有用
+    return toast(`没有 #${idx}，本样本编号范围 ${chunks[0].index} ~ ${chunks[chunks.length - 1].index}`);
+  }
+  // 记住本次定位，作为翻页基准并供重绘后回填输入框
+  chunkJumpIndex = idx;
+  // 目标是否在当前筛选下渲染出来了
+  const visible = !chunkFilter || (hit.findings || []).some(f => f.detector === chunkFilter);
+  if (!visible) {
+    // 不在筛选内时 DOM 里根本没有这个节点，必须先取消筛选再重绘
+    chunkFilter = "";
+    // 重绘会顺带把输入框回填为当前编号
+    renderChunkView();
+    // 筛选状态被改变了，必须说明，否则会困惑于列表怎么变长了
+    toast(`#${idx} 不在原筛选内，已取消筛选`);
+  } else {
+    // 无需重绘时只同步输入框，避免为一次跳转重建上千个切片节点
+    const input = $("chunkJump");
+    if (input) input.value = idx;
+  }
+  // 复用既有的滚动与高亮；编号已校验过，不会触发它的找不到分支
+  scrollToChunk({ index: idx });
+  return true;
+}
+
+// 读输入框的编号并跳转
+function jumpToChunk() {
+  // 输入框不存在说明当前不在切片预览页
+  const input = $("chunkJump");
+  if (!input) return;
+  // 去掉首尾空白
+  const raw = (input.value || "").trim();
+  // 空值只是没填，不算错误
+  if (!raw) return toast("请输入切片编号");
+  // 编号是序号不是度量，只接受整数
+  const idx = Number(raw);
+  if (!Number.isInteger(idx)) return toast("切片编号必须是整数");
+  // 交给统一入口处理
+  gotoChunkIndex(idx);
+}
+
+// 上一片／下一片：在当前可见列表内移动
+function stepChunk(delta) {
+  // 以页面上实际渲染的切片为准：筛选状态下逐片核对的是这一类，不该跳出去
+  const list = visibleChunks();
+  if (!list.length) return toast("请先选择一个样本");
+  // 按数组位置移动而不是编号加减——编号未必连续，加减会落空
+  let pos = list.findIndex(c => c.index === chunkJumpIndex);
+  // 还没定位过时从边界外起步，使首次点击正好落在第一片或最后一片
+  if (pos < 0) pos = delta > 0 ? -1 : list.length;
+  // 目标位置
+  const next = pos + delta;
+  // 到头时明确告知，而不是静默无反应
+  if (next < 0) return toast("已经是第一片");
+  if (next >= list.length) return toast("已经是最后一片");
+  // 交给统一入口处理
+  gotoChunkIndex(list[next].index);
+}
+
 // ========== 切片预览：加载并渲染某个样本 ==========
 // target 形如 {index, evidence, config}：指定加载后要定位到的切片，
 // 其中 config 是该条目所属轮次的切分参数，必须用它切分序号才对得上。
@@ -2955,6 +3050,9 @@ const pdfView = (() => {
 
 async function selectCase(caseId, target) {
   currentCase = caseId;
+  // 换样本时清掉上一份的跳转位置：编号只在本样本内有意义，
+  // 留着会让翻页从一个不属于当前样本的基准起步
+  chunkJumpIndex = null;
   // 更新左侧选中态
   $("chunkCaseList").querySelectorAll(".case-item").forEach(b => {
     b.classList.toggle("active", b.dataset.case === caseId);
@@ -2983,6 +3081,8 @@ async function selectCase(caseId, target) {
         _usedConfig: h.config || {},
         _isHistory: true,
       };
+      // 从别处跳进来时先记下基准，渲染时才能回填输入框，翻页也接着这一片继续
+      if (target) chunkJumpIndex = target.index;
       renderChunkView();
       if (target) scrollToChunk(target);
       return;
@@ -3007,6 +3107,8 @@ async function selectCase(caseId, target) {
     autoShotOff = false;
     // 记录本次切分实际使用的参数，供界面标注
     currentCaseData._usedConfig = p;
+    // 从别处跳进来时先记下基准，渲染时才能回填输入框，翻页也接着这一片继续
+    if (target) chunkJumpIndex = target.index;
     // 渲染元信息、筛选工具栏与切片流
     renderChunkView();
     // 渲染完成后再定位，此时 DOM 已就绪
@@ -3029,6 +3131,18 @@ function renderChunkView() {
   }));
   // 按数量降序排列筛选项
   const dets = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+
+  // 筛选条件是跟着上一个样本带过来的，新样本一条都没命中时自动取消。
+  // 不取消的话切片流是空的，而筛选栏里又没有对应按钮可点——
+  // 界面看上去就像这个样本没切出东西来，实际只是被筛没了。
+  if (chunkFilter && !counts[chunkFilter]) {
+    // 记下被丢弃的筛选，提示里要说清是哪一类
+    const dropped = chunkFilter;
+    // 回到显示全部
+    chunkFilter = "";
+    // 明确告知，而不是默默换了视图
+    toast(`本样本没有「${detCn(dropped)}」，已显示全部切片`);
+  }
 
   // 依据当前筛选挑出要展示的切片
   const shown = chunkFilter
@@ -3061,6 +3175,14 @@ function renderChunkView() {
         </select>
       </label>
       ${viewingRun ? `<span class="pill low">历史快照，非实时结果</span>` : ""}
+      <span class="spacer"></span>
+      <div class="jump-box">
+        <button class="mini step" id="chunkPrev" title="上一片">‹</button>
+        <label>跳到 #<input type="number" id="chunkJump" placeholder="编号"
+          value="${chunkJumpIndex === null ? "" : chunkJumpIndex}"></label>
+        <button class="mini step" id="chunkNext" title="下一片">›</button>
+        <button class="mini" id="chunkJumpBtn">跳转</button>
+      </div>
     </div>`;
 
   // 筛选工具栏：全部 + 各问题类型
@@ -3125,6 +3247,18 @@ function renderChunkView() {
       viewingRun = srcSel.value;
       selectCase(currentCase);
     });
+  }
+  // 绑定按编号跳转：点按钮或在输入框里回车都能触发
+  const jumpInput = $("chunkJump");
+  if (jumpInput) {
+    // 回车直接跳，省去伸手点按钮
+    jumpInput.addEventListener("keydown", ev => {
+      if (ev.key === "Enter") jumpToChunk();
+    });
+    $("chunkJumpBtn").addEventListener("click", jumpToChunk);
+    // 上一片／下一片：以最近一次定位到的切片为基准移动
+    $("chunkPrev").addEventListener("click", () => stepChunk(-1));
+    $("chunkNext").addEventListener("click", () => stepChunk(1));
   }
 
   // 渲染切片流；筛选后无结果时给出明确提示
