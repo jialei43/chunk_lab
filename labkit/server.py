@@ -186,6 +186,17 @@ def api_parse():
         return jsonify({"ok": False, "message": "未选择文件"}), 400
     # 确保上传目录存在
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    # 解析方式：local 走本机 MinerU 服务，cloud 走官方精准解析 API
+    mode = (request.form.get("mode") or "local").lower()
+    # 云端缺 token 时提前拦下，避免文件都落盘了才失败
+    if mode == "cloud" and not resolve_mineru_token():
+        return jsonify({"ok": False,
+                        "message": "未配置 MinerU token。请在 chunk-lab/labconfig.json "
+                                   "填 mineru_token，或设置环境变量 MINERU_API_TOKEN"}), 400
+    # 官方单批上限 200，超出时要求分批而不是截断
+    if mode == "cloud" and len(files) > 200:
+        return jsonify({"ok": False,
+                        "message": f"官方单批最多 200 个文件，当前 {len(files)} 个，请分批提交"}), 400
     # 表单参数整批共用，循环外解析一次即可
     backend = request.form.get("backend") or "pipeline"  # 处理后端类型
     parse_method = request.form.get("parse_method") or "auto"  # 解析方法
@@ -194,6 +205,7 @@ def api_parse():
     note = request.form.get("note", "")  # 备注
     mineru_api = request.form.get("mineru_api", "")  # MinerU API 服务器，留空用默认
     output_dir = request.form.get("output_dir", "")  # 产物输出目录，留空用实验室默认目录
+    lang = request.form.get("lang") or "ch"  # 文档语言，仅云端使用
 
     # 本批已提交的文件名集合，用于跳过同名文件
     seen = set()
@@ -201,6 +213,8 @@ def api_parse():
     tasks = []
     # 因同名被跳过的文件名列表
     skipped = []
+    # 已落盘待整批提交的文件路径，仅云端使用
+    saved = []
     # 逐个落盘并排队
     for file in files:
         # 保留原始文件名：切分器按扩展名分派类型，改名会导致走错分支
@@ -217,7 +231,13 @@ def api_parse():
         dest = UPLOAD_DIR / name
         # 落盘
         file.save(dest)
-        # 排队解析，返回任务标识
+        # 云端整批提交，此处只收集路径，排队动作放到循环外
+        if mode == "cloud":
+            # 记下落盘路径，供整批提交
+            saved.append(dest)
+            # 本文件处理完毕
+            continue
+        # 本地逐个排队解析，返回任务标识
         task_id = start_parse(
             dest,  # 已落盘的文件路径
             name,  # 原始文件名
@@ -232,11 +252,25 @@ def api_parse():
         # 记录本次提交结果
         tasks.append({"task_id": task_id, "filename": name})
 
+    # 云端整批共用一个批次轮询，逐个提交既慢又浪费配额
+    if mode == "cloud" and saved:
+        # 整批提交，得到单个任务标识
+        cloud_task = start_cloud_parse(
+            saved,  # 本批全部文件路径
+            auto_import=auto_import,  # 解析后是否自动入库
+            kind=kind,  # 文档大类
+            note=note,  # 备注
+            lang=lang,  # 文档语言
+        )
+        # 批次内每个文件都指向同一个任务，便于界面统一展示
+        tasks = [{"task_id": cloud_task, "filename": p.name} for p in saved]
+
     # 返回批量结果；task_id 保留单个值兼容只提交一个文件的旧调用方
     return jsonify({
         "ok": True,  # 提交成功
+        "mode": mode,  # 实际使用的解析方式，便于界面区分提示
         "task_id": tasks[0]["task_id"] if tasks else None,  # 首个任务标识，兼容旧调用
-        "task_ids": [t["task_id"] for t in tasks],  # 全部任务标识
+        "task_ids": sorted({t["task_id"] for t in tasks}),  # 去重后的任务标识
         "tasks": tasks,  # 任务与文件名对照
         "count": len(tasks),  # 实际提交数量
         "skipped": skipped,  # 因同名被跳过的文件

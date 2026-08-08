@@ -265,6 +265,9 @@ input[type="text"], input[type="number"], select {
   color: var(--ink-soft);
 }
 
+/* 解析方式切换 */
+.parse-form .cloud-only .cfg-hint { color: var(--muted); }
+
 /* ========== 解析任务 ========== */
 .parse-form .cfg-row { grid-template-columns: 8rem 14rem 1fr; }
 .task-row {
@@ -799,6 +802,16 @@ tr.is-baseline { background: var(--accent-soft); }
 
       <div class="parse-form">
         <div class="cfg-row">
+          <label class="cfg-label">解析方式</label>
+          <div class="cfg-input">
+            <select id="parseMode">
+              <option value="local">本地 MinerU</option>
+              <option value="cloud">云端官方 API</option>
+            </select>
+          </div>
+          <div class="cfg-hint" id="modeHint"></div>
+        </div>
+        <div class="cfg-row">
           <label class="cfg-label">选择文件</label>
           <div class="cfg-input" style="grid-column:span 2">
             <!-- multiple 支持一次选多个文件批量提交，下方参数整批共用 -->
@@ -807,26 +820,26 @@ tr.is-baseline { background: var(--accent-soft); }
             <div class="hint" id="parseFileHint" style="margin-top:0.4rem">可多选，一次提交多个文件；解析在后台串行执行，不会同时压垮 MinerU。</div>
           </div>
         </div>
-        <div class="cfg-row">
+        <div class="cfg-row local-only">
           <label class="cfg-label">MinerU API 服务器</label>
           <div class="cfg-input" style="grid-column:span 2">
             <input type="text" id="parseApi" placeholder="留空使用默认" style="width:100%;max-width:26rem">
           </div>
         </div>
-        <div class="cfg-row">
+        <div class="cfg-row local-only">
           <label class="cfg-label">MinerU 输出目录</label>
           <div class="cfg-input" style="grid-column:span 2">
             <input type="text" id="parseOutDir" placeholder="留空使用默认" style="width:100%;max-width:26rem">
           </div>
         </div>
-        <div class="cfg-row">
+        <div class="cfg-row local-only">
           <label class="cfg-label">处理完成后删除输出文件</label>
           <div class="cfg-input"><input type="checkbox" disabled></div>
           <div class="cfg-hint">
             生产该项默认开启，实验室<strong>固定关闭</strong>——离线重放依赖这些产物，删掉就无法重放，故不提供开关。
           </div>
         </div>
-        <div class="cfg-row">
+        <div class="cfg-row local-only">
           <label class="cfg-label">处理后端类型</label>
           <div class="cfg-input">
             <select id="parseBackend">
@@ -839,7 +852,7 @@ tr.is-baseline { background: var(--accent-soft); }
           </div>
           <div class="cfg-hint">与知识库 MinerU 模型配置中的「MinerU处理后端类型」一致。不同 backend 产出的块数可能差两成。</div>
         </div>
-        <div class="cfg-row">
+        <div class="cfg-row local-only">
           <label class="cfg-label">解析方法</label>
           <div class="cfg-input">
             <select id="parseMethod">
@@ -849,6 +862,16 @@ tr.is-baseline { background: var(--accent-soft); }
             </select>
           </div>
           <div class="cfg-hint">对应 MinerU 选项中的「解析方法」。</div>
+        </div>
+        <div class="cfg-row cloud-only" style="display:none">
+          <label class="cfg-label">文档语言</label>
+          <div class="cfg-input">
+            <select id="parseLang">
+              <option value="ch">中文</option>
+              <option value="en">英文</option>
+            </select>
+          </div>
+          <div class="cfg-hint">云端 model_version 固定为 vlm（官方推荐），无需选择 backend。</div>
         </div>
         <div class="cfg-row">
           <label class="cfg-label">解析后入库</label>
@@ -1031,6 +1054,8 @@ async function loadConfig() {
     if ($("parseApi") && !$("parseApi").value) $("parseApi").placeholder = m.mineru_api || "";
     if ($("parseOutDir") && !$("parseOutDir").value) $("parseOutDir").placeholder = m.output_dir || "";
     if ($("parseBackend") && m.backend) $("parseBackend").value = m.backend;
+    // 云端可用性影响提示文案，配置到位后重新应用一次
+    if ($("parseMode")) applyParseMode();
     // 首次加载时用默认值作为当前配置
     if (!Object.keys(parserConfig).length) parserConfig = { ...configDefaults };
     renderConfigSummary();
@@ -2608,21 +2633,56 @@ $("parseFile").addEventListener("change", () => {
 });
 
 // 提交解析：支持一次提交多个文件，每个文件在服务端各自成为一个任务
+// 解析方式切换：两种方式的参数集合不同，只显示当前方式用得上的。
+// 把用不上的参数留在页面上，只会让人误以为它们生效。
+function applyParseMode() {
+  const isCloud = $("parseMode").value === "cloud";
+  // 本地专属参数：backend、解析方法、服务地址、输出目录等
+  document.querySelectorAll(".local-only").forEach(el => {
+    el.style.display = isCloud ? "none" : "";
+  });
+  // 云端专属参数：文档语言
+  document.querySelectorAll(".cloud-only").forEach(el => {
+    el.style.display = isCloud ? "" : "none";
+  });
+  // 说明点出两者的实质差别，而不只是快慢
+  if (isCloud) {
+    const ok = configCloud && configCloud.available;
+    $("modeHint").innerHTML = ok
+      ? "官方精准解析 API，model_version=vlm，一次可提交至多 200 个文件。实测小文件约 6 秒。"
+      : `<span style="color:var(--warn)">云端不可用：${esc((configCloud && configCloud.hint) || "未配置 token")}</span>`;
+  } else {
+    $("modeHint").textContent =
+      "调用本机 MinerU 服务，串行排队执行（并行会打满显存）。实测 151 页 PDF 约 36 分钟。";
+  }
+  // 按钮文案随方式变化，提交前就能看出走的是哪条路
+  $("btnParse").textContent = isCloud ? "提交到云端解析" : "开始本地解析";
+}
+$("parseMode").addEventListener("change", applyParseMode);
+
 $("btnParse").addEventListener("click", async () => {
   const input = $("parseFile");
   // 取出全部已选文件
   const files = [...(input.files || [])];
   // 未选文件时直接提示，不发无效请求
   if (!files.length) return toast("请先选择文件");
+  const mode = $("parseMode").value;
   const fd = new FormData();
   // 多个文件用同一个字段名追加，后端以 getlist 取出
   files.forEach(f => fd.append("file", f));
-  fd.append("backend", $("parseBackend").value);
-  fd.append("parse_method", $("parseMethod").value);
+  fd.append("mode", mode);
   fd.append("auto_import", $("parseAutoImport").checked ? "1" : "0");
-  // 服务地址与输出目录留空则由后端按「环境变量 > 默认值」解析
-  fd.append("mineru_api", $("parseApi").value.trim());
-  fd.append("output_dir", $("parseOutDir").value.trim());
+  // 两种方式各需一组参数，只发当前方式用得上的，
+  // 把用不上的一并发过去只会让后端接到一堆无意义的字段
+  if (mode === "cloud") {
+    fd.append("lang", $("parseLang").value);
+  } else {
+    fd.append("backend", $("parseBackend").value);
+    fd.append("parse_method", $("parseMethod").value);
+    // 服务地址与输出目录留空则由后端按「环境变量 > 默认值」解析
+    fd.append("mineru_api", $("parseApi").value.trim());
+    fd.append("output_dir", $("parseOutDir").value.trim());
+  }
 
   const btn = $("btnParse");
   btn.disabled = true;
