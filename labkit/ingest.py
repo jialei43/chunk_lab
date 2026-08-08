@@ -151,8 +151,11 @@ def ingest_case(case, overwrite=False):
     source = Path(case["source"])
     # 目标语料目录，以 case_id 命名
     dest_dir = CORPUS_DIR / case["case_id"]
-    # 目标产物路径，统一重命名为 content_list.json，屏蔽上游命名差异
-    dest_json = dest_dir / "content_list.json"
+    # 目标产物路径：保留 MinerU 的原始文件名。
+    # 桥接层直接调用生产的 MinerUParser._read_output，它按
+    # "{stem}_content_list.json" / "{stem}_middle.json" 查找，
+    # 统一改名会让它找不到从而静默降级，切分结果与线上产生偏差。
+    dest_json = dest_dir / source.name
     # 源文件不存在时跳过并回报，避免整批导入因个别样本失败而中断
     if not source.is_file():
         return None, f"源产物不存在：{source}"
@@ -184,6 +187,11 @@ def ingest_case(case, overwrite=False):
         "kind": case["kind"],  # 文档大类，报告分组用
         "slide_mode": case["slide"],  # 是否按幻灯片切分
         "block_count": block_count,  # MinerU 原始块数
+        # 产物文件名保留 MinerU 原始命名，桥接层据此还原 stem 供 _read_output 查找
+        "content_list_name": source.name,
+        # backend 取自产物所在的子目录名（hybrid_auto / vlm / office），
+        # 生产的 _read_output 用它决定在哪些子目录中查找产物
+        "backend": source.parent.name,
         "source": str(source),  # 产物原始路径，仅作追溯用途
         "note": case["note"],  # 该样本的关注点
     }

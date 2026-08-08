@@ -33,10 +33,10 @@ def load_cases(only=None):
             continue
         # 描述文件路径
         meta_path = case_dir / "case.yaml"
-        # 产物文件路径
-        json_path = case_dir / "content_list.json"
+        # 产物文件按 MinerU 原始命名保存，用通配定位而非固定文件名
+        candidates = list(case_dir.glob("*_content_list.json"))
         # 两者缺一则该目录不是完整样本，跳过
-        if not meta_path.is_file() or not json_path.is_file():
+        if not meta_path.is_file() or not candidates:
             continue
         # 读取描述文件
         with meta_path.open("r", encoding="utf-8") as fh:
@@ -46,14 +46,16 @@ def load_cases(only=None):
         if only and meta.get("case_id") not in only:
             continue
         # 把产物路径补进描述，供后续切分使用
-        meta["content_list"] = json_path
+        meta["content_list"] = candidates[0]
+        # 样本目录本身即桥接层需要的语料目录
+        meta["corpus_dir"] = case_dir
         # 收入结果
         cases.append(meta)
     # 返回全部样本
     return cases
 
 
-def evaluate_case(case, cfg=None, children_delimiter=""):
+def evaluate_case(case, cfg=None, children_delimiter=None):
     """评估单个样本：离线切分 + 全部检测器，返回统计与命中。"""
     # 未指定配置时使用默认阈值
     cfg = cfg or DetectorConfig()
@@ -107,7 +109,7 @@ def evaluate_case(case, cfg=None, children_delimiter=""):
     }
 
 
-def inspect_case(case, cfg=None, children_delimiter=""):
+def inspect_case(case, cfg=None, children_delimiter=None):
     """返回单个样本的完整切片内容，并把检测命中挂到对应切片上。
 
     这是「预览切分效果」的数据源：前端据此逐块展示正文，
@@ -163,7 +165,7 @@ def inspect_case(case, cfg=None, children_delimiter=""):
     }
 
 
-def evaluate_all(only=None, cfg=None, children_delimiter=""):
+def evaluate_all(only=None, cfg=None, children_delimiter=None):
     """评估全部语料，返回完整报告字典。"""
     # 未指定配置时使用默认阈值
     cfg = cfg or DetectorConfig()
