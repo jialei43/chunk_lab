@@ -83,6 +83,32 @@ MINERU_OUT = DATA_ROOT / "mineru_out"
 UPLOAD_DIR = DATA_ROOT / "uploads"
 
 
+def resolve_scan_dirs():
+    """解析「添加语料」页要扫描哪些 MinerU 产物目录。
+
+    默认把实验室自己的产物目录排在最前，其后才是外部目录（生产的 MinerU
+    输出、历史实验产物）。外部目录保留是为了能导入既有产物，但界面会标明
+    来源，避免分不清哪些是实验室产的、哪些是生产产的。
+
+    可通过 labconfig.json 的 scan_dirs 完全覆盖，例如只留实验室目录。
+    """
+    # 配置了就完全以配置为准，允许使用者只扫实验室目录
+    configured = load_config().get("scan_dirs")
+    # 接受字符串列表，逐个展开 ~
+    if isinstance(configured, list) and configured:
+        return [Path(p).expanduser() for p in configured if p]
+    # 未配置时用默认清单：实验室产物优先，外部目录其次
+    return [
+        MINERU_OUT,  # 实验室自己的解析产物
+        Path.home() / "MinerU" / "result",  # 生产 MinerU 服务的输出目录
+        LAB_ROOT.parent / "ragflow" / "tmp" / "pdfs",  # 历史实验产物
+    ]
+
+
+# 待扫描的产物目录清单
+SCAN_DIRS = resolve_scan_dirs()
+
+
 def ensure_ragflow_importable():
     """把 ragflow 源码根目录加入 sys.path，使 `rag.app.*` 等模块可被直接导入。
 

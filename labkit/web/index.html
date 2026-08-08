@@ -198,7 +198,7 @@ td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-alig
 .issue .ev { font-family: var(--mono); font-size: 0.74rem; color: var(--muted); background: var(--sunk); padding: 0.05rem 0.35rem; border-radius: 3px; }
 
 /* ========== 语料导入 ========== */
-.src-row { display: grid; grid-template-columns: 1.6rem 1fr 6rem 5rem 5rem; gap: 0.6rem; align-items: center; padding: 0.4rem 0; border-bottom: 1px solid var(--line); font-size: 0.84rem; }
+.src-row { display: grid; grid-template-columns: 1.6rem 1fr 6rem 5rem 4.5rem 5rem; gap: 0.6rem; align-items: center; padding: 0.4rem 0; border-bottom: 1px solid var(--line); font-size: 0.84rem; }
 .src-row:last-child { border-bottom: none; }
 .src-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .src-row.done { opacity: 0.5; }
@@ -696,11 +696,14 @@ tr.is-baseline { background: var(--accent-soft); }
     <div class="card">
       <h3>本机 MinerU 产物</h3>
       <p class="hint" style="margin:0 0 0.9rem">
-        同一文档的重复解析副本已自动去重，只保留最新一份；但同一文档的不同 backend 会各保留一条——
-        它们喂给切分器的块数可能差两成，是有价值的对照。
+        同时扫描实验室自己的产物目录与外部目录（生产 MinerU 输出、历史实验产物），
+        每条都标明来源。同一文档的重复解析副本已自动去重只留最新一份；
+        但同一文档的不同 backend 会各保留一条——它们喂给切分器的块数可能差两成，是有价值的对照。
+        扫描哪些目录可在 <code>labconfig.json</code> 的 <code>scan_dirs</code> 中修改。
       </p>
       <div class="controls" style="margin-bottom:0.8rem">
         <label><input type="checkbox" id="hideImported" checked> 隐藏已导入</label>
+        <label><input type="checkbox" id="labOnly"> 只看实验室产物</label>
         <input type="text" id="srcFilter" placeholder="按文档名筛选…" style="flex:1;min-width:10rem">
         <button class="btn primary" id="btnImport" disabled>导入选中</button>
       </div>
@@ -2073,8 +2076,11 @@ async function loadSources() {
 function renderSources() {
   const hideImported = $("hideImported").checked;
   const filter = $("srcFilter").value.trim().toLowerCase();
+  // 只看实验室产物：用于把生产目录里的历史产物排除在外
+  const labOnly = $("labOnly").checked;
   const items = sourcesCache.filter(s =>
     (!hideImported || !s.imported) &&
+    (!labOnly || s.origin === "lab") &&
     (!filter || s.doc_name.toLowerCase().includes(filter)));
 
   if (!items.length) {
@@ -2083,7 +2089,7 @@ function renderSources() {
   }
   $("srcList").innerHTML =
     `<div class="src-row" style="font-family:var(--mono);font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em">
-      <span></span><span>文档</span><span>backend</span><span style="text-align:right">块数</span><span>状态</span>
+      <span></span><span>文档</span><span>backend</span><span style="text-align:right">块数</span><span>来源</span><span>状态</span>
     </div>` +
     items.map(s => {
       const idx = sourcesCache.indexOf(s);
@@ -2092,6 +2098,9 @@ function renderSources() {
         <span class="src-name" title="${esc(s.path)}">${esc(s.doc_name)}</span>
         <span class="mono" style="font-size:0.76rem;color:var(--muted)">${esc(s.backend)}</span>
         <span class="mono" style="text-align:right">${s.block_count}</span>
+        <span>${s.origin === "lab"
+          ? '<span class="pill good" title="实验室自己解析的产物，与生产隔离">实验室</span>'
+          : '<span class="pill low" title="来自生产 MinerU 输出或历史实验目录">外部</span>'}</span>
         <span>${s.imported ? '<span class="pill low">已导入</span>' : `<span class="pill kind">${esc(s.kind)}</span>`}</span>
       </div>`;
     }).join("");
@@ -2108,6 +2117,7 @@ function renderSources() {
 
 // 筛选控件联动
 $("hideImported").addEventListener("change", renderSources);
+$("labOnly").addEventListener("change", renderSources);
 $("srcFilter").addEventListener("input", renderSources);
 
 // ========== 执行导入 ==========

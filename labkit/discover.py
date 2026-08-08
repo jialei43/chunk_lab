@@ -10,12 +10,7 @@ import json  # 导入 json 读取产物以统计块数
 import re  # 导入 re 剥离目录名中的随机后缀
 from pathlib import Path  # 导入 Path 处理路径
 
-from .paths import CORPUS_DIR  # 导入语料目录，用于标记哪些产物已导入
-
-# 本机 MinerU 服务的输出根目录
-MINERU_RESULT = Path("/Users/jialei/MinerU/result")
-# RagFlow 侧的实验产物根目录
-RAGFLOW_TMP = Path("/Users/jialei/Desktop/RagFlow/tmp/pdfs")
+from .paths import CORPUS_DIR, MINERU_OUT, SCAN_DIRS  # 导入语料目录、实验室产物目录与扫描清单
 # MinerU 输出目录名的随机后缀模式，形如 xxx_auto_a1b2c3d4
 RANDOM_SUFFIX_PATTERN = re.compile(r"_auto_[0-9a-z_]{6,}$", re.IGNORECASE)
 # 文档名末尾的重复副本编号，形如 xxx(1) / xxx(2)
@@ -92,10 +87,26 @@ def _imported_keys():
     return keys
 
 
+def _origin_of(path):
+    """判断产物来自实验室还是外部目录。
+
+    实验室产物是本工具自己解析出来的，与生产隔离；外部产物来自生产的
+    MinerU 输出或历史实验。两者混在一起而不标明来源，就分不清正在用的
+    究竟是哪一份，之前对不上生产的排查就吃过这个亏。
+    """
+    # 尝试判断是否位于实验室产物目录之下
+    try:
+        Path(path).relative_to(MINERU_OUT)
+        return "lab"
+    except ValueError:
+        # 不在实验室目录下即为外部产物
+        return "external"
+
+
 def scan_products(roots=None):
     """扫描全部产物，按「文档名 + backend」去重后返回候选列表。"""
-    # 未指定时扫描两个默认根目录
-    roots = roots or [MINERU_RESULT, RAGFLOW_TMP]
+    # 未指定时用配置解析出的扫描清单
+    roots = roots or SCAN_DIRS
     # 已导入样本的归组键集合，用于标记状态
     imported = _imported_keys()
     # 以「文档名 + backend」为键归组，值为该组中最新的产物
@@ -159,8 +170,10 @@ def scan_products(roots=None):
             "filename": info["doc_name"] if _guess_extension(info["doc_name"]) else info["doc_name"] + ext,  # 建议文件名
             "kind": EXT_TO_KIND.get(ext, "pdf"),  # 文档大类
             "imported": (info["doc_name"], info["backend"]) in imported,  # 是否已导入语料库
+            "origin": _origin_of(info["path"]),  # 产物来源：lab 为实验室自产，external 为外部目录
         })
-    # 按块数降序排列，规模大的文档通常更有代表性
-    items.sort(key=lambda x: -x["block_count"])
+    # 实验室自产的排在最前（它们与生产隔离，是当前实验的产物），
+    # 组内再按块数降序，规模大的文档通常更有代表性
+    items.sort(key=lambda x: (x["origin"] != "lab", -x["block_count"]))
     # 返回候选列表
     return items
