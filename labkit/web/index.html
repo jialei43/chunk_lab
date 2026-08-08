@@ -764,8 +764,17 @@ tr.is-baseline { background: var(--accent-soft); }
         你在切片预览里做的每一次判定都记在这里。<strong>准确率</strong>说明哪条规则最该改，
         <strong>回归护栏</strong>把这些判定变成可执行断言——改完规则跑一次就知道有没有碰坏别的。
         <strong>优化任务书</strong>把全部待办连同规则源码、命中证据、验证方式打包成一份
-        Markdown，直接交给 Claude 就能动手改。
+        Markdown，直接交给 Claude 就能动手改。<br>
+        所有数字都按<strong>选定版本</strong>重新核对过：修好的误报不再计入准确率、
+        也不会出现在任务书里——否则就是拿旧账压现在的成绩，还会让人去改一个已经不存在的问题。
       </p>
+      <div class="cfg-row">
+        <label class="cfg-label">基于版本</label>
+        <div class="cfg-input" style="grid-column:span 2">
+          <select id="rulesRun" style="max-width:26rem"></select>
+          <span class="hint" style="margin-left:0.5rem" id="rulesRunHint"></span>
+        </div>
+      </div>
       <div class="cfg-row">
         <label class="cfg-label">操作</label>
         <div class="cfg-input" style="grid-column:span 2">
@@ -1387,14 +1396,42 @@ const OUTCOME_PILL = {
   improved: "good", still_missing: "low", stale: "low",
 };
 
+// 规则质量页当前基于哪个版本；空串表示用当前代码实时切分
+let rulesRun = "";
+
+// 渲染版本选择器。轮次列表在概览页已经拉过，这里直接复用
+function renderRulesRunPicker() {
+  const sel = $("rulesRun");
+  if (!sel) return;
+  // 只列有切分文本快照的轮次，没有快照的核对不了
+  const opts = runsCache.filter(r => r.has_chunks).map(r => {
+    // 标出哪一轮就是当前代码跑的
+    const same = currentCodeHash && r.code_hash === currentCodeHash;
+    return `<option value="${esc(r.run_id)}" ${rulesRun === r.run_id ? "selected" : ""}>`
+      + `${esc(r.run_id)}${r.label ? " · " + esc(r.label) : ""}`
+      + `${same ? "（= 当前代码）" : "（代码已变）"}</option>`;
+  }).join("");
+  sel.innerHTML = `<option value="" ${!rulesRun ? "selected" : ""}>当前代码（实时切分核对）</option>${opts}`;
+  // 提示说明两者的差别：实时核对每次都要重切，慢但反映最新代码
+  $("rulesRunHint").textContent = rulesRun
+    ? "读该轮快照核对，秒级完成。"
+    : "用当前代码重切一遍核对，样本多时要等一会儿。";
+}
+
 // 加载规则统计与误报归纳
 async function loadRules() {
-  // 占位，避免切过来是一片空白
-  $("rulesStats").innerHTML = `<div class="card"><div class="empty"><span class="spin"></span> 加载中…</div></div>`;
+  // 版本选择器要在拉数据前渲染好，否则看不出正在按哪个版本统计
+  renderRulesRunPicker();
+  // 占位说明在等什么：实时核对要重切全部已标注样本，可能几分钟
+  $("rulesStats").innerHTML = `<div class="card"><div class="empty"><span class="spin"></span> `
+    + (rulesRun ? "正在按该轮快照核对…" : "正在用当前代码重切并核对（样本多时较慢）…")
+    + `</div></div>`;
   // 统计与归纳互不依赖，一起发
   try {
+    // 版本与切分参数一并带上，统计才会按该版本重新核对
+    const q = new URLSearchParams({ run: rulesRun, parser_config: JSON.stringify(runParams()) });
     const [stats, fp] = await Promise.all([
-      api("/api/annotations"),
+      api(`/api/annotations?${q}`),
       api("/api/guard/false-positives"),
     ]);
     renderRules(stats.stats || {}, fp.groups || []);
@@ -1414,13 +1451,17 @@ function renderRules(stats, groups) {
   }
   // 百分比展示，无数据时用占位符而不是 0%
   const pct = v => (v === null || v === undefined) ? "—" : `${Math.round(v * 100)}%`;
+  // 各类计数；字段名与后端 guard.stats 对齐
+  const t = stats.total || {};
   // 标漏报时问题类型是自由填写的，填进来的往往不是已有规则名，
   // 而是「这里该怎么改」。两者要分开看：前者衡量现有规则准不准，
   // 后者是人工提出的、规则还没覆盖的需求——那才是下一条该写什么。
   const all = Object.entries(stats.by_detector || {});
   // 已实现的规则：名字在检测器元数据里
   const rows = all.filter(([d]) => DETECTOR_META[d])
-    .sort((a, b) => b[1].false_positive - a[1].false_positive);
+    // 仍在误报的排前面——那是这个版本下最该改的
+    .sort((a, b) => (b[1].false_positive - a[1].false_positive)
+                 || (b[1].confirmed - a[1].confirmed));
   // 人工提出的新需求：名字不在元数据里，按提出次数降序
   const wanted = all.filter(([d]) => !DETECTOR_META[d] && d !== "(未指定)")
     .sort((a, b) => b[1].missed - a[1].missed);
@@ -1435,15 +1476,25 @@ function renderRules(stats, groups) {
           <div class="hint">报出来的有多少是真问题</div></div>
         <div class="stat"><div class="stat-label">召回率</div><div class="stat-value">${pct(stats.recall)}</div>
           <div class="hint">真问题有多少被抓到</div></div>
-        <div class="stat"><div class="stat-label">已标注</div><div class="stat-value">${stats.cases}</div>
-          <div class="hint">个样本</div></div>
+        <div class="stat"><div class="stat-label">已修复</div>
+          <div class="stat-value" style="color:var(--good)">${t.fixed}</div>
+          <div class="hint">曾标为误报，该版本已不再报</div></div>
+        <div class="stat"><div class="stat-label">回归</div>
+          <div class="stat-value" style="color:${t.regressed ? "var(--bad)" : "inherit"}">${t.regressed}</div>
+          <div class="hint">曾能检出，该版本检不出了</div></div>
+        <div class="stat"><div class="stat-label">核对样本</div><div class="stat-value">${stats.cases}</div>
+          <div class="hint">个</div></div>
       </div>
+      ${t.stale ? `<p class="hint" style="margin:0.8rem 0 0;color:var(--warn)">
+        另有 ${t.stale} 条标注在该版本下按正文摘要找不回对应切片，已排除在统计外——
+        切分结果变化较大时会这样，这些标注需要重做。</p>` : ""}
     </div>
     <div class="card">
       <h3>逐条规则</h3>
       <div style="overflow-x:auto">
       <table>
-        <thead><tr><th>规则</th><th>确认</th><th>误报</th><th>准确率</th><th>误报共性</th><th></th></tr></thead>
+        <thead><tr><th>规则</th><th>仍能检出</th><th>仍在误报</th><th>已修复</th>
+          <th>准确率</th><th>误报共性</th><th></th></tr></thead>
         <tbody>${rows.map(([det, s]) => {
           // 该规则的准确率单独算，总体准确率看不出是谁拖累的
           const judged = s.confirmed + s.false_positive;
@@ -1462,6 +1513,7 @@ function renderRules(stats, groups) {
             <td class="num">${s.false_positive
               ? `<a href="#" data-marks="false_positive" data-det="${esc(det)}">${s.false_positive}</a>`
               : 0}</td>
+            <td class="num" style="color:${s.fixed ? "var(--good)" : "inherit"}">${s.fixed || 0}</td>
             <td class="num">${pct(p)}</td>
             <td>${why}</td>
             <td>${s.false_positive
@@ -1472,8 +1524,9 @@ function renderRules(stats, groups) {
       </table>
       </div>
       <p class="hint" style="margin:0.8rem 0 0">
-        误报多的排在前面——那是最该改的规则。「误报共性」里的文件类型分布常常直接点出问题：
-        某类格式集中出错，说明规则没考虑那种文档的写法。
+        「仍在误报」是该版本下还没修好的，排在前面——那是最该改的规则；「已修复」是
+        曾标为误报、该版本已不再报的，不计入准确率。「误报共性」里的文件类型分布常常
+        直接点出问题：某类格式集中出错，说明规则没考虑那种文档的写法。
       </p>
     </div>
     ${wanted.length ? `<div class="card">
@@ -1621,7 +1674,7 @@ $("btnFullReport").addEventListener("click", async () => {
   btn.innerHTML = '<span class="spin"></span> 生成中…';
   try {
     // 切分参数与预览页一致，否则报告里的证据与页面上看到的对不上
-    const q = new URLSearchParams({ parser_config: JSON.stringify(runParams()) });
+    const q = new URLSearchParams({ run: rulesRun, parser_config: JSON.stringify(runParams()) });
     const d = await api(`/api/guard/report?${q}`);
     const c = d.counts;
     // 概要放在前面，让人一眼看出这份任务书有多少活
@@ -1737,7 +1790,7 @@ $("btnGuard").addEventListener("click", async () => {
   btn.innerHTML = '<span class="spin"></span> 核对中…';
   try {
     // 切分参数与预览页一致，否则切片边界不同、标注对不上
-    const q = new URLSearchParams({ parser_config: JSON.stringify(runParams()) });
+    const q = new URLSearchParams({ run: rulesRun, parser_config: JSON.stringify(runParams()) });
     renderGuard(await api(`/api/guard?${q}`));
   } catch (e) {
     $("guardResult").innerHTML = `<div class="card"><div class="empty" style="color:var(--bad)">核对失败：${esc(e.message)}</div></div>`;
@@ -1749,6 +1802,15 @@ $("btnGuard").addEventListener("click", async () => {
 
 // 刷新统计
 $("btnRefreshRules").addEventListener("click", loadRules);
+// 切换版本后重新核对：所有数字都随版本变化，不重算就对不上了
+$("rulesRun").addEventListener("change", () => {
+  rulesRun = $("rulesRun").value;
+  // 上一版本的明细与报告已经失效，先清掉免得看串
+  $("markDetail").innerHTML = "";
+  $("ruleReport").innerHTML = "";
+  $("guardResult").innerHTML = "";
+  loadRules();
+});
 
 // 渲染护栏结果
 function renderGuard(r) {

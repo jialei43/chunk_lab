@@ -518,9 +518,27 @@ def api_unannotate(case_id, chunk_index):
 
 @app.get("/api/annotations")
 def api_annotation_stats():
-    """标注统计：检测器的准确率与漏报情况。"""
+    """规则质量统计：按指定版本核对后的准确率与待办。
+
+    统计基于核对结果而非直接数标注文件——标注是跨版本累积的，
+    修好的误报若照样计入准确率，就等于用旧账压现在的成绩。
+    run 指定版本，为空表示用当前代码实时切分核对。
+    """
     # 可按样本收窄
-    return jsonify({"ok": True, "stats": annotations.stats(request.args.get("case"))})
+    only = request.args.get("case")
+    # 切分参数与预览页一致，否则切片边界不同、标注对不上
+    raw = request.args.get("parser_config")
+    # 解析失败时用默认配置
+    try:
+        config = json.loads(raw) if raw else None
+    except (TypeError, ValueError):
+        config = None
+    # 执行统计
+    return jsonify({"ok": True, "stats": guard.stats(
+        run_id=request.args.get("run") or None,  # 目标版本
+        only=[only] if only else None,  # 可只看某个样本
+        parser_config=config,  # 切分参数
+    )})
 
 
 @app.get("/api/guard")
@@ -539,8 +557,9 @@ def api_guard():
         config = json.loads(raw) if raw else None
     except (TypeError, ValueError):
         config = None
-    # 执行核对
-    return jsonify(guard.check(only=[only] if only else None, parser_config=config))
+    # 执行核对；run 指定版本，为空表示用当前代码实时切分
+    return jsonify(guard.check(only=[only] if only else None, parser_config=config,
+                               run_id=request.args.get("run") or None))
 
 
 @app.get("/api/guard/false-positives")
@@ -611,8 +630,9 @@ def api_full_report():
         config = json.loads(raw) if raw else None
     except (TypeError, ValueError):
         config = None
-    # 生成报告
-    r = guard.build_full_report(parser_config=config)
+    # 生成报告；只列在目标版本下仍然成立的问题
+    r = guard.build_full_report(parser_config=config,
+                                run_id=request.args.get("run") or None)
     # 需要下载时以附件形式返回，浏览器直接存成文件
     if request.args.get("download") == "1":
         # 文件名带日期，多次生成不会互相覆盖

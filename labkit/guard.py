@@ -17,7 +17,7 @@
 
 from .detectors import DetectorConfig  # 导入检测阈值配置
 from .evaluate import inspect_case, load_cases  # 导入样本加载与单样本切分
-from . import annotations  # 导入标注读写
+from . import annotations, runs  # 导入标注读写与历史轮次快照
 
 # 断言结果的取值与含义。
 # 「待修正」与「回归」必须分开：标完误报、规则还没改的时候，第一次跑必然
@@ -99,8 +99,39 @@ def _hit(chunk, detector):
     return any(f.get("detector") == detector for f in (chunk.get("findings") or []))
 
 
-def check(only=None, cfg=None, parser_config=None):
-    """按当前代码重跑一遍，逐条核对人工标注是否仍然成立。
+def _chunks_of(case, run_id, cfg, parser_config):
+    """取某个样本在指定版本下的切片（含检测命中）。
+
+    run_id 为空表示用当前代码实切；给定时读那一轮的快照——快照里已经存了
+    坐标与那一轮的检测命中，读文件即可，不必也不该重新切分：重切用的是
+    当前代码，得到的根本不是那一轮的结果。
+
+    返回 (切片列表, 错误信息)。
+    """
+    # 指定版本时读快照
+    if run_id:
+        # 快照按样本存，取不到说明那一轮没有这个样本
+        chunks = runs.load_chunks(run_id, case["case_id"])
+        # 缺失时如实回报，而不是悄悄退回实时切分——那会让核对结果张冠李戴
+        if chunks is None:
+            return None, f"该轮快照中没有样本 {case['case_id']}"
+        # 旧轮次的快照可能没有 findings 字段，补空以免核对时报错
+        return [{**c, "findings": c.get("findings") or []} for c in chunks], ""
+    # 未指定版本：用当前代码实切
+    data = inspect_case(case, cfg=cfg, parser_config=parser_config)
+    # 切分失败时把原因带出去
+    if data.get("error"):
+        return None, f"切分失败：{data['error']}"
+    # 返回切片
+    return data.get("chunks") or [], ""
+
+
+def check(only=None, cfg=None, parser_config=None, run_id=None):
+    """逐条核对人工标注在指定版本下是否仍然成立。
+
+    run_id 为空表示用当前代码实切核对；给定时按那一轮的快照核对——
+    这是「按版本看」的基础：标注是跨版本累积的，而一条误报改没改好，
+    只有放在具体某个版本上才有答案。
 
     only 给定时只检查指定样本，便于针对一个文档快速迭代。
     """
@@ -117,18 +148,16 @@ def check(only=None, cfg=None, parser_config=None):
         # 没标注就跳过，避免白跑一次切分
         if not marks:
             continue
-        # 用当前代码重新切分并跑检测器
-        data = inspect_case(case, cfg=cfg, parser_config=parser_config)
-        # 切分失败时整份样本记为无法核对，而不是静默跳过
-        if data.get("error"):
+        # 取该样本在目标版本下的切片
+        chunks, err = _chunks_of(case, run_id, cfg, parser_config)
+        # 取不到时整份样本记为无法核对，而不是静默跳过
+        if chunks is None:
             items.append({
                 "case_id": cid, "chunk_index": None, "detector": "",
                 "verdict": "", "outcome": "stale",
-                "message": f"切分失败，无法核对：{data['error']}",
+                "message": f"无法核对：{err}",
             })
             continue
-        # 新的切片列表
-        chunks = data.get("chunks") or []
         # 本样本已被认领的切片序号，防止多条标注挤到同一个切片上
         used = set()
         # 按标注时的序号排序核对，让相邻标注按原有先后认领切片，
@@ -204,6 +233,74 @@ def check(only=None, cfg=None, parser_config=None):
     }
 
 
+def stats(run_id=None, only=None, cfg=None, parser_config=None, checked=None):
+    """按指定版本核对后的规则质量统计。
+
+    与直接数标注文件的关键区别：**只统计在这个版本下仍然成立的条目**。
+    标注是跨版本累积的，一条误报上周标的、这周已经修好了，再计入准确率
+    就等于用旧账压现在的成绩；生成优化任务书时也会把修完的问题再列一遍。
+
+    checked 可传入已有的核对结果，避免同一次请求里重复核对。
+    """
+    # 没有现成结果时执行一次核对
+    r = checked if checked is not None else check(
+        only=only, cfg=cfg, parser_config=parser_config, run_id=run_id)
+    # 逐检测器累计各类结论
+    by_detector = {}
+    # 总计
+    total = {"confirmed": 0, "false_positive": 0, "missed": 0,
+             "fixed": 0, "regressed": 0, "covered": 0, "stale": 0}
+    # 逐条归入
+    for it in r["items"]:
+        # 问题类型；未指定时归为一类
+        det = it.get("detector") or "(未指定)"
+        # 该规则的计数槽
+        slot = by_detector.setdefault(det, {
+            "confirmed": 0,       # 确认是问题且当前仍能检出
+            "false_positive": 0,  # 标为误报且当前仍在误报——这才是待办
+            "missed": 0,          # 人工提出、当前仍未覆盖
+            "fixed": 0,           # 曾标为误报，当前已不再命中
+            "regressed": 0,       # 曾确认能检出，当前检不出了
+            "covered": 0,         # 曾是漏报，当前已能覆盖
+            "stale": 0,           # 标注已失配，无法核对
+        })
+        # 结论到计数项的映射。同一个人工判定在不同版本下会落到不同计数项，
+        # 这正是「按版本统计」要表达的东西
+        v, outcome = it.get("verdict"), it["outcome"]
+        if outcome == "stale":
+            key = "stale"
+        elif v == "confirmed":
+            key = "confirmed" if outcome == "pass" else "regressed"
+        elif v == "false_positive":
+            key = "fixed" if outcome == "pass" else "false_positive"
+        elif v == "missed":
+            key = "covered" if outcome == "improved" else "missed"
+        else:
+            key = "stale"
+        # 累加
+        slot[key] += 1
+        total[key] += 1
+
+    # 准确率：当前仍能检出的确认数，占「确认 + 仍在误报」之比。
+    # 已修复的误报不再计入分母——那正是改动带来的成绩
+    judged = total["confirmed"] + total["false_positive"]
+    precision = round(total["confirmed"] / judged, 3) if judged else None
+    # 召回率：抓到的占「人工认定的全部真问题」之比
+    real = total["confirmed"] + total["missed"]
+    recall = round(total["confirmed"] / real, 3) if real else None
+
+    # 返回统计
+    return {
+        "run_id": run_id or "",  # 统计基于哪个版本，空表示当前代码
+        "cases": r["checked"],  # 实际核对的样本数
+        "total": total,  # 各类计数
+        "by_detector": by_detector,  # 逐规则计数
+        "precision": precision,  # 准确率
+        "recall": recall,  # 召回率
+        "ok": r["ok"],  # 是否无回归
+    }
+
+
 def analyze_false_positives(detector=None, only=None):
     """归纳误报的共同特征，指出规则该往哪儿改。
 
@@ -253,7 +350,9 @@ def analyze_false_positives(detector=None, only=None):
             "count": len(cases),  # 反例条数
             "by_ext": exts,  # 按文件类型分布
             "notes": notes,  # 人工写下的原因
-            "samples": cases[:8],  # 前若干条反例，供界面直接展示
+            # 全部反例。刻意不在这里截断——任务书要逐条列出，
+            # 截断会让它悄悄漏掉待办；界面若嫌长，自己取前几条即可
+            "samples": cases,
         })
     # 反例多的排在前面，那是最该改的规则
     return out
@@ -543,23 +642,54 @@ def _collect_chunk_texts(marks, parser_config=None):
     return out
 
 
-def build_full_report(parser_config=None):
+def build_full_report(parser_config=None, run_id=None):
     """生成一份完整的优化任务书，可直接交给模型动手改。
 
     与单条规则的报告的区别是「完整」：把当前全部待办放在一起，并按能否
     自动验证排序——误报和已实现规则的问题有护栏兜底，改完立刻知道对不对；
     人工提出的需求和框选区域需要新写代码，风险更高，放在后面。
 
+    **只列在目标版本下仍然成立的问题**。标注是跨版本累积的，修好的误报
+    如果照样列进来，拿到任务书的人会去改一个已经不存在的问题，
+    还会把「改完验证」的结论搅浑。
+
     刻意把代码位置、注册方式、验证命令都写进去：拿到报告的人（或模型）
     不该还要回头问「检测器写在哪」「改完怎么验证」。
     """
-    # 标注总体统计
-    st = annotations.stats()
-    # 误报归纳，按条数降序
-    fp_groups = analyze_false_positives()
+    # 先核对一次，后续所有内容都基于这份结果筛选
+    checked = check(parser_config=parser_config, run_id=run_id)
+    # 基于核对结果的统计，已修复的不再计入
+    st = stats(run_id=run_id, checked=checked)
+    # 仍待修正的误报：标为误报且当前仍在命中。已修复的不列——
+    # 那是成绩，不是待办
+    open_fps = {(it["case_id"], it.get("marked_index"))
+                for it in checked["items"] if it["outcome"] == "open"}
+    # 误报归纳后按核对结果过滤
+    fp_groups = []
+    for g in analyze_false_positives():
+        # 只保留仍在误报的反例
+        kept = [x for x in g["samples"] if (x["case_id"], x.get("chunk_index")) in open_fps]
+        # 一条不剩说明这条规则的误报已全部修好
+        if not kept:
+            continue
+        # 按剩余条数重算，避免标题里的数字与实际列出的对不上
+        exts = {}
+        for c in kept:
+            ext = (c["filename"].rsplit(".", 1)[-1].lower() if "." in c["filename"] else "未知")
+            exts[ext] = exts.get(ext, 0) + 1
+        fp_groups.append({**g, "samples": kept, "count": len(kept),
+                          "by_ext": exts,
+                          "notes": [c["note"] for c in kept if c.get("note")]})
+    # 按剩余误报数降序，最该改的排前面
+    fp_groups.sort(key=lambda g: -g["count"])
+
+    # 仍未覆盖的漏报：已经能覆盖的不再列为待办
+    still_missing = {(it["case_id"], it.get("marked_index"))
+                     for it in checked["items"] if it["outcome"] == "still_missing"}
     # 人工提出的需求：结论为漏报、且问题类型不是已实现的检测器
     from . import detectors as _det
-    missed = list_marks("missed")
+    missed = [m for m in list_marks("missed")
+              if (m["case_id"], m.get("chunk_index")) in still_missing]
     # 已实现的检测器名集合，用于区分「规则漏了」与「规则还不存在」
     implemented = {n[len("detect_"):] for n in dir(_det) if n.startswith("detect_")}
     # 拆成两类：已有规则漏报（调阈值即可）与全新需求（要写代码）
@@ -595,14 +725,19 @@ def build_full_report(parser_config=None):
         "本文件由 `规则质量` 页自动生成，内容全部来自人工标注——每一条都是人对着",
         "真实文档判定的结果。请按下面的任务清单修改检测规则。",
         "",
+        f"**基于版本**：{run_id or '当前代码实时切分'}。",
+        "已经修好的问题不会出现在下面——每一条都在这个版本下重新核对过，",
+        "确认仍然存在才列出。",
+        "",
         "## 现状",
         "",
         f"- 检测器准确率 **{pct(st.get('precision'))}**"
         f"（报出来的有多少经人工确认是真问题）",
         f"- 召回率 **{pct(st.get('recall'))}**（人工发现的问题有多少被规则抓到）",
-        f"- 已标注 {st.get('cases', 0)} 个样本，"
-        f"确认 {st['total']['confirmed']} 条、误报 {st['total']['false_positive']} 条、"
-        f"漏报 {st['total']['missed']} 条",
+        f"- 核对 {st.get('cases', 0)} 个样本：仍能检出 {st['total']['confirmed']} 条、"
+        f"仍在误报 {st['total']['false_positive']} 条、仍未覆盖 {st['total']['missed']} 条",
+        f"- 已修复 {st['total']['fixed']} 条误报，已覆盖 {st['total']['covered']} 条漏报"
+        + (f"，**出现 {st['total']['regressed']} 条回归**" if st['total']['regressed'] else ""),
         f"- 人工在原文上圈出 {len(regions)} 块切分器没切出来的区域",
         "",
         "## 代码位置与约定",
