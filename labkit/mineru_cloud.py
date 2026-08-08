@@ -103,6 +103,29 @@ def _check(resp, what):
     return body.get("data") or {}
 
 
+# 官方对 data_id 的长度上限，按 UTF-8 字节计
+MAX_DATA_ID_BYTES = 128
+
+
+def _data_id(index, name):
+    """构造批内唯一且不超长的 data_id。
+
+    直接拿文件名当 data_id 会被官方拒绝：上限按 UTF-8 字节算，
+    中文文件名很容易超——实测 58 个汉字就是 148 字节，整批都提交不上去。
+
+    保留序号是为了批内唯一，保留截断后的文件名是为了日志和官方控制台里
+    还能认出是哪个文件；纯哈希更短，但出问题时看不出所以然。
+    """
+    # 序号前缀，保证同批内不重复
+    prefix = f"f{index}_"
+    # 留给文件名的字节预算
+    budget = MAX_DATA_ID_BYTES - len(prefix)
+    # 按字节截断；直接切会把多字节字符切成半个，故解码时忽略残缺字节
+    tail = name.encode("utf-8")[:budget].decode("utf-8", "ignore")
+    # 拼成最终标识
+    return prefix + tail
+
+
 def submit_batch(paths, token=None, backend=None, lang="ch", is_ocr=False,
                  enable_formula=True, enable_table=True):
     """申请批量上传链接并上传文件，返回 batch_id 与文件名映射。
@@ -139,8 +162,9 @@ def submit_batch(paths, token=None, backend=None, lang="ch", is_ocr=False,
         "enable_table": enable_table,  # 表格识别
         "language": lang,  # 文档语言
         "model_version": model_version,  # 模型版本，vlm 为官方推荐
-        # 每个文件一项；data_id 便于结果回来时对应上本地文件
-        "files": [{"name": f.name, "is_ocr": is_ocr, "data_id": f.name} for f in files],
+        # 每个文件一项；data_id 是结果匹配的兜底键，受官方长度限制故需截断
+        "files": [{"name": f.name, "is_ocr": is_ocr, "data_id": _data_id(i, f.name)}
+                  for i, f in enumerate(files)],
     }
     log.info(f"[cloud] 申请上传链接：{len(files)} 个文件，model_version={model_version}")
     # 发起申请
