@@ -210,6 +210,66 @@ input[type="text"], input[type="number"], select {
   border: 1px solid var(--line-strong); border-radius: 4px;
 }
 
+/* ========== 报告预览弹层 ========== */
+.modal {
+  display: none; position: fixed; inset: 0; z-index: 40;
+  background: rgba(0, 0, 0, 0.45);
+  align-items: center; justify-content: center; padding: 2vh 2vw;
+}
+.modal-box {
+  background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+  width: min(60rem, 100%); max-height: 96vh; display: flex; flex-direction: column;
+  box-shadow: 0 12px 48px rgba(0, 0, 0, 0.28);
+}
+.modal-head {
+  display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;
+  padding: 0.85rem 1.1rem; border-bottom: 1px solid var(--line);
+}
+.modal-head .btn { text-decoration: none; display: inline-block; }
+.modal-body { padding: 1.2rem 1.6rem 2rem; overflow-y: auto; }
+
+/* 报告正文的 Markdown 排版：报告以表格与代码块为主，重点保证这两者可读 */
+.markdown { font-size: 0.9rem; line-height: 1.7; color: var(--ink); }
+.markdown h1 { font-size: 1.5rem; margin: 0 0 0.8rem; letter-spacing: -0.01em; }
+.markdown h2 {
+  font-size: 1.15rem; margin: 1.8rem 0 0.7rem;
+  padding-bottom: 0.35rem; border-bottom: 1px solid var(--line);
+}
+.markdown h3 { font-size: 1rem; margin: 1.4rem 0 0.5rem; color: var(--accent); }
+.markdown h4 { font-size: 0.92rem; margin: 1.1rem 0 0.4rem; color: var(--ink-soft); }
+.markdown p { margin: 0.5rem 0; }
+.markdown ul { margin: 0.4rem 0; padding-left: 1.3rem; }
+.markdown li { margin: 0.18rem 0; }
+.markdown code {
+  font-family: var(--mono); font-size: 0.84em;
+  background: var(--sunk); border: 1px solid var(--line);
+  border-radius: 3px; padding: 0.08em 0.34em;
+}
+.markdown pre {
+  background: var(--sunk); border: 1px solid var(--line); border-radius: 5px;
+  padding: 0.8rem 1rem; overflow-x: auto; margin: 0.6rem 0;
+}
+.markdown pre code { background: none; border: none; padding: 0; font-size: 0.8rem; line-height: 1.6; }
+.markdown table { margin: 0.7rem 0; font-size: 0.85rem; display: block; overflow-x: auto; }
+.markdown th, .markdown td { border: 1px solid var(--line); padding: 0.4rem 0.6rem; }
+.markdown th { background: var(--sunk); font-weight: 600; }
+.markdown blockquote {
+  margin: 0.7rem 0; padding: 0.5rem 0.9rem;
+  border-left: 3px solid var(--accent); background: var(--accent-soft);
+  color: var(--ink-soft); border-radius: 0 4px 4px 0;
+}
+.markdown blockquote p { margin: 0; }
+.markdown details {
+  margin: 0.6rem 0; padding: 0.5rem 0.8rem;
+  border: 1px solid var(--line); border-radius: 5px; background: var(--sunk);
+}
+.markdown summary { cursor: pointer; font-size: 0.85rem; color: var(--accent); }
+.markdown hr { border: none; border-top: 1px solid var(--line); margin: 1.2rem 0; }
+
+/* 行内的报告按钮：链接与按钮混排时保持一致外观 */
+a.mini { text-decoration: none; display: inline-block; line-height: 1.5; }
+.mini.primary { color: var(--accent); border-color: var(--accent); }
+
 /* ========== 提示与状态 ========== */
 .empty { color: var(--muted); font-size: 0.88rem; padding: 1.5rem 0; text-align: center; }
 .toast {
@@ -430,6 +490,8 @@ tr.is-baseline { background: var(--accent-soft); }
       <div class="src-bar" style="margin-bottom:0.9rem">
         <label>查看轮次 <select id="viewRun"></select></label>
         <span class="hint" id="viewRunHint"></span>
+        <span class="spacer"></span>
+        <button class="btn" id="btnReport">评估报告</button>
       </div>
       <div class="stat-row" id="statRow">
         <div class="stat"><div class="stat-label">语料</div><div class="stat-value">—</div></div>
@@ -532,6 +594,20 @@ tr.is-baseline { background: var(--accent-soft); }
     </div>
   </div>
 </main>
+
+<!-- ========== 评估报告预览弹层 ========== -->
+<div class="modal" id="reportModal">
+  <div class="modal-box">
+    <div class="modal-head">
+      <strong id="reportTitle">评估报告</strong>
+      <span class="spacer"></span>
+      <a class="btn" id="reportRaw" target="_blank" rel="noopener">查看 Markdown 原文</a>
+      <a class="btn primary" id="reportDownload" download>下载 .md</a>
+      <button class="btn" id="reportClose">关闭</button>
+    </div>
+    <div class="modal-body markdown" id="reportBody"></div>
+  </div>
+</div>
 
 <div class="toast" id="toast"></div>
 
@@ -874,6 +950,8 @@ function renderRuns() {
       <td class="run-label" style="font-size:0.8rem">${esc(r.label || "")}</td>
       <td class="run-ops">
         <button class="mini" data-act="view" data-run="${esc(r.run_id)}">查看</button>
+        <button class="mini primary" data-act="report" data-run="${esc(r.run_id)}">报告</button>
+        <a class="mini" href="/api/runs/${esc(r.run_id)}/report?download=1" download>下载</a>
         <button class="mini" data-act="base" data-run="${esc(r.run_id)}" ${r.run_id === baselineId ? "disabled" : ""}>设为基准</button>
         <button class="mini" data-act="label" data-run="${esc(r.run_id)}">备注</button>
         <button class="mini danger" data-act="del" data-run="${esc(r.run_id)}">删除</button>
@@ -894,6 +972,9 @@ async function runAction(act, runId) {
       const r = await api(`/api/runs/${runId}`);
       renderOverview(r, null, r.run_id === baselineId ? "baseline" : "history");
       window.scrollTo({ top: 0, behavior: "smooth" });
+    } else if (act === "report") {
+      // 打开评估报告预览
+      await showReport(runId);
     } else if (act === "base") {
       // 把该轮设为对比基准
       await api("/api/baseline", { method: "POST", body: JSON.stringify({ run_id: runId }) });
@@ -917,6 +998,44 @@ async function runAction(act, runId) {
     toast("操作失败：" + e.message);
   }
 }
+
+// ========== 评估报告预览 ==========
+// 报告是给人看、也是直接交给编码助手改代码的依据，因此既要能在页面上读，
+// 也要能原样下载成 .md 文件。
+async function showReport(runId) {
+  const modal = $("reportModal");
+  modal.style.display = "flex";
+  $("reportBody").innerHTML = `<div class="empty"><span class="spin"></span> 正在生成报告…</div>`;
+  $("reportTitle").textContent = `评估报告 · ${runId}`;
+  // 下载与原文链接指向同一轮次
+  $("reportDownload").href = `/api/runs/${encodeURIComponent(runId)}/report?download=1`;
+  $("reportRaw").href = `/api/runs/${encodeURIComponent(runId)}/report`;
+  try {
+    // 服务端渲染 HTML，避免在前端引入 Markdown 解析库
+    const d = await api(`/api/runs/${encodeURIComponent(runId)}/report?format=html`);
+    $("reportBody").innerHTML = d.html;
+  } catch (e) {
+    $("reportBody").innerHTML = `<div class="empty" style="color:var(--bad)">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+// 概览区的报告入口：打开当前正在查看的那一轮的报告
+$("btnReport").addEventListener("click", () => {
+  const runId = $("viewRun").value;
+  // 尚无历史轮次时给出提示而非打开空报告
+  if (!runId) return toast("尚无历史轮次，请先运行评估");
+  showReport(runId);
+});
+
+// 关闭报告弹层：按钮、遮罩点击、Esc 三种方式
+$("reportClose").addEventListener("click", () => { $("reportModal").style.display = "none"; });
+$("reportModal").addEventListener("click", (e) => {
+  // 只有点击遮罩本身才关闭，点内容区不关
+  if (e.target === $("reportModal")) $("reportModal").style.display = "none";
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") $("reportModal").style.display = "none";
+});
 
 // ========== 趋势图 ==========
 // 用迷你折线展示各类问题随轮次的变化。趋势的意义在于看清累计效果，

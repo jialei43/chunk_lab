@@ -9,7 +9,8 @@
 import threading  # 导入 threading 用一把锁串行化耗时评估，避免并发重复计算
 from pathlib import Path  # 导入 Path 定位前端静态文件
 
-from flask import Flask, jsonify, request, send_from_directory  # 导入 Flask 及其响应工具
+import markdown  # 导入 markdown 把评估报告渲染成 HTML 供页面预览
+from flask import Flask, Response, jsonify, request, send_from_directory  # 导入 Flask 及其响应工具
 
 from . import runs  # 导入运行历史模块，负责轮次快照与基准指针
 from .detectors import DetectorConfig  # 导入检测阈值配置
@@ -17,6 +18,8 @@ from .discover import scan_products  # 导入本机产物扫描
 from .evaluate import (compare_reports, diff_chunk_texts, diff_findings, evaluate_all,
                        inspect_case, load_cases)  # 导入评估相关能力
 from .ingest import ingest_from_path  # 导入按路径导入语料的能力
+from .paths import REPORT_DIR  # 导入报告目录常量
+from .report import build_markdown  # 导入报告生成能力，用于按需重建缺失的报告
 
 # 前端静态文件目录
 WEB_DIR = Path(__file__).resolve().parent / "web"
@@ -297,6 +300,53 @@ def api_run_chunks(run_id, case_id):
         "label": report.get("label", ""),  # 该轮备注
         "chunks": chunks,  # 切分文本
     })
+
+
+@app.get("/api/runs/<run_id>/report")
+def api_run_report(run_id):
+    """返回某一轮的 Markdown 评估报告。
+
+    format=html 时服务端渲染为 HTML 供页面预览，
+    download=1 时作为附件下载，其余情况返回 Markdown 原文。
+    """
+    # 解析轮次
+    report = runs.resolve_run(run_id)
+    # 轮次不存在时返回 404
+    if report is None:
+        return jsonify({"ok": False, "message": f"轮次不存在：{run_id}"}), 404
+    # 真实轮次标识，用于定位报告文件
+    rid = report.get("run_id", run_id)
+    # 报告文件路径
+    path = REPORT_DIR / f"{rid}.md"
+    # 报告文件可能被清理或该轮产生于报告功能之前，此时按轮次数据即时重建，
+    # 保证任何一轮都能拿到报告，而不是给用户一个死链
+    if path.is_file():
+        md = path.read_text(encoding="utf-8")
+    else:
+        # 从文本快照取切片全文用于完整案例
+        md = build_markdown(report, chunks_by_case=runs.load_chunks(rid))
+        # 顺手落盘，下次直接读取
+        REPORT_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(md, encoding="utf-8")
+
+    # 下载模式：作为附件返回，文件名带轮次标识便于归档
+    if request.args.get("download"):
+        # 构造附件响应；mimetype 只给类型，charset 由 Flask 自动补上，
+        # 手写 charset 会与之重复出现在 Content-Type 里
+        resp = Response(md, mimetype="text/markdown")
+        # 指定下载文件名
+        resp.headers["Content-Disposition"] = f'attachment; filename="chunk-lab-{rid}.md"'
+        return resp
+
+    # 预览模式：服务端渲染为 HTML，前端直接嵌入展示
+    if request.args.get("format") == "html":
+        # 启用表格、代码块与目录扩展，报告大量使用表格与围栏代码块
+        html = markdown.markdown(md, extensions=["tables", "fenced_code", "toc", "sane_lists"])
+        # 以 JSON 返回，便于前端连同元信息一起处理
+        return jsonify({"ok": True, "run_id": rid, "html": html})
+
+    # 默认返回 Markdown 原文，用纯文本类型以便浏览器直接展示而非下载
+    return Response(md, mimetype="text/plain")
 
 
 @app.get("/api/chunkdiff")
