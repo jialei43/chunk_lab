@@ -20,8 +20,8 @@ from .evaluate import (compare_reports, diff_chunk_texts, diff_findings, evaluat
                        inspect_case, load_cases)  # 导入评估相关能力
 from .ingest import ingest_from_path  # 导入按路径导入语料的能力
 from .offline import DEFAULT_PARSER_CONFIG, build_parser_config  # 导入切分配置默认值与合并逻辑
-from .parsing import UPLOAD_DIR, get_task, list_tasks, start_parse  # 导入解析任务管理
-from .paths import CORPUS_DIR, DATA_ROOT, MINERU_OUT, REPORT_DIR  # 导入目录常量
+from .parsing import get_task, list_tasks, mineru_defaults, start_parse  # 导入解析任务管理
+from .paths import CORPUS_DIR, DATA_ROOT, MINERU_OUT, REPORT_DIR, UPLOAD_DIR  # 导入目录常量
 from .report import build_markdown  # 导入报告生成能力，用于按需重建缺失的报告
 
 # 前端静态文件目录
@@ -127,6 +127,16 @@ def api_config():
             "mineru_out": str(MINERU_OUT),  # 解析产物目录
             "configurable_by": "环境变量 CHUNKLAB_DATA_DIR，或 chunk-lab/labconfig.json 的 data_dir",
         },
+        # MinerU 连接与产物配置，字段与知识库的 MinerU 模型配置页一一对应
+        "mineru": {
+            "mineru_api": mineru_defaults()["mineru_api"],  # MinerU API 服务器
+            "output_dir": str(MINERU_OUT),  # 输出目录路径
+            "backend": mineru_defaults()["backend"],  # 处理后端类型
+            "effort": mineru_defaults()["effort"],  # hybrid 系列的投入档位
+            # 生产配置页的「处理完成后删除输出文件」默认开启，实验室固定关闭：
+            # 离线重放依赖这些产物，删了就没法重放
+            "delete_output": False,
+        },
     })
 
 
@@ -176,6 +186,8 @@ def api_parse():
         auto_import=request.form.get("auto_import", "1") != "0",  # 解析后是否自动入库
         kind=request.form.get("kind", ""),  # 文档大类
         note=request.form.get("note", ""),  # 备注
+        mineru_api=request.form.get("mineru_api", ""),  # MinerU API 服务器，留空用默认
+        output_dir=request.form.get("output_dir", ""),  # 产物输出目录，留空用实验室默认目录
     )
     # 返回任务标识供前端轮询
     return jsonify({"ok": True, "task_id": task_id})

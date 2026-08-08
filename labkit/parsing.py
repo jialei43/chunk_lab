@@ -16,7 +16,13 @@ from .paths import MINERU_OUT, UPLOAD_DIR, ensure_ragflow_importable  # 导入�
 
 ensure_ragflow_importable()  # 在导入 ragflow 模块之前注入源码路径
 
-from chunklab_bridge.parse import parse_document  # noqa: E402  导入解析桥接
+from chunklab_bridge.parse import parse_document, resolve_mineru_config  # noqa: E402  导入解析桥接
+
+
+def mineru_defaults():
+    """返回 MinerU 连接配置的当前默认值，供界面展示与表单预填。"""
+    # 复用桥接层的解析逻辑，保证界面显示的与实际使用的一致
+    return resolve_mineru_config()
 
 # 任务表：task_id -> 任务状态。仅存活于进程内，服务重启后清空，
 # 这对开发时工具足够，不值得为此引入持久化。
@@ -54,7 +60,7 @@ def list_tasks(limit=20):
 
 
 def start_parse(file_path, filename, backend="pipeline", parse_method="auto",
-                auto_import=True, kind="", note=""):
+                auto_import=True, kind="", note="", mineru_api="", output_dir=""):
     """启动一次后台解析，立即返回任务标识。"""
     # 生成短任务标识，便于在界面与日志中引用
     task_id = uuid.uuid4().hex[:12]
@@ -69,6 +75,7 @@ def start_parse(file_path, filename, backend="pipeline", parse_method="auto",
             "progress": 0.0,  # 进度比例
             "message": "已排队",  # 进度描述
             "started_at": datetime.now().isoformat(timespec="seconds"),  # 开始时间
+            "output_dir": str(output_dir or MINERU_OUT),  # 本次产物落地目录
             "case_id": None,  # 入库后的样本标识
             "block_count": 0,  # 产物块数
             "error": None,  # 失败原因
@@ -92,9 +99,12 @@ def start_parse(file_path, filename, backend="pipeline", parse_method="auto",
             # 执行解析，产物落在实验室目录
             product = parse_document(
                 file_path,  # 待解析文件
-                output_dir=MINERU_OUT,  # 实验室产物目录，与生产分开
+                # 输出目录：调用方可覆盖，默认落在实验室目录，与生产分开
+                output_dir=output_dir or MINERU_OUT,
                 backend=backend,  # 处理后端类型
                 parse_method=parse_method,  # 解析方法
+                # MinerU 服务地址，留空则按环境变量与默认值解析
+                config={"mineru_api": mineru_api} if mineru_api else None,
                 callback=cb,  # 进度回调
             )
             # 统计原始块数

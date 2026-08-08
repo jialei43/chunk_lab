@@ -631,6 +631,25 @@ tr.is-baseline { background: var(--accent-soft); }
           </div>
         </div>
         <div class="cfg-row">
+          <label class="cfg-label">MinerU API 服务器</label>
+          <div class="cfg-input" style="grid-column:span 2">
+            <input type="text" id="parseApi" placeholder="留空使用默认" style="width:100%;max-width:26rem">
+          </div>
+        </div>
+        <div class="cfg-row">
+          <label class="cfg-label">MinerU 输出目录</label>
+          <div class="cfg-input" style="grid-column:span 2">
+            <input type="text" id="parseOutDir" placeholder="留空使用默认" style="width:100%;max-width:26rem">
+          </div>
+        </div>
+        <div class="cfg-row">
+          <label class="cfg-label">处理完成后删除输出文件</label>
+          <div class="cfg-input"><input type="checkbox" disabled></div>
+          <div class="cfg-hint">
+            生产该项默认开启，实验室<strong>固定关闭</strong>——离线重放依赖这些产物，删掉就无法重放，故不提供开关。
+          </div>
+        </div>
+        <div class="cfg-row">
           <label class="cfg-label">处理后端类型</label>
           <div class="cfg-input">
             <select id="parseBackend">
@@ -815,6 +834,11 @@ async function loadConfig() {
     configFields = d.fields || [];
     configDefaults = d.defaults || {};
     configPaths = d.paths || {};
+    // 用实际生效的默认值预填解析表单，避免使用者不知道会连到哪、产物落在哪
+    const m = d.mineru || {};
+    if ($("parseApi") && !$("parseApi").value) $("parseApi").placeholder = m.mineru_api || "";
+    if ($("parseOutDir") && !$("parseOutDir").value) $("parseOutDir").placeholder = m.output_dir || "";
+    if ($("parseBackend") && m.backend) $("parseBackend").value = m.backend;
     // 首次加载时用默认值作为当前配置
     if (!Object.keys(parserConfig).length) parserConfig = { ...configDefaults };
     renderConfigSummary();
@@ -1942,6 +1966,9 @@ $("btnParse").addEventListener("click", async () => {
   fd.append("backend", $("parseBackend").value);
   fd.append("parse_method", $("parseMethod").value);
   fd.append("auto_import", $("parseAutoImport").checked ? "1" : "0");
+  // 服务地址与输出目录留空则由后端按「环境变量 > 默认值」解析
+  fd.append("mineru_api", $("parseApi").value.trim());
+  fd.append("output_dir", $("parseOutDir").value.trim());
 
   const btn = $("btnParse");
   btn.disabled = true;
@@ -2004,6 +2031,7 @@ function renderParseTasks(tasks) {
       </div>
       <div class="task-msg">${esc(t.error || t.message || "")}</div>
       ${t.block_count ? `<div class="hint">原始块数 ${t.block_count}${t.case_id ? `　样本 ${esc(t.case_id)}` : ""}</div>` : ""}
+      ${t.product ? `<div class="hint mono" style="font-size:0.72rem;word-break:break-all">产物 ${esc(t.product)}</div>` : ""}
       ${bar}
     </div>`;
   }).join("");
