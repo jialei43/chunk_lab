@@ -174,6 +174,10 @@ def api_config():
             # 离线重放依赖这些产物，删了就没法重放
             "delete_output": False,
         },
+        # 当前被测代码的指纹。历史轮次都记了自己的指纹，界面拿这个一比，
+        # 就能标出哪一轮的结果还对得上当前代码——改完代码没跑评估时，
+        # 看着旧快照会误以为改动没生效
+        "code_hash": runs.code_fingerprint()["hash"],
         # 云端解析可用性：界面据此决定是否显示云端入口，
         # 未配置 token 时给出配置指引而不是让人点了才报错
         "cloud": {
@@ -961,11 +965,11 @@ def api_set_label(run_id):
 
 @app.delete("/api/runs/<run_id>")
 def api_delete_run(run_id):
-    """删除某一轮快照。"""
+    """删除某一轮及其全部衍生数据：快照、切分文本、报告、索引记录。"""
     # 执行删除；若它是当前基准，指针会被一并清空
-    runs.delete_run(run_id)
-    # 返回成功
-    return jsonify({"ok": True})
+    result = runs.delete_run(run_id)
+    # 如实回报删了哪些文件，而不是笼统说一句已删除
+    return jsonify(result)
 
 
 @app.get("/api/compare")

@@ -1181,6 +1181,7 @@ let configDefaults = {}; // 服务端给的默认值
 let parserConfig = {};   // 当前生效的配置
 let configPaths = {};    // 数据目录位置，数据已移出仓库故需在界面上标明
 let configCloud = {};    // 云端解析可用性，未配 token 时禁用相关入口
+let currentCodeHash = ""; // 当前被测代码的指纹，用于标出哪一轮快照还对得上
 
 // 加载字段定义与默认值
 async function loadConfig() {
@@ -1190,6 +1191,8 @@ async function loadConfig() {
     configDefaults = d.defaults || {};
     configPaths = d.paths || {};
     configCloud = d.cloud || {};
+    // 当前代码指纹，用于判断某一轮快照是否还对得上现在的代码
+    currentCodeHash = d.code_hash || "";
     // 未配置 token 时把原因显示出来，而不是让按钮无声地不可点
     if (!configCloud.available && $("cloudHint")) {
       $("cloudHint").innerHTML = `<span style="color:var(--warn)">云端解析不可用：${esc(configCloud.hint || "未配置 token")}</span>`;
@@ -3057,8 +3060,10 @@ async function selectCase(caseId, target) {
   $("chunkCaseList").querySelectorAll(".case-item").forEach(b => {
     b.classList.toggle("active", b.dataset.case === caseId);
   });
-  $("chunkStream").innerHTML = `<div class="empty"><span class="spin"></span> 正在切分…</div>`;
-  $("chunkMeta").innerHTML = `<p class="hint" style="margin:0">${esc(caseId)}　切分中…</p>`;
+  // 读历史快照是读文件，与实时切分是两回事，文案如实区分
+  const loadingText = viewingRun ? "正在读取该轮快照…" : "正在切分…";
+  $("chunkStream").innerHTML = `<div class="empty"><span class="spin"></span> ${loadingText}</div>`;
+  $("chunkMeta").innerHTML = `<p class="hint" style="margin:0">${esc(caseId)}　${loadingText}</p>`;
 
   // 原文与切分互不依赖，同时开始加载：切分要跑一遍切分器，
   // 等它结束再拉原文会让左栏白等好几秒
@@ -3071,13 +3076,23 @@ async function selectCase(caseId, target) {
     // 代码改动后两者结果不同，历史快照才是那一轮的真实结果。
     if (viewingRun) {
       const h = await api(`/api/runs/${viewingRun}/chunks/${encodeURIComponent(caseId)}`);
-      // 历史快照没有 findings 关联，补空数组以复用同一套渲染
+      // 快照里已经带上了坐标与那一轮的检测命中，直接用即可——
+      // 与实时切分走的是同一套渲染，问题标注、原文定位、截图都能正常工作。
+      // 旧轮次的快照没有这些字段，补默认值以免渲染时报错
+      const chunks = h.chunks.map(c => ({
+        ...c,
+        content_len: (c.content || "").length,  // 正文长度，快照里不存冗余字段
+        findings: c.findings || [],             // 那一轮检出的问题
+        position_int: c.position_int || [],      // 版面坐标，用于定位与截图
+        has_image: !!c.has_image,               // 是否含图
+      }));
       currentCaseData = {
         case_id: caseId,
         filename: (corpusCache.find(c => c.case_id === caseId) || {}).filename || caseId,
-        chunk_count: h.chunks.length,
-        finding_count: 0,
-        chunks: h.chunks.map(c => ({ ...c, content_len: (c.content || "").length, findings: [], has_image: false })),
+        chunk_count: chunks.length,
+        // 命中数从快照现算，而不是写死 0——写死会让历史版本看起来一个问题都没有
+        finding_count: chunks.reduce((n, c) => n + c.findings.length, 0),
+        chunks,
         _usedConfig: h.config || {},
         _isHistory: true,
       };
@@ -3163,9 +3178,16 @@ function renderChunkView() {
 
   // 数据来源选择：实时切分用的是当前代码，历史轮次是那一轮当时的真实结果。
   // 代码改动后两者会不同，这正是需要保留文本快照的原因。
-  const srcOpts = runsCache.filter(r => r.has_chunks).map(r =>
-    `<option value="${esc(r.run_id)}" ${viewingRun === r.run_id ? "selected" : ""}>${esc(r.run_id)}${r.label ? " · " + esc(r.label) : ""}</option>`
-  ).join("");
+  // 每一轮都记了自己的代码指纹，与当前代码不同的显式标出——
+  // 改完代码没跑评估时，看着旧快照会误以为改动没生效
+  const srcOpts = runsCache.filter(r => r.has_chunks).map(r => {
+    // 指纹一致说明这一轮就是当前代码跑出来的
+    const same = currentCodeHash && r.code_hash === currentCodeHash;
+    // 标注放在标签里，下拉收起时也看得见
+    const mark = same ? "（= 当前代码）" : "（代码已变）";
+    return `<option value="${esc(r.run_id)}" ${viewingRun === r.run_id ? "selected" : ""}>`
+      + `${esc(r.run_id)}${r.label ? " · " + esc(r.label) : ""} ${mark}</option>`;
+  }).join("");
   const sourceBar = `
     <div class="src-bar">
       <label>查看：
@@ -3174,7 +3196,14 @@ function renderChunkView() {
           ${srcOpts}
         </select>
       </label>
-      ${viewingRun ? `<span class="pill low">历史快照，非实时结果</span>` : ""}
+      ${viewingRun ? (() => {
+        // 取该轮的摘要以比对代码指纹
+        const r = runsCache.find(x => x.run_id === viewingRun) || {};
+        // 一致时说明这份快照就是当前代码的结果，可放心当作最新
+        return (currentCodeHash && r.code_hash === currentCodeHash)
+          ? `<span class="pill good" title="这一轮就是用当前代码跑的">该轮 = 当前代码</span>`
+          : `<span class="pill medium" title="代码已改动，这一轮的结果不代表当前代码">代码已变，非当前结果</span>`;
+      })() : `<span class="pill low">用当前代码实时切分</span>`}
       <span class="spacer"></span>
       <div class="jump-box">
         <button class="mini step" id="chunkPrev" title="上一片">‹</button>

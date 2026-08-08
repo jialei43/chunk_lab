@@ -64,12 +64,18 @@ def evaluate_case(case, cfg=None, parser_config=None):
     cfg = cfg or DetectorConfig()
     # 执行离线切分；切分失败应作为样本级问题上报而不是中断整轮评估
     try:
+        # 定位已关联的原文。带上它切分器才会写入真实版面坐标，
+        # 快照里存下坐标，历史版本才能在原文上定位高亮与截图；
+        # 没有原文的样本（Office、未关联）照常切分，只是拿不到坐标
+        from .preview import find_source
+        src = find_source(case["case_id"], case.get("filename", ""))
         # 整份配置直接透传，字段的合并与派生由 offline.build_parser_config 统一处理
         chunks = run_offline_chunking(
             case["content_list"],  # 缓存产物路径
             case["filename"],  # 原始文件名，决定切分器的类型判断
             parser_config=parser_config,  # 完整 parser_config，与知识库配置同构
             backend=case.get("backend", "hybrid_auto"),  # 产物 backend，决定 _read_output 的查找
+            pdf_path=str(src) if src else None,  # 有原文时渲染页面图像以获得真实坐标
         )
     except Exception as e:
         # 切分崩溃是最严重的问题，直接作为一条结果返回
@@ -124,11 +130,49 @@ def evaluate_case(case, cfg=None, parser_config=None):
     }
 
 
+def build_preview(case, records, finding_dicts):
+    """把切片记录与检测命中组装成预览格式。
+
+    评估与预览用的是同一次切分的产物，格式必须由同一处生成——
+    两边各拼一遍，迟早会在某个字段上分叉，让缓存里存的和预览要的对不上。
+    """
+    # 按 chunk 序号归集命中，便于挂载到对应切片
+    by_index = {}
+    # 逐条归入对应切片
+    for f in finding_dicts:
+        # 同一切片可能命中多个检测器
+        by_index.setdefault(f["chunk_index"], []).append(f)
+    # 逐块组装前端需要的结构
+    items = []
+    # 遍历全部切片
+    for r in records:
+        # 复制一份记录并挂上该块的问题列表
+        item = dict(r)
+        # 没有命中时为空列表，前端据此判断是否高亮
+        item["findings"] = by_index.get(r["index"], [])
+        # 父块正文体积可能很大，预览无需重复传输，只保留是否为子块的标记
+        item.pop("mom_content", None)
+        # 收入结果
+        items.append(item)
+    # 返回该样本的完整预览数据
+    return {
+        "case_id": case["case_id"],  # 样本标识
+        "filename": case.get("filename", ""),  # 原始文件名
+        "kind": case.get("kind", ""),  # 文档大类
+        "chunk_count": len(items),  # 切片总数
+        "finding_count": len(finding_dicts),  # 命中总数
+        "chunks": items,  # 逐块内容与标注
+    }
+
+
 def inspect_case(case, cfg=None, parser_config=None, with_positions=False):
     """返回单个样本的完整切片内容，并把检测命中挂到对应切片上。
 
     这是「预览切分效果」的数据源：前端据此逐块展示正文，
     并在有问题的块上直接标注是哪类缺陷、证据是什么。
+
+    这条路径每次都真切一遍，用于「看当前代码切成什么样」。想看某一轮
+    评估当时的结果，走历史轮次快照——那是按版本存下来的，读文件即可。
     """
     # 未指定配置时使用默认阈值
     cfg = cfg or DetectorConfig()
@@ -155,33 +199,8 @@ def inspect_case(case, cfg=None, parser_config=None, with_positions=False):
     records = normalize_chunks(chunks)
     # 跑全部检测器
     findings = run_detectors(records, case["case_id"], cfg)
-    # 按 chunk 序号归集命中，便于挂载到对应切片
-    by_index = {}
-    # 逐条归入对应切片
-    for f in findings:
-        # 同一切片可能命中多个检测器
-        by_index.setdefault(f.chunk_index, []).append(asdict(f))
-    # 逐块组装前端需要的结构
-    items = []
-    # 遍历全部切片
-    for r in records:
-        # 复制一份记录并挂上该块的问题列表
-        item = dict(r)
-        # 没有命中时为空列表，前端据此判断是否高亮
-        item["findings"] = by_index.get(r["index"], [])
-        # 父块正文体积可能很大，预览无需重复传输，只保留是否为子块的标记
-        item.pop("mom_content", None)
-        # 收入结果
-        items.append(item)
-    # 返回该样本的完整预览数据
-    return {
-        "case_id": case["case_id"],  # 样本标识
-        "filename": case.get("filename", ""),  # 原始文件名
-        "kind": case.get("kind", ""),  # 文档大类
-        "chunk_count": len(items),  # 切片总数
-        "finding_count": len(findings),  # 命中总数
-        "chunks": items,  # 逐块内容与标注
-    }
+    # 组装预览格式；与评估共用同一处实现，保证快照里存的与预览要的一致
+    return build_preview(case, records, [asdict(f) for f in findings])
 
 
 def evaluate_all(only=None, cfg=None, parser_config=None):

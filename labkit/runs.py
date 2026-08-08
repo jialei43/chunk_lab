@@ -15,7 +15,7 @@ import json  # 导入 json 读写快照
 import subprocess  # 导入 subprocess 读取 ragflow 的 git 版本信息
 from datetime import datetime  # 导入 datetime 生成轮次标识与时间戳
 
-from .paths import BASELINE_DIR, RAGFLOW_ROOT, RUNS_DIR  # 导入目录常量
+from .paths import BASELINE_DIR, RAGFLOW_ROOT, REPORT_DIR, RUNS_DIR  # 导入目录常量
 
 # 轻量索引文件：只存每轮摘要，避免为渲染列表而读取全部大文件
 INDEX_FILE = RUNS_DIR / "index.json"
@@ -124,22 +124,41 @@ def chunks_path(run_id):
     return RUNS_DIR / f"{run_id}.chunks.gz"
 
 
-def save_chunks(run_id, chunks_by_case):
+def save_chunks(run_id, chunks_by_case, findings_by_case=None):
     """保存该轮的切分文本快照。
 
     这是历史可回溯的前提：离线驱动调的是当前代码，代码一改，旧轮次的切分
     结果就再也无法重现。不存下来，历史轮次就只剩统计数字，看不到那时候
     文本被切成了什么样，也就无法比较切分边界的变化。
 
-    只保留比较所需的字段并 gzip 压缩，中文文本压缩率约 3-4 倍。
+    快照要能**直接当预览用**，所以字段必须够全：
+      - `position_int` 决定能否在原文上定位与截图，缺了它历史版本只能看文本；
+      - 检测命中一并挂到对应切片上，否则看历史版本时所有问题标注都是空的。
+    两者体积都不大，gzip 后中文文本压缩率约 3-4 倍。
+
+    图像对象等运行时产物一律不留——它们无法序列化，也不该进快照。
     """
     # 确保目录存在
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    # 精简字段：正文与定位信息是比较所需，图像对象等一律不留
+    # 按样本、按切片序号归集检测命中，便于挂到对应切片上
+    hits = {}
+    # 逐样本归集
+    for case_id, findings in (findings_by_case or {}).items():
+        # 该样本的命中按切片序号分组
+        by_index = {}
+        # 逐条归入
+        for f in findings:
+            # 同一切片可能命中多条规则
+            by_index.setdefault(f.get("chunk_index"), []).append(f)
+        # 收入
+        hits[case_id] = by_index
+    # 精简字段：正文、定位与命中是预览与比较所需
     slim = {}
     # 逐样本精简
     for case_id, records in (chunks_by_case or {}).items():
-        # 每个切片只保留比较与展示必需的字段
+        # 取该样本的命中索引
+        by_index = hits.get(case_id, {})
+        # 每个切片保留预览与比较必需的字段
         slim[case_id] = [
             {
                 "index": r["index"],  # 切片序号
@@ -147,7 +166,13 @@ def save_chunks(run_id, chunks_by_case):
                 "doc_type_kwd": r.get("doc_type_kwd", ""),  # 块类型
                 "important_kwd": r.get("important_kwd", []),  # 标题面包屑
                 "page_num_int": r.get("page_num_int", []),  # 页码
+                # 版面坐标：历史版本要能在原文上定位高亮、裁出截图，全靠它
+                "position_int": r.get("position_int", []),
+                "top_int": r.get("top_int", []),  # 页内纵向位置，用于排序
                 "is_child": r.get("is_child", False),  # 是否子块
+                "has_image": bool(r.get("has_image")),  # 是否含图，界面据此加标记
+                # 该切片在这一轮被检出的问题；缺了它历史版本看不到任何标注
+                "findings": by_index.get(r["index"], []),
             }
             for r in records
         ]
@@ -190,8 +215,13 @@ def save_run(report, label=""):
     chunks_by_case = report.pop("_chunks", None)
     # 有文本时写出快照并记录体积，便于观察磁盘占用
     if chunks_by_case:
+        # 逐样本取出检测命中，随快照一并存下。
+        # 不存的话，看历史版本时所有问题标注都是空的——那份快照就只能看文本，
+        # 没法回答「这一轮这个块被判了什么问题」
+        findings_by_case = {c["case_id"]: c.get("findings") or []
+                            for c in report.get("cases", [])}
         # 写出压缩快照
-        path = save_chunks(run_id, chunks_by_case)
+        path = save_chunks(run_id, chunks_by_case, findings_by_case)
         # 记录压缩后大小，前端可展示
         report["chunks_bytes"] = path.stat().st_size
         # 标记该轮含文本快照，供界面判断能否做文本对比
@@ -313,25 +343,34 @@ def set_label(run_id, label):
 
 
 def delete_run(run_id):
-    """删除某一轮快照。若它正是当前基准，同时清空基线指针。"""
-    # 快照路径
-    path = RUNS_DIR / f"{run_id}.json"
-    # 删除文件（存在才删）
-    if path.is_file():
-        path.unlink()
-    # 一并删除切分文本快照，避免留下孤儿文件占用磁盘
-    cpath = chunks_path(run_id)
-    if cpath.is_file():
-        cpath.unlink()
+    """删除某一轮及其全部衍生数据。
+
+    一轮评估会落下四样东西：快照 JSON、压缩的切分文本、Markdown 报告、
+    索引里的一条记录；此外它还可能被基线指针引用。只删其中一部分会留下
+    孤儿文件，或者让基线指向已经不存在的数据。
+
+    返回实际删掉的文件清单，供界面如实回报删了什么。
+    """
+    # 记录实际删除的文件，便于回报而不是笼统说一句“已删除”
+    removed = []
+    # 快照、切分文本、Markdown 报告三处衍生文件
+    for path in (RUNS_DIR / f"{run_id}.json", chunks_path(run_id),
+                 REPORT_DIR / f"{run_id}.md"):
+        # 存在才删；缺哪个都不算错，历史轮次未必都生成过报告
+        if path.is_file():
+            path.unlink()
+            removed.append(path.name)
     # 从索引中移除
     index = [r for r in _load_index() if r.get("run_id") != run_id]
     # 写回索引
     _save_index(index)
     # 被删除的轮次若是当前基准，必须清空指针，否则后续对比会指向不存在的数据
-    if get_baseline_id() == run_id:
+    cleared_baseline = get_baseline_id() == run_id
+    # 清空指针
+    if cleared_baseline:
         clear_baseline()
-    # 返回成功
-    return True
+    # 返回删除详情
+    return {"ok": True, "removed": removed, "cleared_baseline": cleared_baseline}
 
 
 def set_baseline(run_id):
