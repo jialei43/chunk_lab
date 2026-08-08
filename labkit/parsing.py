@@ -13,6 +13,7 @@
 
 import queue  # 导入 queue 作为解析任务的串行队列
 import logging  # 导入 logging 捕获解析过程的日志
+import time  # 导入 time 判断产物新鲜度
 import threading  # 导入 threading 在后台执行耗时解析
 import uuid  # 导入 uuid 生成任务标识
 from datetime import datetime  # 导入 datetime 记录任务时间
@@ -96,6 +97,38 @@ def _update(task_id, **fields):
         # 任务存在才更新，避免被删除后重建出幽灵条目
         if task_id in _tasks:
             _tasks[task_id].update(fields)
+
+
+# MinerU 服务端自己的输出根目录。
+# 客户端中断时服务端仍会把产物落在这里，是回捞的依据。
+MINERU_SERVER_OUTPUTS = (
+    Path.home() / "MinerU" / "uv_tools" / "output",
+    Path.home() / "MinerU" / "result",
+)
+
+
+def salvage_product(stem, within_hours=6):
+    """从 MinerU 服务端输出目录回捞指定文件的产物。
+
+    存在的理由：解析一份大 PDF 可能要几十分钟，客户端一旦中断，
+    ragflow 侧的临时目录会留空，而服务端其实已经跑完。
+    不回捞的话那份算力就白费了，还得从头再跑一遍。
+    """
+    # 截止时间，过旧的产物多半属于别的批次
+    cutoff = time.time() - within_hours * 3600
+    # 逐个候选根目录查找
+    for root in MINERU_SERVER_OUTPUTS:
+        # 目录不存在时跳过
+        if not root.is_dir():
+            continue
+        # 按文件名匹配产物，取最近产生的一份
+        matches = [p for p in root.rglob(f"{stem}_content_list.json")
+                   if p.stat().st_mtime >= cutoff]
+        # 有命中则返回最新的
+        if matches:
+            return max(matches, key=lambda p: p.stat().st_mtime)
+    # 没找到
+    return None
 
 
 def append_log(task_id, line):
@@ -342,6 +375,8 @@ def start_parse(file_path, filename, backend="pipeline", parse_method="auto",
             # 轮到本任务执行，从排队中切到运行中并记录真实开始时间
             _update(task_id, status="running", message="正在调用 MinerU 解析…",
                     run_started_at=datetime.now().isoformat(timespec="seconds"))
+            # 记录本次解析的输出目录与文件名，供失败时回捞产物
+            _update(task_id, message="正在调用 MinerU 解析（大文件可能数十分钟）…")
             # 执行解析，产物落在实验室目录
             product = parse_document(
                 file_path,  # 待解析文件
