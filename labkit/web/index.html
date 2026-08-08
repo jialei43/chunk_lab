@@ -429,6 +429,20 @@ a.mini { text-decoration: none; display: inline-block; line-height: 1.5; }
   display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap;
   border-top: 1px dashed var(--line); padding-top: 0.5rem; margin-top: 0.2rem;
 }
+/* ========== 规则质量：护栏结果列表 ========== */
+.guard-list { display: flex; flex-direction: column; gap: 0.5rem; max-height: 60vh; overflow-y: auto; }
+.guard-item {
+  border: 1px solid var(--line); border-left: 3px solid var(--line-strong);
+  border-radius: 5px; padding: 0.6rem 0.8rem;
+  display: flex; flex-direction: column; gap: 0.3rem;
+}
+/* 只有回归用警示色——待修正是待办，仍未覆盖是还没做到的事，都不是事故 */
+.guard-item.regressed { border-left-color: var(--bad); }
+.guard-item.open { border-left-color: var(--warn); }
+.guard-item.improved, .guard-item.pass { border-left-color: var(--good); }
+.guard-head { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; font-size: 0.82rem; }
+.guard-head .mono { font-size: 0.75rem; color: var(--muted); }
+
 .chunk-shot { margin-top: 0.6rem; }
 .shot { margin: 0.4rem 0; }
 .shot img {
@@ -595,6 +609,7 @@ tr.is-baseline { background: var(--accent-soft); }
 <nav>
   <button class="tab active" data-view="overview">概览</button>
   <button class="tab" data-view="chunks">切片预览</button>
+  <button class="tab" data-view="rules">规则质量</button>
   <button class="tab" data-view="corpus">语料库</button>
   <button class="tab" data-view="crawl">网页抓取</button>
   <button class="tab" data-view="parse">解析文件</button>
@@ -704,6 +719,27 @@ tr.is-baseline { background: var(--accent-soft); }
         </div>
       </div>
     </div>
+  </div>
+
+  <!-- ---------- 规则质量 ---------- -->
+  <div class="view" id="view-rules">
+    <div class="card">
+      <h3>标注驱动的规则迭代</h3>
+      <p class="hint" style="margin:0 0 0.9rem">
+        你在切片预览里做的每一次判定都记在这里。<strong>准确率</strong>说明哪条规则最该改，
+        <strong>回归护栏</strong>把这些判定变成可执行断言——改完规则跑一次就知道有没有碰坏别的。
+      </p>
+      <div class="cfg-row">
+        <label class="cfg-label">操作</label>
+        <div class="cfg-input" style="grid-column:span 2">
+          <button class="mini" id="btnGuard">跑回归护栏</button>
+          <button class="mini" id="btnRefreshRules">刷新统计</button>
+          <span class="hint" id="guardHint" style="margin-left:0.5rem">护栏会用当前代码把已标注的样本重切一遍，样本多时要等一会儿。</span>
+        </div>
+      </div>
+    </div>
+    <div id="rulesStats"></div>
+    <div id="guardResult"></div>
   </div>
 
   <!-- ---------- 语料库 ---------- -->
@@ -1285,8 +1321,190 @@ document.querySelectorAll(".tab").forEach(tab => {
     if (tab.dataset.view === "chunks") loadChunkCaseList();
     if (tab.dataset.view === "parse") loadParseTasks();
     if (tab.dataset.view === "crawl") loadCrawl();
+    if (tab.dataset.view === "rules") loadRules();
   });
 });
+
+// ========== 规则质量：标注驱动的迭代闭环 ==========
+// 标注本身只是记录，改规则时帮不上忙。这里把它接出来：准确率说明哪条规则
+// 最该改，误报归纳指出该怎么改，回归护栏保证改完没碰坏别的。
+
+// 各类结论的中文说法，与后端 guard.OUTCOMES 对齐
+const OUTCOME_CN = {
+  pass: "符合预期", regressed: "回归", open: "待修正",
+  improved: "改进", still_missing: "仍未覆盖", stale: "标注已失配",
+};
+// 结论对应的徽标类，取值必须是 .pill 已定义的：只有回归是真出事了
+const OUTCOME_PILL = {
+  pass: "good", regressed: "high", open: "medium",
+  improved: "good", still_missing: "low", stale: "low",
+};
+
+// 加载规则统计与误报归纳
+async function loadRules() {
+  // 占位，避免切过来是一片空白
+  $("rulesStats").innerHTML = `<div class="card"><div class="empty"><span class="spin"></span> 加载中…</div></div>`;
+  // 统计与归纳互不依赖，一起发
+  try {
+    const [stats, fp] = await Promise.all([
+      api("/api/annotations"),
+      api("/api/guard/false-positives"),
+    ]);
+    renderRules(stats.stats || {}, fp.groups || []);
+  } catch (e) {
+    $("rulesStats").innerHTML = `<div class="card"><div class="empty" style="color:var(--bad)">加载失败：${esc(e.message)}</div></div>`;
+  }
+}
+
+// 渲染规则统计与误报归纳
+function renderRules(stats, groups) {
+  // 一条标注都没有时说明该怎么开始，而不是显示一堆零
+  if (!stats.cases) {
+    $("rulesStats").innerHTML = `<div class="card"><div class="empty">
+      还没有任何标注。到「切片预览」里对检测结果点「确认是问题」或「标为误报」，
+      这里就会有数据。</div></div>`;
+    return;
+  }
+  // 百分比展示，无数据时用占位符而不是 0%
+  const pct = v => (v === null || v === undefined) ? "—" : `${Math.round(v * 100)}%`;
+  // 标漏报时问题类型是自由填写的，填进来的往往不是已有规则名，
+  // 而是「这里该怎么改」。两者要分开看：前者衡量现有规则准不准，
+  // 后者是人工提出的、规则还没覆盖的需求——那才是下一条该写什么。
+  const all = Object.entries(stats.by_detector || {});
+  // 已实现的规则：名字在检测器元数据里
+  const rows = all.filter(([d]) => DETECTOR_META[d])
+    .sort((a, b) => b[1].false_positive - a[1].false_positive);
+  // 人工提出的新需求：名字不在元数据里，按提出次数降序
+  const wanted = all.filter(([d]) => !DETECTOR_META[d] && d !== "(未指定)")
+    .sort((a, b) => b[1].missed - a[1].missed);
+  // 逐规则一行，附上该规则的误报归纳
+  const byDet = Object.fromEntries(groups.map(g => [g.detector, g]));
+
+  $("rulesStats").innerHTML = `
+    <div class="card">
+      <h3>总体</h3>
+      <div class="stat-row">
+        <div class="stat"><div class="stat-label">准确率</div><div class="stat-value">${pct(stats.precision)}</div>
+          <div class="hint">报出来的有多少是真问题</div></div>
+        <div class="stat"><div class="stat-label">召回率</div><div class="stat-value">${pct(stats.recall)}</div>
+          <div class="hint">真问题有多少被抓到</div></div>
+        <div class="stat"><div class="stat-label">已标注</div><div class="stat-value">${stats.cases}</div>
+          <div class="hint">个样本</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>逐条规则</h3>
+      <div style="overflow-x:auto">
+      <table>
+        <thead><tr><th>规则</th><th>确认</th><th>误报</th><th>准确率</th><th>误报共性</th></tr></thead>
+        <tbody>${rows.map(([det, s]) => {
+          // 该规则的准确率单独算，总体准确率看不出是谁拖累的
+          const judged = s.confirmed + s.false_positive;
+          const p = judged ? s.confirmed / judged : null;
+          // 归纳信息：文件类型分布与人工写下的原因，是改规则最直接的线索
+          const g = byDet[det];
+          const why = g
+            ? `${Object.entries(g.by_ext).map(([e, n]) => `${e} ${n}`).join("、")}` +
+              (g.notes.length ? `　<span class="ev">${esc(g.notes[0])}</span>` : "")
+            : "—";
+          return `<tr>
+            <td><span class="pill ${sevClass(detSev(det))}">${esc(detCn(det))}</span></td>
+            <td class="num">${s.confirmed}</td>
+            <td class="num">${s.false_positive}</td>
+            <td class="num">${pct(p)}</td>
+            <td>${why}</td>
+          </tr>`;
+        }).join("")}</tbody>
+      </table>
+      </div>
+      <p class="hint" style="margin:0.8rem 0 0">
+        误报多的排在前面——那是最该改的规则。「误报共性」里的文件类型分布常常直接点出问题：
+        某类格式集中出错，说明规则没考虑那种文档的写法。
+      </p>
+    </div>
+    ${wanted.length ? `<div class="card">
+      <h3>人工提出的规则需求</h3>
+      <p class="hint" style="margin:0 0 0.9rem">
+        标漏报时填的问题类型不在现有规则里，说明这是规则还没覆盖的情况。
+        这些是最直接的待办——每一条都是人看着真实文档提出来的。
+      </p>
+      <div style="overflow-x:auto">
+      <table>
+        <thead><tr><th>需求</th><th>提出次数</th></tr></thead>
+        <tbody>${wanted.map(([d, s]) => `<tr>
+          <td>${esc(d)}</td>
+          <td class="num">${s.missed || (s.confirmed + s.false_positive + s.missed)}</td>
+        </tr>`).join("")}</tbody>
+      </table>
+      </div>
+    </div>` : ""}`;
+}
+
+// 跑一次回归护栏
+$("btnGuard").addEventListener("click", async () => {
+  const btn = $("btnGuard");
+  // 置为运行中：护栏要把已标注样本全部重切一遍，重复点会白白争抢 CPU
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span> 核对中…';
+  try {
+    // 切分参数与预览页一致，否则切片边界不同、标注对不上
+    const q = new URLSearchParams({ parser_config: JSON.stringify(runParams()) });
+    renderGuard(await api(`/api/guard?${q}`));
+  } catch (e) {
+    $("guardResult").innerHTML = `<div class="card"><div class="empty" style="color:var(--bad)">核对失败：${esc(e.message)}</div></div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "跑回归护栏";
+  }
+});
+
+// 刷新统计
+$("btnRefreshRules").addEventListener("click", loadRules);
+
+// 渲染护栏结果
+function renderGuard(r) {
+  // 没有可核对的标注时直接说明
+  if (!r.items || !r.items.length) {
+    $("guardResult").innerHTML = `<div class="card"><div class="empty">没有可核对的标注</div></div>`;
+    return;
+  }
+  // 汇总徽标，按严重度排序展示
+  const order = ["regressed", "open", "still_missing", "stale", "improved", "pass"];
+  const chips = order.filter(k => r.summary[k]).map(k =>
+    `<span class="pill ${OUTCOME_PILL[k]}">${OUTCOME_CN[k]} ${r.summary[k]}</span>`
+  ).join(" ");
+  // 结论只看回归：待修正是待办，仍未覆盖是还没做到的事，都不该算失败
+  const verdict = r.ok
+    ? `<span style="color:var(--good)">通过，无回归</span>`
+    : `<span style="color:var(--bad)">不通过，出现 ${r.summary.regressed} 条回归</span>`;
+  // 明细按严重度排序，回归排最前
+  const items = [...r.items].sort((a, b) =>
+    order.indexOf(a.outcome) - order.indexOf(b.outcome));
+
+  $("guardResult").innerHTML = `
+    <div class="card">
+      <h3>回归护栏</h3>
+      <p style="margin:0 0 0.6rem">核对 ${r.checked} 个样本　${chips}</p>
+      <p class="hint" style="margin:0 0 0.9rem">结论：${verdict}
+        只有「回归」算失败——那是改动碰坏了本来能检出的东西。</p>
+      <div class="guard-list">${items.map(it => {
+        // 找不回切片时只有标注时的序号可说
+        const where = it.chunk_index === null
+          ? `标注时 #${it.marked_index}`
+          : `#${it.chunk_index}${it.marked_index !== it.chunk_index ? `（标注时 #${it.marked_index}）` : ""}`;
+        return `<div class="guard-item ${it.outcome}">
+          <div class="guard-head">
+            <span class="pill ${OUTCOME_PILL[it.outcome]}">${OUTCOME_CN[it.outcome]}</span>
+            <span class="mono">${esc(it.case_id)} ${where}</span>
+            <span>${esc(detCn(it.detector) || "(未指定)")}</span>
+          </div>
+          <div class="hint">${esc(it.message)}</div>
+          ${it.note ? `<div class="hint">人工备注：${esc(it.note)}</div>` : ""}
+          ${it.excerpt ? `<div class="ev">${esc(it.excerpt.slice(0, 80).replace(/\n/g, " "))}</div>` : ""}
+        </div>`;
+      }).join("")}</div>
+    </div>`;
+}
 
 // ========== 运行评估 ==========
 $("btnEval").addEventListener("click", async () => {

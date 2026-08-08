@@ -13,7 +13,7 @@ from pathlib import Path  # 导入 Path 定位前端静态文件
 import markdown  # 导入 markdown 把评估报告渲染成 HTML 供页面预览
 from flask import Flask, Response, jsonify, request, send_from_directory  # 导入 Flask 及其响应工具
 
-from . import annotations, crawling, runs  # 导入标注、爬取与运行历史模块
+from . import annotations, crawling, guard, runs  # 导入标注、爬取、回归护栏与运行历史模块
 from .detect import detect  # 导入列表页结构自动识别
 from .preview import attach_source, attach_source_from_path, find_source, render_chunk  # 导入原文截图能力
 from .detectors import DetectorConfig  # 导入检测阈值配置
@@ -460,6 +460,43 @@ def api_annotation_stats():
     """标注统计：检测器的准确率与漏报情况。"""
     # 可按样本收窄
     return jsonify({"ok": True, "stats": annotations.stats(request.args.get("case"))})
+
+
+@app.get("/api/guard")
+def api_guard():
+    """按当前代码重跑一遍，核对人工标注是否仍然成立。
+
+    这是改检测规则时的护栏：没有它，修好一条误报的同时碰坏另一条，
+    要等下一轮全量评估才发现，甚至根本发现不了。
+    """
+    # 可按样本收窄，便于针对一个文档快速迭代
+    only = request.args.get("case")
+    # 切分参数与预览页保持一致，否则切片边界不同、标注对不上
+    raw = request.args.get("parser_config")
+    # 解析失败时用默认配置，不因参数格式问题让护栏跑不起来
+    try:
+        config = json.loads(raw) if raw else None
+    except (TypeError, ValueError):
+        config = None
+    # 执行核对
+    return jsonify(guard.check(only=[only] if only else None, parser_config=config))
+
+
+@app.get("/api/guard/false-positives")
+def api_false_positives():
+    """归纳误报的共同特征，指出规则该往哪儿改。
+
+    逐条看误报很难看出规律；把同一条规则的反例放在一起，
+    命中的是什么、出现在什么格式的文档里，往往一眼就能看出来。
+    """
+    # 可按规则或样本收窄
+    return jsonify({
+        "ok": True,
+        "groups": guard.analyze_false_positives(
+            detector=request.args.get("detector"),  # 只看某一条规则
+            only=[request.args.get("case")] if request.args.get("case") else None,  # 只看某个样本
+        ),
+    })
 
 
 @app.post("/api/preview/<case_id>/source")

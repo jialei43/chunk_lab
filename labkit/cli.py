@@ -176,6 +176,58 @@ def cmd_runs(args):
     return 0
 
 
+def cmd_guard(args):
+    """核对人工标注在当前代码下是否仍然成立。
+
+    改检测规则的正确顺序是：先跑一次记下基准，改完再跑一次比对。
+    出现「回归」说明这次改动碰坏了本来能检出的东西。
+    """
+    # 延迟导入，其它子命令不承担切分依赖的加载开销
+    from .guard import OUTCOMES, analyze_false_positives, check
+    # 执行核对
+    r = check(only=[args.case] if args.case else None)
+    # 汇总一行说清结果
+    parts = [f"{OUTCOMES[k]} {v}" for k, v in r["summary"].items() if v]
+    print(f"\n核对 {r['checked']} 个样本：{'、'.join(parts) or '没有可核对的标注'}")
+    # 有回归时明确指出，这是唯一算失败的情况
+    print("结论：" + ("通过，无回归" if r["ok"] else "不通过，出现回归"))
+
+    # 只关心待办时过滤掉已通过的条目
+    rows = ([x for x in r["items"] if x["outcome"] in ("regressed", "open", "stale")]
+            if args.todo else r["items"])
+    # 逐条打印
+    for it in rows:
+        # 找不回切片时只有标注时的序号可说
+        if it.get("chunk_index") is None:
+            where = f"标注时 #{it.get('marked_index')}"
+        else:
+            # 序号错位时同时给出新旧序号，便于理解标注为什么要靠摘要定位
+            moved = ("" if it.get("marked_index") == it.get("chunk_index")
+                     else f"（标注时 #{it.get('marked_index')}）")
+            where = f"#{it['chunk_index']}{moved}"
+        print(f"\n  [{OUTCOMES[it['outcome']]}] {it['case_id']} {where}　{it['detector']}")
+        print(f"      {it['message']}")
+        # 人工备注往往直接写了原因，是改规则最有用的线索
+        if it.get("note"):
+            print(f"      人工备注：{it['note']}")
+        # 摘要帮助确认核对的是不是同一段文字
+        if it.get("excerpt"):
+            print(f"      正文：{it['excerpt'][:60].replace(chr(10), ' ')}")
+
+    # 附带误报归纳，指出规则该往哪儿改
+    if args.why:
+        groups = analyze_false_positives(only=[args.case] if args.case else None)
+        # 没有误报时说明这一点，避免以为是功能没跑
+        if not groups:
+            print("\n暂无标为误报的切片，无从归纳")
+        for g in groups:
+            print(f"\n  规则 {g['detector']}：{g['count']} 条误报")
+            print(f"      文件类型分布：{g['by_ext']}")
+            # 人工备注是最直接的线索
+            for n in g["notes"][:5]:
+                print(f"      人工判断：{n}")
+
+
 def cmd_smoke(args):
     """执行单产物连通性验证，转发给阶段一的 smoke 模块。"""
     # 延迟导入
@@ -394,6 +446,16 @@ def build_parser():
     p_serve.set_defaults(func=cmd_serve)
 
     # smoke 子命令
+    p_guard = sub.add_parser("guard", help="回归护栏：核对人工标注是否仍然成立")
+    # 可只核对一个样本，便于针对某个文档快速迭代
+    p_guard.add_argument("--case", default="", help="只核对指定样本")
+    # 只列出仍需处理的条目，改规则时更省事
+    p_guard.add_argument("--todo", action="store_true", help="只列出回归与待修正")
+    # 顺带打印误报归纳
+    p_guard.add_argument("--why", action="store_true", help="附带误报共性分析")
+    # 绑定处理函数
+    p_guard.set_defaults(func=cmd_guard)
+
     p_smoke = sub.add_parser("smoke", help="单产物连通性验证")
     # 产物路径
     p_smoke.add_argument("content_list", help="content_list.json 路径")
