@@ -111,6 +111,45 @@ DETECTOR_INFO = {
             "rag/app/mineru_chunker.py::_describe_image（VLM 图片描述）",
         ],
     },
+    "table_split": {
+        "cn": "表格被拆散",
+        "sev": "high",
+        "desc": "表体切片没有表头，单独看不知道每列是什么。生产有「长表按行组切分并重复表头」的机制，命中说明该机制未生效。",
+        "code": [
+            "rag/app/mineru_chunker.py::_emit_table_chunks（行组切分与表头重复）",
+            "rag/app/mineru_chunker.py::_detect_header_rows（表头行识别）",
+        ],
+    },
+    "dangling_reference": {
+        "cn": "指代缺失上下文",
+        "sev": "medium",
+        "desc": "切片以「其中／此外／上图／该 X」开头，被指代对象在前一个切片。形式完全合法，但单独被检索出来时读者无从理解。",
+        "code": [
+            "rag/app/mineru_chunker.py::_merge_text_units（相邻段落未合并导致指代与先行词分离）",
+            "rag/app/mineru_chunker.py（可考虑为这类切片补充前文摘要或上下文窗口）",
+        ],
+    },
+    "list_split": {
+        "cn": "列表被拆散",
+        "sev": "medium",
+        "desc": "编号项跨切片断开，任何一片单独看都是不完整的枚举。",
+        "code": ["rag/app/mineru_chunker.py::_merge_text_units（列表项属独立原始块，默认模式下各自成块）"],
+    },
+    "heading_tail": {
+        "cn": "标题与正文分离",
+        "sev": "medium",
+        "desc": "标题落在切片末尾，其正文在下一切片。与「标题孤块」不同，这里标题被吸附在上一块结尾，更隐蔽。",
+        "code": ["rag/app/mineru_chunker.py::_merge_text_units（标题应与其后正文合并而非留在上一块）"],
+    },
+    "caption_orphan": {
+        "cn": "图注公式脱离上下文",
+        "sev": "medium",
+        "desc": "图表注或公式独立成块、缺少讲解正文。单独检索无价值，也使被引用对象失去说明。",
+        "code": [
+            "rag/app/mineru_chunker.py::_emit_image_chunks（图片与图注的关联）",
+            "rag/app/mineru_chunker.py::_merge_text_units（图注应与讲解正文合并）",
+        ],
+    },
     "missing_position": {
         "cn": "缺定位",
         "sev": "low",
