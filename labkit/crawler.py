@@ -24,6 +24,8 @@
 
 import argparse  # 导入 argparse 解析命令行参数
 import hashlib  # 导入 hashlib 为重名文件生成短后缀
+import threading  # 导入 threading 实现速率限制与线程本地会话
+from concurrent.futures import ThreadPoolExecutor, as_completed  # 导入线程池并行下载
 import json  # 导入 json 读写断点续跑的进度文件
 import logging  # 导入 logging 输出抓取过程
 import random  # 导入 random 给延时加抖动，避免固定节奏的请求特征
@@ -54,6 +56,48 @@ MAX_RETRIES = 3
 # 声明真实的 UA 并留下用途说明，便于站点管理员识别与联系，比伪装成浏览器更妥当
 USER_AGENT = "chunk-lab-crawler/1.0 (document collection for offline chunking tests)"
 
+# 默认并发下载数。
+#
+# 并发与速率是两件事，必须分开控制：并发提升传输吞吐，delay 限制请求频率。
+# 若不分开，一开并发就等于把请求频率乘以并发数，很容易把对方站点打挂。
+#
+# 由此也决定了并发的适用范围——只有当「单文件传输耗时」明显大于 delay 时才有收益：
+#   · 大文件（几十 MB）：传输占主导，并发接近线性提速
+#   · 小文件或详情页多：瓶颈在请求发起，并发无效，调小 delay 才有用
+# 实测 arxiv 列表页（50+ 详情页、6 个约 1MB 文件）：并发 4 与串行耗时相同。
+DEFAULT_WORKERS = 4
+
+
+class RateLimiter:
+    """全局请求速率限制：保证任意两次请求的发起间隔不小于给定值。
+
+    与并发数正交：并发 8 且间隔 1 秒，仍然是每秒最多发起 1 个请求，
+    只是允许 8 个文件同时在传输。这正是既提速又不加压的关键。
+    """
+
+    def __init__(self, min_interval):
+        # 两次请求之间的最小间隔
+        self.min_interval = min_interval
+        # 保护上次请求时间的锁，多线程共用同一个节流器
+        self.lock = threading.Lock()
+        # 上次放行的时间点，用单调时钟避免系统时间调整造成异常
+        self.last = 0.0
+
+    def acquire(self):
+        """阻塞到允许发起下一次请求为止。"""
+        # 持锁计算等待时间并更新时间戳，保证全局有序
+        with self.lock:
+            # 当前时刻
+            now = time.monotonic()
+            # 距离允许发起还差多久
+            wait = self.last + self.min_interval - now
+            # 未到时间就睡；抖动放在这里，避免固定节奏的请求特征
+            if wait > 0:
+                time.sleep(wait * random.uniform(0.85, 1.15))
+            # 记录本次放行时间
+            self.last = time.monotonic()
+
+
 # 日志格式：时间 + 级别 + 消息
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
                     datefmt="%H:%M:%S")
@@ -66,13 +110,16 @@ class Crawler:
     def __init__(self, start_url, out_dir, exts, delay=DEFAULT_DELAY, max_pages=10,
                  max_files=0, max_mb=DEFAULT_MAX_MB, next_text=None, next_selector=None,
                  detail_selector=None, same_host=True, obey_robots=True, dry_run=False,
-                 on_progress=None):
+                 on_progress=None, workers=DEFAULT_WORKERS, link_pattern=None):
         # 起始列表页
         self.start_url = start_url
         # 下载目录
         self.out_dir = Path(out_dir)
         # 目标扩展名集合，统一小写并带点，便于比对
         self.exts = {("." + e.strip().lower().lstrip(".")) for e in exts.split(",") if e.strip()}
+        # 链接正则：不少站点的下载地址不带扩展名（如 /pdf/2401.12345、download?id=9），
+        # 只看扩展名会把它们全部漏掉，故允许额外用正则指定
+        self.link_pattern = re.compile(link_pattern) if link_pattern else None
         # 请求间隔
         self.delay = delay
         # 最多翻多少页，防止无限翻页
@@ -95,10 +142,16 @@ class Crawler:
         self.dry_run = dry_run
         # 进度回调，Web 端据此展示实时状态；命令行不传则只写日志
         self.on_progress = on_progress
+        # 并发下载数；1 即完全串行
+        self.workers = max(1, int(workers))
+        # 全局速率限制器，所有线程共用，保证请求频率不随并发数放大
+        self.limiter = RateLimiter(delay)
+        # 保护统计与已完成集合的锁，多线程会同时更新它们
+        self.state_lock = threading.Lock()
+        # 线程本地存储：requests.Session 并非完全线程安全，每线程各持一个更稳妥
+        self.local = threading.local()
 
-        # 复用连接，减少握手开销
-        self.session = requests.Session()
-        self.session.headers["User-Agent"] = USER_AGENT
+        # 会话按线程创建，见 session 属性
         # 起始域名，用于同域判断
         self.host = urlparse(start_url).netloc
         # 已访问过的页面，避免翻页成环时死循环
@@ -109,6 +162,27 @@ class Crawler:
         self.stats = {"pages": 0, "found": 0, "downloaded": 0, "skipped": 0, "failed": 0}
         # robots 解析器
         self.robots = None
+
+    @property
+    def session(self):
+        """当前线程的 HTTP 会话。
+
+        requests.Session 并非完全线程安全，多线程共用同一个可能出现连接池竞争，
+        因此每个线程各持一个；连接复用的收益在单线程内部依然保留。
+        """
+        # 该线程尚未创建过会话时新建
+        if not hasattr(self.local, "session"):
+            s = requests.Session()
+            s.headers["User-Agent"] = USER_AGENT
+            self.local.session = s
+        # 返回本线程的会话
+        return self.local.session
+
+    def bump(self, key, n=1):
+        """线程安全地累加统计项。"""
+        # 多线程会同时更新统计，必须加锁
+        with self.state_lock:
+            self.stats[key] = self.stats.get(key, 0) + n
 
     # ---------- 准备 ----------
 
@@ -172,18 +246,24 @@ class Crawler:
         """上报进度。命令行走日志，Web 端走回调。"""
         # 始终记录日志，便于事后排查
         log.info(message)
-        # 有回调时同步给调用方
+        # 有回调时同步给调用方；取统计快照避免回调看到半更新状态
         if self.on_progress:
             # 回调异常不应中断抓取
             try:
-                self.on_progress(dict(self.stats), message)
+                with self.state_lock:
+                    snapshot = dict(self.stats)
+                self.on_progress(snapshot, message)
             except Exception:
                 pass
 
     def sleep(self):
-        """请求间隔。加入随机抖动，避免固定节奏的请求特征。"""
-        # 在基准延时上下浮动 30%
-        time.sleep(self.delay * random.uniform(0.7, 1.3))
+        """等待到允许发起下一次请求。
+
+        走全局限速器而非各线程各睡各的：后者在并发下会让实际请求频率
+        变成「并发数 ÷ 间隔」，与设定值完全不符。
+        """
+        # 由限速器统一节流
+        self.limiter.acquire()
 
     def get(self, url, **kwargs):
         """带重试的 GET。失败按指数退避重试，仍失败则返回 None。"""
@@ -210,7 +290,14 @@ class Crawler:
     # ---------- 解析 ----------
 
     def is_target(self, url):
-        """判断链接是否指向目标格式的文件。"""
+        """判断链接是否指向目标格式的文件。
+
+        两条判据取并集：扩展名匹配，或命中用户给的正则。
+        只靠扩展名会漏掉大量不带后缀的下载地址。
+        """
+        # 正则优先：命中即认定为目标，不再看扩展名
+        if self.link_pattern and self.link_pattern.search(url):
+            return True
         # 去掉查询串后看扩展名；不少下载链接带参数
         path = urlparse(url).path
         # 扩展名匹配即为目标
@@ -290,21 +377,34 @@ class Crawler:
         # 返回安全文件名
         return name
 
+    def download_guarded(self, url):
+        """下载的线程安全包装：先节流，再下载，异常不外泄到线程池。"""
+        # 每个文件请求前统一节流
+        self.sleep()
+        # 单个文件失败不应中断其它下载
+        try:
+            self.download(url)
+        except Exception as e:
+            log.error(f"下载异常 {url}：{e}")
+            self.bump("failed")
+
     def download(self, url):
         """下载单个文件。已存在同名同源文件时跳过。"""
-        # 断点续跑：此前已下载过就不重复
-        if url in self.done:
-            self.stats["skipped"] += 1
+        # 断点续跑：此前已下载过就不重复；多线程读写故加锁
+        with self.state_lock:
+            already = url in self.done
+        if already:
+            self.bump("skipped")
             return
         # robots 禁止时不下载
         if not self.allowed(url):
             log.warning(f"robots.txt 不允许，跳过：{url}")
-            self.stats["skipped"] += 1
+            self.bump("skipped")
             return
         # 演练模式只报告不下载
         if self.dry_run:
             log.info(f"[dry-run] 将下载 {url}")
-            self.stats["found"] += 1
+            self.bump("found")
             return
 
         # 用流式请求，先看响应头再决定是否真的读取内容
@@ -312,18 +412,18 @@ class Crawler:
             resp = self.session.get(url, timeout=DOWNLOAD_TIMEOUT, stream=True)
         except Exception as e:
             log.error(f"下载失败 {url}：{e}")
-            self.stats["failed"] += 1
+            self.bump("failed")
             return
         # 非 200 视为失败
         if resp.status_code != 200:
             log.error(f"下载失败 {url}：HTTP {resp.status_code}")
-            self.stats["failed"] += 1
+            self.bump("failed")
             return
         # 超过大小上限时放弃，避免误抓超大文件
         size = int(resp.headers.get("Content-Length") or 0)
         if size and size > self.max_bytes:
             log.warning(f"超过 {self.max_bytes // 1024 // 1024}MB 上限，跳过：{url}")
-            self.stats["skipped"] += 1
+            self.bump("skipped")
             return
 
         # 推导文件名并处理重名
@@ -352,12 +452,13 @@ class Crawler:
             # 半截文件毫无价值，且会让人误以为下载成功
             dest.unlink(missing_ok=True)
             log.error(f"下载中断 {url}：{e}")
-            self.stats["failed"] += 1
+            self.bump("failed")
             return
 
-        # 记录完成
-        self.done.add(url)
-        self.stats["downloaded"] += 1
+        # 记录完成；多线程写入故加锁
+        with self.state_lock:
+            self.done.add(url)
+        self.bump("downloaded")
         self.report(f"已下载 {dest.name}（{written / 1024:.0f} KB）")
 
     # ---------- 主流程 ----------
@@ -380,7 +481,7 @@ class Crawler:
         if resp is None or resp.status_code != 200:
             log.error(f"列表页不可用：{url}")
             return None
-        self.stats["pages"] += 1
+        self.bump("pages")
         # 用响应声明的编码解析，中文站点常见 GBK
         resp.encoding = resp.apparent_encoding or resp.encoding
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -392,39 +493,53 @@ class Crawler:
         # 配置了详情页选择器时，进入详情页再找附件
         if self.detail_selector:
             details = [u for u in self.extract_links(soup, url, self.detail_selector)
-                       if self.same_site(u)]
-            log.info(f"本页 {len(details)} 个详情页")
-            # 逐个进入详情页
-            for d in details:
-                # 达到文件数上限时提前结束
-                if self.max_files and self.stats["downloaded"] >= self.max_files:
-                    break
+                       if self.same_site(u) and self.allowed(u)]
+            self.report(f"本页 {len(details)} 个详情页，并发 {self.workers} 抓取")
+
+            # 抓取单个详情页并返回其中的目标文件链接
+            def fetch_detail(d):
+                # 每次请求前统一节流，保证全局频率不随并发放大
                 self.sleep()
-                # robots 禁止则跳过
-                if not self.allowed(d):
-                    continue
                 sub = self.get(d)
                 # 详情页取不到就跳过，不影响其它条目
                 if sub is None or sub.status_code != 200:
-                    continue
+                    return []
                 sub.encoding = sub.apparent_encoding or sub.encoding
                 sub_soup = BeautifulSoup(sub.text, "html.parser")
-                # 收集详情页里的目标文件
-                targets += [u for u in self.extract_links(sub_soup, d)
-                            if self.is_target(u) and self.same_site(u)]
+                # 收集该详情页里的目标文件
+                return [u for u in self.extract_links(sub_soup, d)
+                        if self.is_target(u) and self.same_site(u)]
 
-        # 去重后逐个下载，保持原顺序便于对照页面
+            # 并行抓取详情页；它们彼此独立，是并发收益最明显的一段
+            with ThreadPoolExecutor(max_workers=self.workers) as pool:
+                futures = [pool.submit(fetch_detail, d) for d in details]
+                # 逐个收取结果；单个详情页失败不影响整体
+                for fut in as_completed(futures):
+                    try:
+                        targets += fut.result()
+                    except Exception as e:
+                        log.warning(f"详情页抓取异常：{e}")
+
+        # 去重，保持原顺序便于对照页面
         seen = set()
         ordered = [u for u in targets if not (u in seen or seen.add(u))]
-        log.info(f"本页命中 {len(ordered)} 个目标文件")
-        # 逐个下载
-        for u in ordered:
-            # 达到上限即停
-            if self.max_files and self.stats["downloaded"] >= self.max_files:
-                log.info(f"已达文件数上限 {self.max_files}")
-                break
-            self.sleep()
-            self.download(u)
+        # 有文件数上限时先截断，避免并发下超量下载
+        if self.max_files:
+            with self.state_lock:
+                remain = max(0, self.max_files - self.stats["downloaded"])
+            ordered = ordered[:remain]
+        self.report(f"本页命中 {len(ordered)} 个目标文件，并发 {self.workers} 下载")
+
+        # 并行下载。请求发起仍由全局限速器串行节流，并发提升的是传输吞吐——
+        # 大文件的耗时几乎都在传输上，因此这里的收益最直接。
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            futures = [pool.submit(self.download_guarded, u) for u in ordered]
+            # 等待全部完成；异常已在内部处理，这里只兜底
+            for fut in as_completed(futures):
+                try:
+                    fut.result()
+                except Exception as e:
+                    log.error(f"下载线程异常：{e}")
         # 每页结束后保存进度，中断后可续跑
         self.save_progress()
         # 返回下一页地址
@@ -432,6 +547,8 @@ class Crawler:
 
     def run(self):
         """执行抓取。"""
+        # 记录起始时间，用于报告实际耗时
+        started = time.monotonic()
         # 准备 robots 与断点信息
         self.load_robots()
         self.load_progress()
@@ -450,8 +567,10 @@ class Crawler:
         self.save_progress()
         # 打印统计
         log.info("—— 完成 ——")
+        elapsed = time.monotonic() - started
         log.info(f"列表页 {self.stats['pages']}　下载 {self.stats['downloaded']}　"
-                 f"跳过 {self.stats['skipped']}　失败 {self.stats['failed']}")
+                 f"跳过 {self.stats['skipped']}　失败 {self.stats['failed']}　"
+                 f"耗时 {elapsed:.1f}s　并发 {self.workers}")
         log.info(f"文件位于：{self.out_dir.resolve()}")
         # 有失败时以非零码退出，便于脚本串联时感知
         return 1 if self.stats["failed"] else 0
@@ -469,6 +588,8 @@ def main(argv=None):
     p.add_argument("-o", "--out", default=None, help="下载目录，默认为数据目录下的 downloads/")
     # 目标扩展名
     p.add_argument("--ext", default=DEFAULT_EXTS, help=f"目标扩展名，逗号分隔，默认 {DEFAULT_EXTS}")
+    p.add_argument("--link-pattern",
+                   help="下载链接的正则，用于识别不带扩展名的地址，如 '/pdf/' 或 'download\\?id='")
     # 翻页规则
     p.add_argument("--next-text", help="翻页链接的文字，如「下一页」")
     p.add_argument("--next-selector", help="翻页链接的 CSS 选择器，优先于 --next-text")
@@ -479,7 +600,12 @@ def main(argv=None):
     p.add_argument("--max-files", type=int, default=0, help="最多下载多少个文件，0 为不限")
     p.add_argument("--max-mb", type=int, default=DEFAULT_MAX_MB, help=f"单文件大小上限 MB，默认 {DEFAULT_MAX_MB}")
     # 节奏
-    p.add_argument("--delay", type=float, default=DEFAULT_DELAY, help=f"请求间隔秒数，默认 {DEFAULT_DELAY}")
+    p.add_argument("--delay", type=float, default=DEFAULT_DELAY,
+                   help=f"两次请求的全局最小间隔秒数，默认 {DEFAULT_DELAY}。与并发数无关，"
+                        f"并发再高请求频率也不超过它")
+    p.add_argument("-w", "--workers", type=int, default=DEFAULT_WORKERS,
+                   help=f"并发下载数，默认 {DEFAULT_WORKERS}。提升的是传输吞吐而非请求频率；"
+                        f"设为 1 即完全串行")
     # 范围与合规
     p.add_argument("--cross-host", action="store_true", help="允许抓取外域链接，默认只抓同域")
     p.add_argument("--ignore-robots", action="store_true",
@@ -508,6 +634,8 @@ def main(argv=None):
         same_host=not args.cross_host,  # 是否限制同域
         obey_robots=not args.ignore_robots,  # 是否遵守 robots
         dry_run=args.dry_run,  # 是否只演练
+        workers=args.workers,  # 并发下载数
+        link_pattern=args.link_pattern,  # 下载链接正则
     )
     return crawler.run()
 

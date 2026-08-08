@@ -162,36 +162,75 @@ def api_corpus():
 
 @app.post("/api/parse")
 def api_parse():
-    """上传文件并启动 MinerU 解析，立即返回任务标识。
+    """上传一个或多个文件并排队 MinerU 解析，立即返回任务标识。
 
     解析耗时数分钟，必须异步：同步等待会让请求超时、界面假死。
+    多文件共用同一份表单参数（backend、解析方法等），每个文件一个独立任务，
+    互不影响；任务在服务端串行执行，避免并发压垮本机 MinerU 服务。
     产物落在实验室自己的目录，与生产的 MinerU 输出彻底分开。
     """
-    # 取上传的文件
-    file = request.files.get("file")
+    # 取出全部上传文件，过滤掉浏览器可能带来的空文件项
+    files = [f for f in request.files.getlist("file") if f and f.filename]
     # 没有文件时明确提示
-    if file is None or not file.filename:
+    if not files:
         return jsonify({"ok": False, "message": "未选择文件"}), 400
     # 确保上传目录存在
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    # 保留原始文件名：切分器按扩展名分派类型，改名会导致走错分支
-    dest = UPLOAD_DIR / Path(file.filename).name
-    # 落盘
-    file.save(dest)
-    # 启动后台解析
-    task_id = start_parse(
-        dest,  # 已落盘的文件路径
-        Path(file.filename).name,  # 原始文件名
-        backend=request.form.get("backend") or "pipeline",  # 处理后端类型
-        parse_method=request.form.get("parse_method") or "auto",  # 解析方法
-        auto_import=request.form.get("auto_import", "1") != "0",  # 解析后是否自动入库
-        kind=request.form.get("kind", ""),  # 文档大类
-        note=request.form.get("note", ""),  # 备注
-        mineru_api=request.form.get("mineru_api", ""),  # MinerU API 服务器，留空用默认
-        output_dir=request.form.get("output_dir", ""),  # 产物输出目录，留空用实验室默认目录
-    )
-    # 返回任务标识供前端轮询
-    return jsonify({"ok": True, "task_id": task_id})
+    # 表单参数整批共用，循环外解析一次即可
+    backend = request.form.get("backend") or "pipeline"  # 处理后端类型
+    parse_method = request.form.get("parse_method") or "auto"  # 解析方法
+    auto_import = request.form.get("auto_import", "1") != "0"  # 解析后是否自动入库
+    kind = request.form.get("kind", "")  # 文档大类
+    note = request.form.get("note", "")  # 备注
+    mineru_api = request.form.get("mineru_api", "")  # MinerU API 服务器，留空用默认
+    output_dir = request.form.get("output_dir", "")  # 产物输出目录，留空用实验室默认目录
+
+    # 本批已提交的文件名集合，用于跳过同名文件
+    seen = set()
+    # 已提交的任务列表，元素含任务标识与文件名
+    tasks = []
+    # 因同名被跳过的文件名列表
+    skipped = []
+    # 逐个落盘并排队
+    for file in files:
+        # 保留原始文件名：切分器按扩展名分派类型，改名会导致走错分支
+        name = Path(file.filename).name
+        # 上传目录按文件名平铺存放，同名会互相覆盖，故一批内只收第一个
+        if name in seen:
+            # 记录被跳过的文件，如实回报而不是静默丢弃
+            skipped.append(name)
+            # 跳过后续处理
+            continue
+        # 记入已见文件名
+        seen.add(name)
+        # 目标路径
+        dest = UPLOAD_DIR / name
+        # 落盘
+        file.save(dest)
+        # 排队解析，返回任务标识
+        task_id = start_parse(
+            dest,  # 已落盘的文件路径
+            name,  # 原始文件名
+            backend=backend,  # 处理后端类型
+            parse_method=parse_method,  # 解析方法
+            auto_import=auto_import,  # 解析后是否自动入库
+            kind=kind,  # 文档大类
+            note=note,  # 备注
+            mineru_api=mineru_api,  # MinerU API 服务器
+            output_dir=output_dir,  # 产物输出目录
+        )
+        # 记录本次提交结果
+        tasks.append({"task_id": task_id, "filename": name})
+
+    # 返回批量结果；task_id 保留单个值兼容只提交一个文件的旧调用方
+    return jsonify({
+        "ok": True,  # 提交成功
+        "task_id": tasks[0]["task_id"] if tasks else None,  # 首个任务标识，兼容旧调用
+        "task_ids": [t["task_id"] for t in tasks],  # 全部任务标识
+        "tasks": tasks,  # 任务与文件名对照
+        "count": len(tasks),  # 实际提交数量
+        "skipped": skipped,  # 因同名被跳过的文件
+    })
 
 
 @app.get("/api/parse/<task_id>")
@@ -327,7 +366,9 @@ def api_crawl():
         detail_selector=payload.get("detail_selector", ""),  # 详情页选择器
         max_pages=int(payload.get("max_pages") or 10),  # 翻页上限
         max_files=int(payload.get("max_files") or 0),  # 文件数上限
-        delay=float(payload.get("delay") or 1.0),  # 请求间隔
+        delay=float(payload.get("delay") or 1.0),  # 全局最小请求间隔
+        workers=int(payload.get("workers") or 4),  # 并发下载数
+        link_pattern=payload.get("link_pattern", ""),  # 下载链接正则
         obey_robots=payload.get("obey_robots", True),  # 是否遵守 robots.txt
         dry_run=bool(payload.get("dry_run")),  # 是否只演练
     )

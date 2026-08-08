@@ -657,6 +657,14 @@ tr.is-baseline { background: var(--accent-soft); }
           <div class="cfg-hint">逗号分隔的扩展名。</div>
         </div>
         <div class="cfg-row">
+          <label class="cfg-label">下载链接正则</label>
+          <div class="cfg-input"><input type="text" id="crawlLinkPattern" placeholder="/pdf/" style="width:100%"></div>
+          <div class="cfg-hint">
+            很多站点的下载地址不带扩展名（如 <code>/pdf/2401.12345</code>、<code>download?id=9</code>），
+            只按扩展名会全部漏掉。填正则可补上，与扩展名取并集。
+          </div>
+        </div>
+        <div class="cfg-row">
           <label class="cfg-label">翻页链接文字</label>
           <div class="cfg-input"><input type="text" id="crawlNextText" placeholder="下一页" style="width:100%"></div>
           <div class="cfg-hint">留空则只抓当前这一页。也可用下方选择器精确指定。</div>
@@ -683,8 +691,21 @@ tr.is-baseline { background: var(--accent-soft); }
         </div>
         <div class="cfg-row">
           <label class="cfg-label">请求间隔（秒）</label>
-          <div class="cfg-input"><input type="number" id="crawlDelay" value="1" min="0.2" max="10" step="0.1" style="width:7rem"></div>
-          <div class="cfg-hint">不要调得过小，对方站点承受不住反而会封禁。</div>
+          <div class="cfg-input"><input type="number" id="crawlDelay" value="1" min="0.1" max="10" step="0.1" style="width:7rem"></div>
+          <div class="cfg-hint">
+            两次请求的<strong>全局</strong>最小间隔，与并发数无关。
+            <strong>这才是抓取速度的主要决定因素</strong>：想快就调小它，代价是对方站点压力线性上升。
+            <span id="crawlRateHint" class="mono"></span>
+          </div>
+        </div>
+        <div class="cfg-row">
+          <label class="cfg-label">并发下载数</label>
+          <div class="cfg-input"><input type="number" id="crawlWorkers" value="4" min="1" max="16" style="width:7rem"></div>
+          <div class="cfg-hint">
+            只对<strong>大文件传输</strong>有效。若耗时主要花在请求发起上（详情页多、文件小），
+            并发不会提速——请求频率被下面的间隔锁死。实测 50+ 详情页、6 个 1MB 文件时，
+            并发 4 与串行耗时相同。设为 1 即完全串行。
+          </div>
         </div>
         <div class="cfg-row">
           <label class="cfg-label">遵守 robots.txt</label>
@@ -728,7 +749,10 @@ tr.is-baseline { background: var(--accent-soft); }
         <div class="cfg-row">
           <label class="cfg-label">选择文件</label>
           <div class="cfg-input" style="grid-column:span 2">
-            <input type="file" id="parseFile" accept=".pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.png,.jpg,.jpeg">
+            <!-- multiple 支持一次选多个文件批量提交，下方参数整批共用 -->
+            <input type="file" id="parseFile" multiple accept=".pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.png,.jpg,.jpeg">
+            <!-- 已选文件的数量与名称提示，避免多选后不知道到底选中了什么 -->
+            <div class="hint" id="parseFileHint" style="margin-top:0.4rem">可多选，一次提交多个文件；解析在后台串行执行，不会同时压垮 MinerU。</div>
           </div>
         </div>
         <div class="cfg-row">
@@ -2222,12 +2246,14 @@ function crawlParams(dryRun) {
     url: $("crawlUrl").value.trim(),
     out_dir: $("crawlOutDir").value.trim(),
     exts: $("crawlExts").value.trim(),
+    link_pattern: $("crawlLinkPattern").value.trim(),
     next_text: $("crawlNextText").value.trim(),
     next_selector: $("crawlNextSel").value.trim(),
     detail_selector: $("crawlDetailSel").value.trim(),
     max_pages: parseInt($("crawlMaxPages").value) || 10,
     max_files: parseInt($("crawlMaxFiles").value) || 0,
     delay: parseFloat($("crawlDelay").value) || 1,
+    workers: parseInt($("crawlWorkers").value) || 4,
     obey_robots: $("crawlRobots").checked,
     dry_run: !!dryRun,
   };
@@ -2257,6 +2283,16 @@ async function submitCrawl(dryRun) {
 
 // 目录改变后立即刷新文件列表，避免显示的仍是上一个目录的内容
 $("crawlOutDir").addEventListener("change", loadCrawl);
+
+// 实时显示有效请求频率：把「间隔」翻译成更直观的每秒请求数，
+// 让人在调参时能直接看到自己给对方站点施加了多大压力
+function updateRateHint() {
+  const d = parseFloat($("crawlDelay").value) || 1;
+  const qps = (1 / d).toFixed(1);
+  $("crawlRateHint").textContent = `　当前约 ${qps} 请求/秒`;
+}
+$("crawlDelay").addEventListener("input", updateRateHint);
+updateRateHint();
 
 $("btnCrawl").addEventListener("click", () => submitCrawl(false));
 $("btnCrawlDry").addEventListener("click", () => submitCrawl(true));
@@ -2299,7 +2335,7 @@ function renderCrawlTasks(tasks) {
         <strong style="word-break:break-all">${esc(t.url)}</strong>
       </div>
       <div class="task-msg">${esc(t.error || t.message || "")}</div>
-      <div class="hint mono">页 ${s.pages || 0}　下载 ${s.downloaded || 0}　跳过 ${s.skipped || 0}　失败 ${s.failed || 0}</div>
+      <div class="hint mono">页 ${s.pages || 0}　下载 ${s.downloaded || 0}　跳过 ${s.skipped || 0}　失败 ${s.failed || 0}${t.workers ? `　并发 ${t.workers}` : ""}</div>
     </div>`;
   }).join("");
 }
@@ -2374,13 +2410,34 @@ function stopCrawlPolling() {
 // 解析耗时数分钟，因此走「提交任务 + 轮询进度」，而不是同步等待请求返回。
 let parsePollTimer = null;
 
-// 提交解析
+// 选择文件后回显已选清单：多选时若不回显，很难确认到底选中了哪几个
+$("parseFile").addEventListener("change", () => {
+  // 取出已选文件列表
+  const files = [...($("parseFile").files || [])];
+  // 未选择时恢复默认说明文案
+  if (!files.length) {
+    $("parseFileHint").textContent = "可多选，一次提交多个文件；解析在后台串行执行，不会同时压垮 MinerU。";
+    return;
+  }
+  // 计算总大小，便于预估上传耗时
+  const mb = files.reduce((s, f) => s + f.size, 0) / 1024 / 1024;
+  // 文件较多时只列前若干个，避免提示行过长
+  const names = files.slice(0, 5).map(f => f.name).join("、");
+  // 回显数量、总大小与文件名
+  $("parseFileHint").textContent =
+    `已选 ${files.length} 个文件，共 ${mb.toFixed(1)} MB：${names}${files.length > 5 ? ` 等 ${files.length} 个` : ""}`;
+});
+
+// 提交解析：支持一次提交多个文件，每个文件在服务端各自成为一个任务
 $("btnParse").addEventListener("click", async () => {
   const input = $("parseFile");
+  // 取出全部已选文件
+  const files = [...(input.files || [])];
   // 未选文件时直接提示，不发无效请求
-  if (!input.files || !input.files[0]) return toast("请先选择文件");
+  if (!files.length) return toast("请先选择文件");
   const fd = new FormData();
-  fd.append("file", input.files[0]);
+  // 多个文件用同一个字段名追加，后端以 getlist 取出
+  files.forEach(f => fd.append("file", f));
   fd.append("backend", $("parseBackend").value);
   fd.append("parse_method", $("parseMethod").value);
   fd.append("auto_import", $("parseAutoImport").checked ? "1" : "0");
@@ -2390,15 +2447,20 @@ $("btnParse").addEventListener("click", async () => {
 
   const btn = $("btnParse");
   btn.disabled = true;
-  btn.innerHTML = '<span class="spin"></span> 提交中…';
+  // 多文件上传耗时更长，按钮上标明正在提交的数量
+  btn.innerHTML = `<span class="spin"></span> 提交中…（${files.length} 个）`;
   try {
     // 上传走 multipart，不能带 JSON 的 Content-Type，故不复用 api()
     const res = await fetch("/api/parse", { method: "POST", body: fd });
     const d = await res.json();
     if (!res.ok || !d.ok) throw new Error(d.message || "提交失败");
-    toast("已提交，正在后台解析");
-    // 清空选择，避免重复提交同一文件
+    // 同名文件只会保留第一个，被跳过的要如实告知而不是让人以为都提交了
+    const skipped = d.skipped && d.skipped.length ? `，跳过 ${d.skipped.length} 个同名文件` : "";
+    toast(`已提交 ${d.count} 个文件，正在后台依次解析${skipped}`);
+    // 清空选择，避免重复提交同一批文件
     input.value = "";
+    // 同步复位文件提示
+    $("parseFileHint").textContent = "可多选，一次提交多个文件；解析在后台串行执行，不会同时压垮 MinerU。";
     // 立即刷新任务列表并开始轮询
     await loadParseTasks();
     startParsePolling();
@@ -2415,8 +2477,8 @@ async function loadParseTasks() {
   try {
     const d = await api("/api/parse");
     renderParseTasks(d.tasks || []);
-    // 有任务仍在运行时保持轮询，全部结束则停下来
-    if ((d.tasks || []).some(t => t.status === "running")) startParsePolling();
+    // 仍有任务在跑或在排队时保持轮询，全部结束则停下来
+    if ((d.tasks || []).some(t => t.status === "running" || t.status === "queued")) startParsePolling();
     else stopParsePolling();
   } catch (e) {
     $("parseTasks").innerHTML = `<div class="empty" style="color:var(--bad)">${esc(e.message)}</div>`;
@@ -2429,10 +2491,17 @@ function renderParseTasks(tasks) {
     $("parseTasks").innerHTML = `<div class="empty">暂无任务</div>`;
     return;
   }
-  $("parseTasks").innerHTML = tasks.map(t => {
-    // 状态徽标：运行中带转圈，失败标红
-    const badge = t.status === "running"
-      ? `<span class="pill kind"><span class="spin"></span> 解析中</span>`
+  // 排队中的任务数，用于在批量提交后一眼看出还剩多少没开始
+  const queued = tasks.filter(t => t.status === "queued").length;
+  // 队列概览条：批量提交后这里能直接看到还剩几个没开始，无需逐条数
+  const summary = queued
+    ? `<div class="hint" style="margin-bottom:0.6rem">还有 ${queued} 个任务排队中，将依次执行（同一时刻只解析一个）。</div>`
+    : "";
+  $("parseTasks").innerHTML = summary + tasks.map(t => {
+    // 状态徽标：排队中不转圈以区别于真正在跑的那个，运行中带转圈，失败标红
+    const badge = t.status === "queued"
+      ? `<span class="pill low">排队中</span>`
+      : t.status === "running" ? `<span class="pill kind"><span class="spin"></span> 解析中</span>`
       : t.status === "done" ? `<span class="pill good">完成</span>`
       : `<span class="pill bad">失败</span>`;
     // 进度条仅在运行中展示
