@@ -2,12 +2,16 @@
 
 解析耗时数分钟，必须异步执行并可查询进度，否则请求会超时、界面会假死。
 
+批量提交的任务串行排队执行：MinerU 是本机单实例服务，一次并行跑十个解析
+会把显存与内存打满，整体反而更慢，所以宁可排队也不并发。
+
 与生产的隔离体现在两处：
   - 产物写入实验室自己的 mineru_out/，不碰生产的 MinerU 输出目录；
   - delete_output 固定为 False，产物保留下来供离线重放，
     而生产默认解析完就删。
 """
 
+import queue  # 导入 queue 作为解析任务的串行队列
 import threading  # 导入 threading 在后台执行耗时解析
 import uuid  # 导入 uuid 生成任务标识
 from datetime import datetime  # 导入 datetime 记录任务时间

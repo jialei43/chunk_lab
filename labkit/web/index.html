@@ -646,6 +646,12 @@ tr.is-baseline { background: var(--accent-soft); }
           </div>
         </div>
         <div class="cfg-row">
+          <label class="cfg-label">下载目录</label>
+          <div class="cfg-input" style="grid-column:span 2">
+            <input type="text" id="crawlOutDir" placeholder="留空使用默认" style="width:100%;max-width:34rem">
+          </div>
+        </div>
+        <div class="cfg-row">
           <label class="cfg-label">文件类型</label>
           <div class="cfg-input"><input type="text" id="crawlExts" value="pdf,doc,docx,ppt,pptx,xls,xlsx" style="width:100%"></div>
           <div class="cfg-hint">逗号分隔的扩展名。</div>
@@ -699,7 +705,7 @@ tr.is-baseline { background: var(--accent-soft); }
     </div>
 
     <div class="card">
-      <h3>已下载文件</h3>
+      <h3>已下载文件 <span class="run-tag" id="crawlDirTag"></span></h3>
       <div class="controls" style="margin-bottom:0.8rem">
         <button class="btn" id="btnCrawlSelectAll">全选</button>
         <button class="btn primary" id="btnCrawlParse" disabled>解析选中并入库</button>
@@ -2214,6 +2220,7 @@ let crawlPollTimer = null;
 function crawlParams(dryRun) {
   return {
     url: $("crawlUrl").value.trim(),
+    out_dir: $("crawlOutDir").value.trim(),
     exts: $("crawlExts").value.trim(),
     next_text: $("crawlNextText").value.trim(),
     next_selector: $("crawlNextSel").value.trim(),
@@ -2248,13 +2255,21 @@ async function submitCrawl(dryRun) {
   }
 }
 
+// 目录改变后立即刷新文件列表，避免显示的仍是上一个目录的内容
+$("crawlOutDir").addEventListener("change", loadCrawl);
+
 $("btnCrawl").addEventListener("click", () => submitCrawl(false));
 $("btnCrawlDry").addEventListener("click", () => submitCrawl(true));
 
 // 加载任务与已下载文件
 async function loadCrawl() {
   try {
-    const d = await api("/api/crawl");
+    // 文件列表跟随下载目录：目录改了却仍列出旧目录的文件会造成误解
+    const dir = $("crawlOutDir").value.trim();
+    const d = await api("/api/crawl?" + new URLSearchParams({ dir }));
+    // 用实际生效的目录回填占位符与标签，让人清楚文件到底存在哪
+    if (!$("crawlOutDir").value) $("crawlOutDir").placeholder = d.default_dir || "";
+    $("crawlDirTag").textContent = d.current_dir || "";
     renderCrawlTasks(d.tasks || []);
     renderCrawlFiles(d.files || []);
     // 仅在有任务运行时轮询，避免无谓请求
@@ -2332,7 +2347,10 @@ $("btnCrawlParse").addEventListener("click", async () => {
   btn.disabled = true;
   btn.innerHTML = '<span class="spin"></span> 提交中…';
   try {
-    const d = await api("/api/crawl/parse", { method: "POST", body: JSON.stringify({ paths }) });
+    const d = await api("/api/crawl/parse", {
+      method: "POST",
+      body: JSON.stringify({ paths, out_dir: $("crawlOutDir").value.trim() }),
+    });
     toast(`已提交 ${d.count} 个解析任务，可在「解析文件」页查看进度`);
   } catch (e) {
     toast("提交失败：" + e.message);

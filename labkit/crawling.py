@@ -9,6 +9,8 @@ import uuid  # 导入 uuid 生成任务标识
 from datetime import datetime  # 导入 datetime 记录任务时间
 
 from .crawler import Crawler  # 导入爬虫本体，与命令行共用同一份实现
+from pathlib import Path  # 导入 Path 校验与解析下载目录
+
 from .paths import DATA_ROOT  # 导入数据根目录
 
 # 下载目录，与语料、产物等一并放在数据目录下（仓库之外）
@@ -110,10 +112,40 @@ def start_crawl(url, out_dir=None, exts="pdf,doc,docx,ppt,pptx,xls,xlsx",
     return task_id
 
 
-def list_downloads(limit=200):
+# 拒绝写入的路径：系统目录与根目录。
+# 这是本地开发工具，不必做严格沙箱，但把文件写进系统目录几乎一定是误操作。
+FORBIDDEN_ROOTS = ("/", "/etc", "/usr", "/bin", "/sbin", "/System", "/Library", "/var", "/private")
+
+
+def resolve_out_dir(raw):
+    """校验并解析下载目录，非法时抛出可读的错误。"""
+    # 未指定时用默认目录
+    if not raw or not str(raw).strip():
+        return DOWNLOAD_DIR
+    # 展开 ~ 并转绝对路径
+    path = Path(str(raw).strip()).expanduser()
+    # 相对路径以数据目录为基准，避免落到当前工作目录这种不确定的位置
+    if not path.is_absolute():
+        path = DATA_ROOT / path
+    # 规范化后再校验，防止用 .. 绕过
+    path = path.resolve()
+    # 系统目录与根目录一律拒绝
+    if str(path) in FORBIDDEN_ROOTS:
+        raise ValueError(f"不允许写入系统目录：{path}")
+    # 位于系统目录之下同样拒绝
+    for root in FORBIDDEN_ROOTS:
+        if root != "/" and str(path).startswith(root + "/"):
+            raise ValueError(f"不允许写入系统目录：{path}")
+    # 返回校验通过的目录
+    return path
+
+
+def list_downloads(limit=200, out_dir=None):
     """列出已下载的文件，供界面查看与后续解析。"""
+    # 未指定时看默认目录
+    target = Path(out_dir) if out_dir else DOWNLOAD_DIR
     # 目录不存在说明尚未抓取过
-    if not DOWNLOAD_DIR.is_dir():
+    if not target.is_dir():
         return []
     # 收集文件信息，跳过进度文件等隐藏项
     items = [
@@ -123,7 +155,7 @@ def list_downloads(limit=200):
             "size": p.stat().st_size,  # 字节数
             "mtime": p.stat().st_mtime,  # 修改时间，用于排序
         }
-        for p in DOWNLOAD_DIR.iterdir()
+        for p in target.iterdir()
         if p.is_file() and not p.name.startswith(".")
     ]
     # 最新的排在前面

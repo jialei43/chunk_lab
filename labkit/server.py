@@ -312,9 +312,15 @@ def api_crawl():
     # 只接受 http(s)，避免被诱导去读本地文件
     if not url.startswith(("http://", "https://")):
         return jsonify({"ok": False, "message": "仅支持 http/https 地址"}), 400
+    # 校验下载目录；非法路径要在启动前拦下，而不是让后台线程失败
+    try:
+        out_dir = crawling.resolve_out_dir(payload.get("out_dir"))
+    except ValueError as e:
+        return jsonify({"ok": False, "message": str(e)}), 400
     # 启动后台抓取
     task_id = crawling.start_crawl(
         url,  # 起始列表页
+        out_dir=out_dir,  # 下载目录，可由界面指定
         exts=payload.get("exts") or "pdf,doc,docx,ppt,pptx,xls,xlsx",  # 目标扩展名
         next_text=payload.get("next_text", ""),  # 翻页文字
         next_selector=payload.get("next_selector", ""),  # 翻页选择器
@@ -332,9 +338,16 @@ def api_crawl():
 @app.get("/api/crawl")
 def api_crawl_list():
     """列出最近的抓取任务与已下载文件。"""
+    # 可按目录查看，下载目录允许在界面上更改
+    try:
+        out_dir = crawling.resolve_out_dir(request.args.get("dir"))
+    except ValueError as e:
+        return jsonify({"ok": False, "message": str(e)}), 400
     # 任务与文件一并返回，前端一次请求即可刷新整页
     return jsonify({"ok": True, "tasks": crawling.list_tasks(),
-                    "files": crawling.list_downloads()})
+                    "files": crawling.list_downloads(out_dir=out_dir),
+                    "default_dir": str(crawling.DOWNLOAD_DIR),
+                    "current_dir": str(out_dir)})
 
 
 @app.get("/api/crawl/<task_id>")
@@ -359,15 +372,21 @@ def api_crawl_parse():
     # 无选中项时直接返回
     if not paths:
         return jsonify({"ok": False, "message": "没有选中文件"}), 400
+    # 解析范围限定在下载目录内，避免被诱导解析本机任意文件；
+    # 下载目录可在界面上更改，故以本次请求指定的目录为准
+    try:
+        allowed_dir = crawling.resolve_out_dir(payload.get("out_dir")).resolve()
+    except ValueError as e:
+        return jsonify({"ok": False, "message": str(e)}), 400
     # 逐个提交解析任务；解析本身是异步的，这里只负责排队
     task_ids = []
     # 遍历选中文件
     for raw in paths:
-        # 只允许下载目录内的文件，避免被诱导解析任意路径
+        # 规范化后校验是否在允许目录内
         p = Path(raw).resolve()
         # 越界路径直接跳过
         try:
-            p.relative_to(crawling.DOWNLOAD_DIR.resolve())
+            p.relative_to(allowed_dir)
         except ValueError:
             continue
         # 文件必须存在
