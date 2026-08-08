@@ -238,6 +238,14 @@ input[type="text"], input[type="number"], select {
   .cfg-row { grid-template-columns: 1fr; gap: 0.25rem; }
 }
 
+/* ========== 下载文件清单 ========== */
+.dl-list { margin-top: 0.5rem; border-top: 1px dashed var(--line); padding-top: 0.5rem; }
+.dl-row { padding: 0.28rem 0; }
+.dl-head { display: flex; align-items: center; gap: 0.5rem; font-size: 0.82rem; }
+.dl-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 26rem; }
+.dl-list details { margin-top: 0.3rem; }
+.dl-list summary { cursor: pointer; font-size: 0.78rem; }
+
 /* ========== 解析任务 ========== */
 .parse-form .cfg-row { grid-template-columns: 8rem 14rem 1fr; }
 .task-row {
@@ -2336,8 +2344,61 @@ function renderCrawlTasks(tasks) {
       </div>
       <div class="task-msg">${esc(t.error || t.message || "")}</div>
       <div class="hint mono">页 ${s.pages || 0}　下载 ${s.downloaded || 0}　跳过 ${s.skipped || 0}　失败 ${s.failed || 0}${t.workers ? `　并发 ${t.workers}` : ""}</div>
+      ${renderTaskFiles(t)}
     </div>`;
   }).join("");
+}
+
+// 把字节数换算成便于阅读的单位
+function fmtBytes(n) {
+  if (!n) return "—";
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(0) + " KB";
+  return (n / 1024 / 1024).toFixed(1) + " MB";
+}
+
+// 渲染任务内的文件级进度。
+// 只有汇总计数时，并发下载看不出谁在下、下到哪了，出问题也无从定位。
+function renderTaskFiles(t) {
+  const files = t.files || [];
+  if (!files.length) return "";
+  // 进行中的排最前，其次失败，最后是已完成——需要关注的先看到
+  const rank = { downloading: 0, failed: 1, pending: 2, skipped: 3, done: 4 };
+  const sorted = [...files].sort((a, b) => (rank[a.status] ?? 9) - (rank[b.status] ?? 9));
+  // 完成的条目多时折叠，避免刷屏
+  const active = sorted.filter(f => f.status === "downloading" || f.status === "failed");
+  const rest = sorted.filter(f => !(f.status === "downloading" || f.status === "failed"));
+
+  const row = (f) => {
+    const pct = f.total_bytes ? Math.min(100, Math.round(f.done_bytes / f.total_bytes * 100)) : null;
+    const badge = {
+      downloading: '<span class="pill kind">下载中</span>',
+      done: '<span class="pill good">完成</span>',
+      failed: '<span class="pill bad">失败</span>',
+      skipped: '<span class="pill low">跳过</span>',
+    }[f.status] || '<span class="pill low">等待</span>';
+    // 服务端未给 Content-Length 时无法算百分比，只显示已传输量
+    const size = f.status === "downloading"
+      ? (pct !== null ? `${pct}%　${fmtBytes(f.done_bytes)} / ${fmtBytes(f.total_bytes)}`
+                      : `已传 ${fmtBytes(f.done_bytes)}`)
+      : fmtBytes(f.total_bytes || f.done_bytes);
+    return `<div class="dl-row">
+      <div class="dl-head">
+        ${badge}
+        <span class="dl-name" title="${esc(f.url)}">${esc(f.name || f.url.split("/").pop())}</span>
+        <span class="spacer"></span>
+        <span class="mono hint">${esc(size)}</span>
+      </div>
+      ${f.status === "downloading" && pct !== null
+        ? `<div class="bar-track" style="margin-top:0.25rem"><div class="bar-fill" style="width:${pct}%"></div></div>` : ""}
+      ${f.message ? `<div class="hint" style="font-size:0.74rem">${esc(f.message)}</div>` : ""}
+    </div>`;
+  };
+
+  return `<div class="dl-list">
+    ${active.map(row).join("")}
+    ${rest.length ? `<details><summary class="hint">其余 ${rest.length} 个文件</summary>${rest.map(row).join("")}</details>` : ""}
+  </div>`;
 }
 
 // 渲染已下载文件
@@ -2347,7 +2408,11 @@ function renderCrawlFiles(files) {
     $("btnCrawlParse").disabled = true;
     return;
   }
-  $("crawlFiles").innerHTML = files.map((f, i) => `
+  // 汇总一行，便于快速判断抓了多少
+  const totalSize = files.reduce((a, f) => a + (f.size || 0), 0);
+  $("crawlFiles").innerHTML = `<div class="hint" style="margin-bottom:0.5rem">
+      共 ${files.length} 个文件，合计 ${fmtBytes(totalSize)}
+    </div>` + files.map((f, i) => `
     <div class="src-row" style="grid-template-columns:1.6rem 1fr 7rem">
       <input type="checkbox" class="crawl-cb" data-path="${esc(f.path)}">
       <span class="src-name" title="${esc(f.path)}">${esc(f.name)}</span>
@@ -2398,7 +2463,8 @@ $("btnCrawlParse").addEventListener("click", async () => {
 // 轮询控制
 function startCrawlPolling() {
   if (crawlPollTimer) return;
-  crawlPollTimer = setInterval(loadCrawl, 3000);
+  // 1.5 秒一轮：进度条要跟得上传输，又不至于把请求打得太密
+  crawlPollTimer = setInterval(loadCrawl, 1500);
 }
 function stopCrawlPolling() {
   if (!crawlPollTimer) return;

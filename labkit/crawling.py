@@ -73,6 +73,7 @@ def start_crawl(url, out_dir=None, exts="pdf,doc,docx,ppt,pptx,xls,xlsx",
             "status": "running",  # 运行状态
             "message": "已排队",  # 当前进度描述
             "stats": {"pages": 0, "found": 0, "downloaded": 0, "skipped": 0, "failed": 0},  # 统计
+            "files": [],  # 文件级状态，含正在下载的进度
             "started_at": datetime.now().isoformat(timespec="seconds"),  # 开始时间
             "error": None,  # 失败原因
         }
@@ -81,9 +82,15 @@ def start_crawl(url, out_dir=None, exts="pdf,doc,docx,ppt,pptx,xls,xlsx",
     def _run():
         # 任何异常都要落到任务状态里，而不是让线程静默死掉
         try:
-            # 进度回调：把爬虫的统计与消息同步到任务状态
-            def on_progress(stats, message):
-                _update(task_id, stats=stats, message=message)
+            # 进度回调：把统计、消息与文件级进度同步到任务状态。
+            # message 为 None 表示只是进度刷新，不覆盖已有的阶段描述。
+            def on_progress(stats, message, files=None):
+                fields = {"stats": stats}
+                if message is not None:
+                    fields["message"] = message
+                if files is not None:
+                    fields["files"] = files
+                _update(task_id, **fields)
 
             # 组装爬虫；参数与命令行完全一致，两边共用同一实现
             crawler = Crawler(
@@ -104,9 +111,9 @@ def start_crawl(url, out_dir=None, exts="pdf,doc,docx,ppt,pptx,xls,xlsx",
             )
             # 执行抓取
             crawler.run()
-            # 完成后写入最终统计
+            # 完成后写入最终统计与文件清单
             _update(task_id, status="done", stats=dict(crawler.stats),
-                    message="抓取完成")
+                    files=crawler.files_snapshot(), message="抓取完成")
         except Exception as e:
             # 失败时记录可读原因
             _update(task_id, status="failed", error=f"{type(e).__name__}: {e}",
@@ -120,7 +127,12 @@ def start_crawl(url, out_dir=None, exts="pdf,doc,docx,ppt,pptx,xls,xlsx",
 
 # 拒绝写入的路径：系统目录与根目录。
 # 这是本地开发工具，不必做严格沙箱，但把文件写进系统目录几乎一定是误操作。
-FORBIDDEN_ROOTS = ("/", "/etc", "/usr", "/bin", "/sbin", "/System", "/Library", "/var", "/private")
+#
+# 注意 macOS 的符号链接：/etc、/var、/tmp 都在 /private 之下，resolve() 后会
+# 变成 /private/etc、/private/var、/private/tmp。因此这里逐个列出，
+# 而不是笼统地禁掉 /private——那会连 /tmp 一起误伤，而 /tmp 是完全合理的目录。
+FORBIDDEN_ROOTS = ("/", "/etc", "/usr", "/bin", "/sbin", "/System", "/Library",
+                   "/var", "/private/etc", "/private/var")
 
 
 def resolve_out_dir(raw):

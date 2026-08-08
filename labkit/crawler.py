@@ -146,8 +146,13 @@ class Crawler:
         self.workers = max(1, int(workers))
         # 全局速率限制器，所有线程共用，保证请求频率不随并发数放大
         self.limiter = RateLimiter(delay)
-        # 保护统计与已完成集合的锁，多线程会同时更新它们
+        # 保护统计、已完成集合与文件状态表的锁，多线程会同时更新它们
         self.state_lock = threading.Lock()
+        # 文件级状态表：url -> 该文件的下载情况。
+        # 只有汇总计数的话，并发下载时看不出谁在下、下到哪了，出问题也无从定位。
+        self.files = {}
+        # 上次上报进度的时间，用于节流；每个数据块都回调会明显拖慢下载
+        self.last_report = 0.0
         # 线程本地存储：requests.Session 并非完全线程安全，每线程各持一个更稳妥
         self.local = threading.local()
 
@@ -177,6 +182,51 @@ class Crawler:
             self.local.session = s
         # 返回本线程的会话
         return self.local.session
+
+    def track(self, url, **fields):
+        """更新某个文件的状态。线程安全。"""
+        # 多线程会同时写入，必须加锁
+        with self.state_lock:
+            # 首次出现时初始化
+            item = self.files.setdefault(url, {
+                "url": url,  # 文件地址
+                "name": "",  # 本地文件名，确定后回填
+                "status": "pending",  # pending / downloading / done / failed / skipped
+                "done_bytes": 0,  # 已传输字节
+                "total_bytes": 0,  # 总字节，服务端未给出 Content-Length 时为 0
+                "message": "",  # 失败原因等补充信息
+            })
+            # 合并本次更新
+            item.update(fields)
+
+    def files_snapshot(self):
+        """取文件状态的快照，供进度回调使用。"""
+        # 复制一份，避免回调方看到半更新的状态
+        with self.state_lock:
+            return [dict(v) for v in self.files.values()]
+
+    def report_progress(self, force=False):
+        """节流上报进度。
+
+        下载过程中每个数据块都回调会明显拖慢传输，因此默认最多每 0.5 秒报一次；
+        状态发生跃迁（开始、完成、失败）时用 force 立即上报。
+        """
+        # 无回调时不做任何事
+        if not self.on_progress:
+            return
+        # 非强制时按时间节流
+        now = time.monotonic()
+        if not force and now - self.last_report < 0.5:
+            return
+        # 记录本次上报时间
+        self.last_report = now
+        # 回调异常不应中断抓取
+        try:
+            with self.state_lock:
+                snapshot = dict(self.stats)
+            self.on_progress(snapshot, None, self.files_snapshot())
+        except Exception:
+            pass
 
     def bump(self, key, n=1):
         """线程安全地累加统计项。"""
@@ -243,7 +293,7 @@ class Crawler:
     # ---------- 网络 ----------
 
     def report(self, message):
-        """上报进度。命令行走日志，Web 端走回调。"""
+        """上报带文字说明的进度。命令行走日志，Web 端走回调。"""
         # 始终记录日志，便于事后排查
         log.info(message)
         # 有回调时同步给调用方；取统计快照避免回调看到半更新状态
@@ -252,7 +302,7 @@ class Crawler:
             try:
                 with self.state_lock:
                     snapshot = dict(self.stats)
-                self.on_progress(snapshot, message)
+                self.on_progress(snapshot, message, self.files_snapshot())
             except Exception:
                 pass
 
@@ -395,35 +445,52 @@ class Crawler:
             already = url in self.done
         if already:
             self.bump("skipped")
+            self.track(url, status="skipped", message="此前已下载")
+            self.report_progress(force=True)
             return
         # robots 禁止时不下载
         if not self.allowed(url):
             log.warning(f"robots.txt 不允许，跳过：{url}")
             self.bump("skipped")
+            self.track(url, status="skipped", message="robots.txt 不允许")
+            self.report_progress(force=True)
             return
         # 演练模式只报告不下载
         if self.dry_run:
             log.info(f"[dry-run] 将下载 {url}")
             self.bump("found")
+            self.track(url, status="skipped", name=Path(urlparse(url).path).name or url,
+                       message="试跑，未实际下载")
+            self.report_progress(force=True)
             return
 
+        # 标记进入下载阶段，界面据此显示为进行中
+        self.track(url, status="downloading", message="正在连接")
+        self.report_progress(force=True)
         # 用流式请求，先看响应头再决定是否真的读取内容
         try:
             resp = self.session.get(url, timeout=DOWNLOAD_TIMEOUT, stream=True)
         except Exception as e:
             log.error(f"下载失败 {url}：{e}")
             self.bump("failed")
+            self.track(url, status="failed", message=str(e)[:120])
+            self.report_progress(force=True)
             return
         # 非 200 视为失败
         if resp.status_code != 200:
             log.error(f"下载失败 {url}：HTTP {resp.status_code}")
             self.bump("failed")
+            self.track(url, status="failed", message=f"HTTP {resp.status_code}")
+            self.report_progress(force=True)
             return
         # 超过大小上限时放弃，避免误抓超大文件
         size = int(resp.headers.get("Content-Length") or 0)
         if size and size > self.max_bytes:
             log.warning(f"超过 {self.max_bytes // 1024 // 1024}MB 上限，跳过：{url}")
             self.bump("skipped")
+            self.track(url, status="skipped", total_bytes=size,
+                       message=f"超过 {self.max_bytes // 1024 // 1024}MB 上限")
+            self.report_progress(force=True)
             return
 
         # 推导文件名并处理重名
@@ -435,6 +502,10 @@ class Crawler:
             digest = hashlib.sha1(url.encode()).hexdigest()[:6]
             dest = self.out_dir / f"{Path(name).stem}_{digest}{Path(name).suffix}"
 
+        # 文件名与总大小确定后回填，界面即可显示进度条
+        self.track(url, name=dest.name, total_bytes=size, message="")
+        self.report_progress(force=True)
+
         # 边下边写，避免大文件占满内存；中途失败要清理半截文件
         written = 0
         try:
@@ -445,6 +516,9 @@ class Crawler:
                         continue
                     fh.write(chunk)
                     written += len(chunk)
+                    # 上报已传输字节；内部按时间节流，不会拖慢传输
+                    self.track(url, done_bytes=written)
+                    self.report_progress()
                     # 边下边校验大小，处理没有 Content-Length 的情况
                     if written > self.max_bytes:
                         raise IOError(f"超过 {self.max_bytes // 1024 // 1024}MB 上限")
@@ -453,12 +527,15 @@ class Crawler:
             dest.unlink(missing_ok=True)
             log.error(f"下载中断 {url}：{e}")
             self.bump("failed")
+            self.track(url, status="failed", message=f"传输中断：{str(e)[:100]}")
+            self.report_progress(force=True)
             return
 
         # 记录完成；多线程写入故加锁
         with self.state_lock:
             self.done.add(url)
         self.bump("downloaded")
+        self.track(url, status="done", done_bytes=written, total_bytes=written)
         self.report(f"已下载 {dest.name}（{written / 1024:.0f} KB）")
 
     # ---------- 主流程 ----------
