@@ -247,7 +247,11 @@ def download_result(zip_url, out_dir, stem):
                 # 按用途重命名为本地同构的名字；其余原样保留
                 if name.endswith("content_list.json"):
                     target = out_dir / f"{stem}_content_list.json"
-                elif name.endswith("middle.json"):
+                # 官方把 middle.json 命名为 layout.json，内容结构一致：
+                # 顶层同为 pdf_info/_backend/_version_name，PDF 的单页同样含
+                # page_size 与 preproc_blocks。不改名的话桥接层找不到它，
+                # 双栏修复、卡片归位、跨页续排合并会全部静默失效。
+                elif name.endswith("middle.json") or name == "layout.json":
                     target = out_dir / f"{stem}_middle.json"
                 elif name.endswith("model.json"):
                     target = out_dir / f"{stem}_model.json"
