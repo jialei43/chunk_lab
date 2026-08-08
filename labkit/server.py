@@ -13,7 +13,8 @@ from pathlib import Path  # 导入 Path 定位前端静态文件
 import markdown  # 导入 markdown 把评估报告渲染成 HTML 供页面预览
 from flask import Flask, Response, jsonify, request, send_from_directory  # 导入 Flask 及其响应工具
 
-from . import runs  # 导入运行历史模块，负责轮次快照与基准指针
+from . import annotations, runs  # 导入标注与运行历史模块
+from .preview import attach_source, attach_source_from_path, find_source, render_chunk  # 导入原文截图能力
 from .detectors import DetectorConfig  # 导入检测阈值配置
 from .discover import scan_products  # 导入本机产物扫描
 from .evaluate import (compare_reports, diff_chunk_texts, diff_findings, evaluate_all,
@@ -210,6 +211,88 @@ def api_parse_list():
     """列出最近的解析任务。"""
     # 返回最近若干条
     return jsonify({"ok": True, "tasks": list_tasks()})
+
+
+@app.get("/api/annotations/<case_id>")
+def api_annotations(case_id):
+    """读取某样本的人工标注。"""
+    # 返回标注字典，键为切片序号
+    return jsonify({"ok": True, "annotations": annotations.load(case_id)})
+
+
+@app.post("/api/annotations/<case_id>")
+def api_annotate(case_id):
+    """写入一条人工标注：确认、误报，或标记检测器漏掉的问题。"""
+    # 读取请求体
+    payload = request.get_json(silent=True) or {}
+    # 切片序号为必填
+    if "chunk_index" not in payload:
+        return jsonify({"ok": False, "message": "缺少 chunk_index"}), 400
+    # 结论非法时明确报错而不是写入无法解释的数据
+    try:
+        item = annotations.save_one(
+            case_id,  # 样本标识
+            int(payload["chunk_index"]),  # 切片序号
+            payload.get("verdict", ""),  # 标注结论
+            detector=payload.get("detector", ""),  # 相关检测器或人工判定的问题类型
+            note=payload.get("note", ""),  # 备注
+            excerpt=payload.get("excerpt", ""),  # 正文摘要，用于日后校验序号是否错位
+        )
+    except ValueError as e:
+        return jsonify({"ok": False, "message": str(e)}), 400
+    # 返回写入的条目
+    return jsonify({"ok": True, "annotation": item})
+
+
+@app.delete("/api/annotations/<case_id>/<int:chunk_index>")
+def api_unannotate(case_id, chunk_index):
+    """删除一条标注。"""
+    # 执行删除
+    annotations.delete_one(case_id, chunk_index)
+    # 返回成功
+    return jsonify({"ok": True})
+
+
+@app.get("/api/annotations")
+def api_annotation_stats():
+    """标注统计：检测器的准确率与漏报情况。"""
+    # 可按样本收窄
+    return jsonify({"ok": True, "stats": annotations.stats(request.args.get("case"))})
+
+
+@app.post("/api/preview/<case_id>/source")
+def api_attach_source(case_id):
+    """为样本关联原始文件，之后才能渲染切片截图。"""
+    # 优先接收上传的文件
+    file = request.files.get("file")
+    # 其次接受本机路径，避免大文件重复上传
+    local = (request.form.get("path") or "").strip()
+    # 处理上传
+    if file is not None and file.filename:
+        dest = attach_source(case_id, Path(file.filename).name, file)
+    elif local:
+        # 本机路径必须存在
+        src = Path(local).expanduser()
+        if not src.is_file():
+            return jsonify({"ok": False, "message": f"文件不存在：{src}"}), 400
+        dest = attach_source_from_path(case_id, src.name, src)
+    else:
+        return jsonify({"ok": False, "message": "请上传文件或提供本机路径"}), 400
+    # 返回关联结果
+    return jsonify({"ok": True, "path": str(dest)})
+
+
+@app.post("/api/preview/<case_id>/shot")
+def api_chunk_shot(case_id):
+    """按切片坐标渲染原文截图。"""
+    # 读取请求体
+    payload = request.get_json(silent=True) or {}
+    # 渲染并返回；各类前置条件不满足时以 ok=False 携带原因返回
+    return jsonify(render_chunk(
+        case_id,  # 样本标识
+        payload.get("filename", ""),  # 原始文件名
+        payload.get("positions") or [],  # 切片坐标
+    ))
 
 
 @app.get("/api/sources")
@@ -581,8 +664,17 @@ def api_case_detail(case_id):
     config = build_parser_config(overrides)
     # 检测阈值与切分预算同源
     cfg = DetectorConfig(chunk_token_num=int(config.get("chunk_token_num") or 512))
+    # with_positions 时渲染页面图像以获得真实坐标，代价是慢一些，
+    # 故由前端在需要截图时才请求
+    want_pos = request.args.get("positions") == "1"
     # 生成预览数据
-    return jsonify(inspect_case(cases[0], cfg=cfg, parser_config=config))
+    data = inspect_case(cases[0], cfg=cfg, parser_config=config, with_positions=want_pos)
+    # 附带该样本是否已关联原始文件，界面据此决定是否显示截图入口
+    src = find_source(cases[0]["case_id"], cases[0].get("filename", ""))
+    data["source_file"] = str(src) if src else None
+    # 附带人工标注，前端在切片上直接展示
+    data["annotations"] = annotations.load(cases[0]["case_id"])
+    return jsonify(data)
 
 
 def serve(host="127.0.0.1", port=5099, debug=False):

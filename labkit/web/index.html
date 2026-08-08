@@ -353,6 +353,19 @@ a.mini { text-decoration: none; display: inline-block; line-height: 1.5; }
 /* 切片预览的数据来源选择：实时切分 vs 历史快照 */
 .src-bar { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; font-size: 0.82rem; color: var(--muted); margin-bottom: 0.7rem; }
 
+/* ========== 人工标注与原文截图 ========== */
+.chunk-anno {
+  display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap;
+  border-top: 1px dashed var(--line); padding-top: 0.5rem; margin-top: 0.2rem;
+}
+.chunk-shot { margin-top: 0.6rem; }
+.shot { margin: 0.4rem 0; }
+.shot img {
+  max-width: 100%; border: 1px solid var(--line); border-radius: 4px;
+  background: #fff; display: block;
+}
+.shot figcaption { font-size: 0.72rem; color: var(--muted); margin-top: 0.2rem; }
+
 /* ========== 差异下钻面板 ========== */
 .diff-box {
   margin-top: 1rem; padding-top: 1rem; border-top: 1px dashed var(--line);
@@ -754,6 +767,8 @@ let sourcesCache = [];      // 可导入产物缓存
 let currentCase = null;     // 切片预览中当前选中的样本
 let currentCaseData = null; // 当前样本的切片数据，切换筛选时复用避免重复切分
 let chunkFilter = "";       // 切片预览的检测器筛选，空串表示不筛选
+let caseAnnotations = {};   // 当前样本的人工标注，键为切片序号
+let shotCache = {};         // 截图缓存，避免同一切片重复渲染
 let runsCache = [];         // 历史轮次摘要，按时间倒序
 let baselineId = "";        // 当前作为对比基准的轮次标识
 let viewingRun = "";        // 切片预览查看的历史轮次，空串表示用当前代码实时切分
@@ -1813,7 +1828,8 @@ async function selectCase(caseId, target) {
     // 有定位目标时优先用该条目所属轮次的参数，保证序号可比；否则用顶栏当前参数
     // 有定位目标时用该条目所属轮次的配置，保证序号可比；否则用当前配置
     const p = (target && target.config) ? target.config : runParams();
-    const q = new URLSearchParams({ parser_config: JSON.stringify(p) });
+    // 请求真实坐标：渲染页面图像会慢一些，但没有坐标就无法截图与定位
+    const q = new URLSearchParams({ parser_config: JSON.stringify(p), positions: "1" });
     const data = await api(`/api/case/${encodeURIComponent(caseId)}?${q}`);
     if (data.error) {
       $("chunkStream").innerHTML = `<div class="empty" style="color:var(--bad)">切分失败：${esc(data.error)}</div>`;
@@ -1821,6 +1837,9 @@ async function selectCase(caseId, target) {
     }
     // 缓存本样本数据，切换筛选时直接重渲染，无需重新切分
     currentCaseData = data;
+    // 缓存人工标注与截图状态
+    caseAnnotations = data.annotations || {};
+    shotCache = {};
     // 记录本次切分实际使用的参数，供界面标注
     currentCaseData._usedConfig = p;
     // 渲染元信息、筛选工具栏与切片流
@@ -1922,6 +1941,149 @@ function renderChunkView() {
     : `<div class="empty">该筛选下没有切片</div>`;
 }
 
+// ========== 人工标注与原文截图 ==========
+// 规则检测只能给出「疑似」，是不是问题终究要人来定。把判断存下来才能算出
+// 检测器的准确率；而人工标出的漏报，直接指明下一条该写什么规则。
+
+// 渲染切片底部的标注条
+function renderAnnotation(c) {
+  // 该切片已有的标注
+  const a = caseAnnotations[String(c.index)];
+  // 已标注时展示结论与备注，并提供撤销
+  if (a) {
+    const cls = a.verdict === "confirmed" ? "bad" : a.verdict === "false_positive" ? "good" : "medium";
+    const txt = { confirmed: "已确认是问题", false_positive: "已标为误报", missed: "人工标记的问题" }[a.verdict] || a.verdict;
+    return `<div class="chunk-anno">
+      <span class="pill ${cls}">${esc(txt)}</span>
+      ${a.detector ? `<span class="hint">${esc(detCn(a.detector))}</span>` : ""}
+      ${a.note ? `<span class="hint">· ${esc(a.note)}</span>` : ""}
+      <span class="spacer"></span>
+      <button class="mini" data-anno-del="${c.index}">撤销标注</button>
+    </div>`;
+  }
+  // 未标注时按有无检测结果给出不同操作：
+  // 有命中 → 判定对错；无命中 → 标记漏报
+  const hasFinding = c.findings && c.findings.length;
+  const det = hasFinding ? c.findings[0].detector : "";
+  return `<div class="chunk-anno">
+    ${hasFinding
+      ? `<button class="mini" data-anno="confirmed" data-idx="${c.index}" data-det="${esc(det)}">确认是问题</button>
+         <button class="mini" data-anno="false_positive" data-idx="${c.index}" data-det="${esc(det)}">标为误报</button>`
+      : `<button class="mini" data-anno="missed" data-idx="${c.index}">这里有问题（检测器漏报）</button>`}
+    <span class="spacer"></span>
+    <button class="mini" data-shot="${c.index}">看原文截图</button>
+  </div>`;
+}
+
+// 事件委托：标注与截图按钮
+document.addEventListener("click", async (e) => {
+  // 标注
+  const btn = e.target.closest("[data-anno]");
+  if (btn) return doAnnotate(btn.dataset.anno, parseInt(btn.dataset.idx), btn.dataset.det || "");
+  // 撤销标注
+  const del = e.target.closest("[data-anno-del]");
+  if (del) return undoAnnotate(parseInt(del.dataset.annoDel));
+  // 原文截图
+  const shot = e.target.closest("[data-shot]");
+  if (shot) return loadShot(parseInt(shot.dataset.shot));
+});
+
+// 写入一条标注
+async function doAnnotate(verdict, idx, detector) {
+  // 漏报需要人工指定问题类型，否则统计时无从归类
+  let det = detector;
+  if (verdict === "missed") {
+    const opts = Object.entries(DETECTOR_META).map(([k, v]) => `${v.cn}(${k})`).join("、");
+    det = prompt(`这是哪类问题？填检测器标识，或自定义一个新类型。\n已有类型：${opts}`, "");
+    if (det === null) return;
+  }
+  // 备注可留空
+  const note = prompt("补充说明（可留空）：", "") ?? "";
+  // 取正文摘要，供日后校验序号是否因参数变化而错位
+  const rec = (currentCaseData.chunks || []).find(c => c.index === idx) || {};
+  try {
+    await api(`/api/annotations/${encodeURIComponent(currentCase)}`, {
+      method: "POST",
+      body: JSON.stringify({
+        chunk_index: idx, verdict, detector: det, note,
+        excerpt: (rec.content || "").slice(0, 60),
+      }),
+    });
+    // 本地同步后重绘，避免整页刷新
+    caseAnnotations[String(idx)] = { chunk_index: idx, verdict, detector: det, note };
+    renderChunkView();
+    toast("已记录");
+  } catch (err) {
+    toast("标注失败：" + err.message);
+  }
+}
+
+// 撤销标注
+async function undoAnnotate(idx) {
+  try {
+    await fetch(`/api/annotations/${encodeURIComponent(currentCase)}/${idx}`, { method: "DELETE" });
+    delete caseAnnotations[String(idx)];
+    renderChunkView();
+    toast("已撤销");
+  } catch (err) {
+    toast("撤销失败：" + err.message);
+  }
+}
+
+// 加载并展示原文截图
+async function loadShot(idx) {
+  const box = document.getElementById(`shot-${idx}`);
+  if (!box) return;
+  // 已加载过则折叠，再点展开
+  if (shotCache[idx]) {
+    box.innerHTML = box.innerHTML ? "" : shotCache[idx];
+    return;
+  }
+  const rec = (currentCaseData.chunks || []).find(c => c.index === idx);
+  if (!rec) return;
+  box.innerHTML = `<div class="hint"><span class="spin"></span> 正在渲染原文…</div>`;
+  try {
+    const r = await api(`/api/preview/${encodeURIComponent(currentCase)}/shot`, {
+      method: "POST",
+      body: JSON.stringify({ filename: currentCaseData.filename, positions: rec.position_int || [] }),
+    });
+    // 前置条件不满足时如实说明，并在缺原文时给出关联入口
+    if (!r.ok) {
+      box.innerHTML = `<div class="hint" style="color:var(--warn)">${esc(r.message)}
+        ${r.reason === "no_source" ? ' <button class="mini" id="attachSrc">关联原始文件</button>' : ""}</div>`;
+      const b = document.getElementById("attachSrc");
+      if (b) b.addEventListener("click", attachSource);
+      return;
+    }
+    // 渲染截图
+    const html = r.images.map(im =>
+      `<figure class="shot"><img src="${im.data_uri}" alt="原文截图"><figcaption>第 ${im.page} 页</figcaption></figure>`
+    ).join("");
+    shotCache[idx] = html;
+    box.innerHTML = html;
+  } catch (err) {
+    box.innerHTML = `<div class="hint" style="color:var(--bad)">截图失败：${esc(err.message)}</div>`;
+  }
+}
+
+// 关联原始文件：多数语料从 MinerU 产物导入，产物里不含原文
+async function attachSource() {
+  const path = prompt("原始文件在本机的完整路径：", "");
+  if (!path) return;
+  try {
+    const fd = new FormData();
+    fd.append("path", path);
+    const res = await fetch(`/api/preview/${encodeURIComponent(currentCase)}/source`, { method: "POST", body: fd });
+    const d = await res.json();
+    if (!d.ok) throw new Error(d.message);
+    toast("已关联，重新加载该样本以获得坐标");
+    shotCache = {};
+    selectCase(currentCase);
+  } catch (err) {
+    toast("关联失败：" + err.message);
+  }
+}
+
 // 渲染单个切片卡片：元信息 + 正文 + 问题标注
 // highlight 指定当前筛选的检测器，命中它的那条问题会被强调，便于在多问题切片中一眼定位
 function renderChunk(c, highlight) {
@@ -1956,6 +2118,8 @@ function renderChunk(c, highlight) {
     </div>
     <div class="chunk-body ${isTable ? "is-table" : ""}">${body}</div>
     ${issues ? `<div class="chunk-issues">${issues}</div>` : ""}
+    ${renderAnnotation(c)}
+    <div class="chunk-shot" id="shot-${c.index}"></div>
   </div>`;
 }
 

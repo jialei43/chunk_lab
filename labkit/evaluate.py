@@ -124,7 +124,7 @@ def evaluate_case(case, cfg=None, parser_config=None):
     }
 
 
-def inspect_case(case, cfg=None, parser_config=None):
+def inspect_case(case, cfg=None, parser_config=None, with_positions=False):
     """返回单个样本的完整切片内容，并把检测命中挂到对应切片上。
 
     这是「预览切分效果」的数据源：前端据此逐块展示正文，
@@ -135,11 +135,18 @@ def inspect_case(case, cfg=None, parser_config=None):
     # 执行离线切分；失败时把错误回传给前端而不是抛出 500
     try:
         # 按样本描述中的参数切分
+        # 需要坐标时定位已关联的原始 PDF，渲染页面图像后切分才有真实位置
+        pdf_path = None
+        if with_positions:
+            from .preview import find_source
+            src = find_source(case["case_id"], case.get("filename", ""))
+            pdf_path = str(src) if src else None
         chunks = run_offline_chunking(
             case["content_list"],  # 缓存产物路径
             case["filename"],  # 原始文件名
             parser_config=parser_config,  # 完整 parser_config，与评估口径一致
             backend=case.get("backend", "hybrid_auto"),  # 产物 backend
+            pdf_path=pdf_path,  # 有原文时渲染页面图像以获得真实坐标
         )
     except Exception as e:
         # 以结构化错误返回，前端可直接展示

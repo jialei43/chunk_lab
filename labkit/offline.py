@@ -88,7 +88,8 @@ def build_parser_config(overrides=None):
 
 
 def run_offline_chunking(corpus_dir, filename, parser_config=None, slide_mode=False,
-                         lang="Chinese", eng=False, backend="hybrid_auto", parser_id=None):
+                         lang="Chinese", eng=False, backend="hybrid_auto", parser_id=None,
+                         pdf_path=None):
     """核心入口：用缓存产物驱动生产切分逻辑，返回 chunk 列表。
 
     slide_mode 不再由外部传入——它由生产的 presentation 模块依据文件类型自行决定，
@@ -109,6 +110,9 @@ def run_offline_chunking(corpus_dir, filename, parser_config=None, slide_mode=Fa
         lang=lang,  # 文档语言
         backend=backend,  # 产物所用 backend，影响 _read_output 的查找
         parser_id=infer_parser_id(filename, parser_id),  # 切片方法，须与生产一致
+        # 关联了原始 PDF 时渲染页面图像，切分才有真实坐标与截图；
+        # 渲染有成本，故仅预览传入，批量评估不传以保持速度
+        pdf_path=pdf_path,
     )
 
 
