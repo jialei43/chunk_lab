@@ -749,10 +749,13 @@ tr.is-baseline { background: var(--accent-soft); }
       <p class="hint" style="margin:0 0 0.9rem">
         你在切片预览里做的每一次判定都记在这里。<strong>准确率</strong>说明哪条规则最该改，
         <strong>回归护栏</strong>把这些判定变成可执行断言——改完规则跑一次就知道有没有碰坏别的。
+        <strong>优化任务书</strong>把全部待办连同规则源码、命中证据、验证方式打包成一份
+        Markdown，直接交给 Claude 就能动手改。
       </p>
       <div class="cfg-row">
         <label class="cfg-label">操作</label>
         <div class="cfg-input" style="grid-column:span 2">
+          <button class="btn primary" id="btnFullReport">生成优化任务书</button>
           <button class="mini" id="btnGuard">跑回归护栏</button>
           <button class="mini" id="btnRefreshRules">刷新统计</button>
           <span class="hint" id="guardHint" style="margin-left:0.5rem">护栏会用当前代码把已标注的样本重切一遍，样本多时要等一会儿。</span>
@@ -1589,6 +1592,53 @@ async function showMarks(verdict, detector) {
     $("markDetail").innerHTML = `<div class="card"><div class="empty" style="color:var(--bad)">加载失败：${esc(e.message)}</div></div>`;
   }
 }
+
+// 生成整份优化任务书：把全部待办打包成一份可直接交给模型的 Markdown
+$("btnFullReport").addEventListener("click", async () => {
+  const btn = $("btnFullReport");
+  // 要把所有已标注样本重切一遍取证据，可能要等一会儿
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span> 生成中…';
+  try {
+    // 切分参数与预览页一致，否则报告里的证据与页面上看到的对不上
+    const q = new URLSearchParams({ parser_config: JSON.stringify(runParams()) });
+    const d = await api(`/api/guard/report?${q}`);
+    const c = d.counts;
+    // 概要放在前面，让人一眼看出这份任务书有多少活
+    $("ruleReport").innerHTML = `<div class="card">
+      <h3>优化任务书</h3>
+      <p style="margin:0 0 0.5rem">
+        误报 ${c.false_positive} 条（涉及 ${c.false_positive_rules} 条规则）、
+        已有规则漏报 ${c.missed_known} 条、新需求 ${c.missed_new} 条、
+        框选区域 ${c.regions} 块
+      </p>
+      <p class="hint" style="margin:0 0 0.7rem">
+        含每条规则的当前源码、每条反例此刻的真实命中证据、代码位置与验证命令。
+        整份交给 Claude 即可动手改，改完跑 <code>./run.sh guard --todo</code> 验证。
+      </p>
+      <div style="display:flex;gap:0.4rem;margin-bottom:0.7rem">
+        <button class="mini" id="btnCopyFull">复制全文</button>
+        <a class="mini" href="/api/guard/report?download=1&${q}"
+           style="text-decoration:none;display:inline-block">下载 Markdown</a>
+      </div>
+      <pre class="report-pre">${esc(d.markdown)}</pre>
+    </div>`;
+    // 复制到剪贴板：这是最常用的路径，直接粘给模型
+    $("btnCopyFull").addEventListener("click", async () => {
+      // 剪贴板 API 在非安全上下文可能不可用，失败时提示手动复制
+      try {
+        await navigator.clipboard.writeText(d.markdown);
+        toast(`已复制 ${d.markdown.length} 字符`);
+      } catch { toast("复制失败，请手动选中文本复制"); }
+    });
+    $("ruleReport").scrollIntoView({ behavior: "smooth", block: "start" });
+  } catch (e) {
+    $("ruleReport").innerHTML = `<div class="card"><div class="empty" style="color:var(--bad)">生成失败：${esc(e.message)}</div></div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "生成优化任务书";
+  }
+});
 
 // 生成并展示某条规则的优化报告
 async function showRuleReport(detector) {

@@ -377,7 +377,7 @@ def build_optimization_report(detector, only=None, parser_config=None):
             used.add(found.get("index"))
             # 取该规则在这块上的命中证据
             hits = [f for f in (found.get("findings") or []) if f.get("detector") == detector]
-            evidences[(cid, s["excerpt"][:30])] = {
+            evidences[(cid, s.get("chunk_index"))] = {
                 "index": found.get("index"),
                 "content": found.get("content", ""),
                 "evidence": hits[0].get("evidence", "") if hits else "",
@@ -388,7 +388,7 @@ def build_optimization_report(detector, only=None, parser_config=None):
     samples = []
     for s in g["samples"]:
         # 按样本与摘要前缀取回
-        ev = evidences.get((s["case_id"], s["excerpt"][:30]), {})
+        ev = evidences.get((s["case_id"], s.get("chunk_index")), {})
         samples.append({**s, **ev})
 
     # 规则的当前实现
@@ -422,8 +422,8 @@ def build_optimization_report(detector, only=None, parser_config=None):
         ]
         # 相关常量单独列出，正则模式往往才是问题所在
         if rule["consts"]:
-            lines += ["```python"] + rule["consts"] + ["```", ""]
-        lines += ["```python", rule["source"].rstrip(), "```", ""]
+            lines += _fenced("\n".join(rule["consts"]), "python")
+        lines += _fenced(rule["source"].rstrip(), "python")
     else:
         lines += [
             "## 当前实现",
@@ -452,7 +452,7 @@ def build_optimization_report(detector, only=None, parser_config=None):
         # 批量判定的可信度低于逐条细看，如实标注
         if s.get("batch"):
             lines.append("- 来自批量判定（未逐条细看）")
-        lines += ["", "正文：", "", "```text", (s.get("content") or s["excerpt"])[:600], "```", ""]
+        lines += ["", "正文：", ""] + _fenced((s.get("content") or s["excerpt"])[:600])
 
     # 收尾给出验证方式，避免改完不知道怎么确认
     lines += [
@@ -475,4 +475,313 @@ def build_optimization_report(detector, only=None, parser_config=None):
         "count": g["count"],
         "samples": samples,
         "rule": rule,
+    }
+
+
+def _fenced(text, lang="text"):
+    """把正文包成代码块，围栏长度按内容自动调整。
+
+    切片正文本身可能含有 ```（Markdown 文档、代码示例都会），固定用三个反引号
+    会被正文提前闭合，后面的内容全部串位。围栏取比正文中最长反引号序列多一个。
+    """
+    # 正文统一成字符串
+    body = str(text or "")
+    # 找出正文里最长的连续反引号
+    longest = 0
+    run = 0
+    for ch in body:
+        # 累计当前连续长度
+        run = run + 1 if ch == "`" else 0
+        # 记录最大值
+        longest = max(longest, run)
+    # 围栏至少三个，且必须比正文里最长的多一个
+    fence = "`" * max(3, longest + 1)
+    # 返回完整代码块的各行
+    return [f"{fence}{lang}", body, fence, ""]
+
+
+def _collect_chunk_texts(marks, parser_config=None):
+    """为一批标注取回它们此刻对应的切片正文与命中情况。
+
+    标注里只有 60 字摘要，改代码时不够用——要判断一条规则该怎么写，
+    得看到整块正文长什么样、以及当前规则在它上面匹配到了什么。
+    """
+    # 检测阈值取默认
+    cfg = DetectorConfig()
+    # 按样本归集，一个样本只切一次
+    by_case = {}
+    for m in marks:
+        by_case.setdefault(m["case_id"], []).append(m)
+    # 逐样本重切并取回正文
+    out = {}
+    for case in load_cases(only=sorted(by_case)):
+        # 样本标识
+        cid = case["case_id"]
+        # 用当前代码切分并检测
+        data = inspect_case(case, cfg=cfg, parser_config=parser_config)
+        # 切分失败时跳过该样本，其余样本照常
+        if data.get("error"):
+            continue
+        # 本样本内已认领的切片
+        used = set()
+        # 逐条标注定位
+        for m in by_case[cid]:
+            # 按摘要找回切片
+            found = _find_chunk(data.get("chunks") or [], m.get("excerpt"), used)
+            # 找不回来时留空，报告里会退回用摘要
+            if found is None:
+                continue
+            # 认领
+            used.add(found.get("index"))
+            # 记下正文与当前全部命中
+            # 用标注时的序号作键：它在样本内唯一，而摘要前缀会重复
+            out[(cid, m.get("chunk_index"))] = {
+                "index": found.get("index"),
+                "content": found.get("content", ""),
+                "findings": found.get("findings") or [],
+            }
+    return out
+
+
+def build_full_report(parser_config=None):
+    """生成一份完整的优化任务书，可直接交给模型动手改。
+
+    与单条规则的报告的区别是「完整」：把当前全部待办放在一起，并按能否
+    自动验证排序——误报和已实现规则的问题有护栏兜底，改完立刻知道对不对；
+    人工提出的需求和框选区域需要新写代码，风险更高，放在后面。
+
+    刻意把代码位置、注册方式、验证命令都写进去：拿到报告的人（或模型）
+    不该还要回头问「检测器写在哪」「改完怎么验证」。
+    """
+    # 标注总体统计
+    st = annotations.stats()
+    # 误报归纳，按条数降序
+    fp_groups = analyze_false_positives()
+    # 人工提出的需求：结论为漏报、且问题类型不是已实现的检测器
+    from . import detectors as _det
+    missed = list_marks("missed")
+    # 已实现的检测器名集合，用于区分「规则漏了」与「规则还不存在」
+    implemented = {n[len("detect_"):] for n in dir(_det) if n.startswith("detect_")}
+    # 拆成两类：已有规则漏报（调阈值即可）与全新需求（要写代码）
+    missed_known = [m for m in missed if m["detector"] in implemented]
+    missed_new = [m for m in missed if m["detector"] not in implemented]
+    # 框选区域
+    regions = annotations.all_regions()
+
+    # 一次性取回所有相关切片的正文，避免每块各切一遍
+    texts = _collect_chunk_texts(
+        [s for g in fp_groups for s in g["samples"]] + missed,
+        parser_config=parser_config,
+    )
+
+    # 百分比展示
+    def pct(v):
+        return "—" if v is None else f"{round(v * 100)}%"
+
+    # 取某条标注对应的正文，找不回时退回摘要
+    def body_of(m):
+        rec = texts.get((m["case_id"], m.get("chunk_index")))
+        return (rec or {}).get("content") or m.get("excerpt", "")
+
+    # 取某条标注上某规则的当前命中证据
+    def evidence_of(m, det):
+        rec = texts.get((m["case_id"], m.get("chunk_index")))
+        hits = [f for f in (rec or {}).get("findings", []) if f.get("detector") == det]
+        return hits[0].get("evidence", "") if hits else ""
+
+    lines = [
+        "# chunk-lab 切分检测规则优化任务",
+        "",
+        "本文件由 `规则质量` 页自动生成，内容全部来自人工标注——每一条都是人对着",
+        "真实文档判定的结果。请按下面的任务清单修改检测规则。",
+        "",
+        "## 现状",
+        "",
+        f"- 检测器准确率 **{pct(st.get('precision'))}**"
+        f"（报出来的有多少经人工确认是真问题）",
+        f"- 召回率 **{pct(st.get('recall'))}**（人工发现的问题有多少被规则抓到）",
+        f"- 已标注 {st.get('cases', 0)} 个样本，"
+        f"确认 {st['total']['confirmed']} 条、误报 {st['total']['false_positive']} 条、"
+        f"漏报 {st['total']['missed']} 条",
+        f"- 人工在原文上圈出 {len(regions)} 块切分器没切出来的区域",
+        "",
+        "## 代码位置与约定",
+        "",
+        "- 检测规则全部在 `labkit/detectors.py`，每条是一个 `detect_<名字>` 函数，",
+        "  返回 `Finding` 列表，并在文件末尾的 `ALL_DETECTORS` 登记表中注册。",
+        "- `Finding` 字段：`detector`（规则名）、`severity`（high/medium/low）、",
+        "  `case_id`、`chunk_index`、`message`（一句话描述）、`evidence`（证据片段）。",
+        "- 阈值集中在 `DetectorConfig`，不要在函数里写死数字。",
+        "- 判定正文时先调 `strip_breadcrumb(record)` 剥掉面包屑，",
+        "  否则标题文字会混进正文判据。",
+        "",
+        "## 改完怎么验证",
+        "",
+        "```bash",
+        "./run.sh guard --todo",
+        "```",
+        "",
+        "护栏会用改后的代码重跑已标注的样本，逐条核对人工判定是否仍然成立：",
+        "",
+        "- **待修正 → 符合预期**：这次修改生效了；",
+        "- **出现回归**：改动碰坏了本来能检出的东西，必须修好才算完成；",
+        "- 仍未覆盖、标注已失配不算失败。",
+        "",
+        "**只有回归为 0 才算改动成立。**",
+        "",
+    ]
+
+    # ---------- 任务一：误报 ----------
+    if fp_groups:
+        lines += [
+            "## 任务一：修正误报（有护栏兜底，改完可自动验证）",
+            "",
+            f"共 {len(fp_groups)} 条规则存在误报。按误报条数降序，先改影响最大的。",
+            "",
+        ]
+        for gi, g in enumerate(fp_groups, 1):
+            det = g["detector"]
+            # 该规则的准确率单独算出来，说明问题有多严重
+            s = (st.get("by_detector") or {}).get(det, {})
+            judged = s.get("confirmed", 0) + s.get("false_positive", 0)
+            p = pct(s.get("confirmed", 0) / judged) if judged else "—"
+            lines += [
+                f"### {gi}. `{det}`",
+                "",
+                f"误报 {g['count']} 条，准确率 {p}，"
+                f"文件类型分布 {'、'.join(f'{k} {v}' for k, v in g['by_ext'].items())}。",
+                "",
+            ]
+            # 人工写下的原因去重后列出，往往直接说明了该怎么改
+            if g["notes"]:
+                seen = []
+                for n in g["notes"]:
+                    if n not in seen:
+                        seen.append(n)
+                lines += ["人工判断的原因：", ""] + [f"- {n}" for n in seen] + [""]
+            # 当前实现
+            rule = _rule_source(det)
+            if rule:
+                lines += [f"当前实现（`{rule['file']}` 第 {rule['line']} 行）：", ""]
+                if rule["consts"]:
+                    lines += _fenced("\n".join(rule["consts"]), "python")
+                lines += _fenced(rule["source"].rstrip(), "python")
+            # 反例明细
+            lines += ["误报的切片：", ""]
+            for si, sample in enumerate(g["samples"], 1):
+                ev = evidence_of(sample, det)
+                rec = texts.get((sample["case_id"], sample.get("chunk_index")), {})
+                lines += [
+                    f"**{si}) {sample['case_id']} #{rec.get('index', sample.get('chunk_index'))}"
+                    f"（{sample.get('filename', '')}）**",
+                    "",
+                ]
+                # 命中了什么是改规则的关键
+                if ev:
+                    lines.append(f"- 当前命中：`{ev}`")
+                if sample.get("note"):
+                    lines.append(f"- 人工判断：{sample['note']}")
+                if sample.get("batch"):
+                    lines.append("- 来自批量判定（未逐条细看，可信度低于逐条判定）")
+                lines += [""] + _fenced(body_of(sample)[:500])
+
+    # ---------- 任务二：已有规则漏报 ----------
+    if missed_known:
+        # 按规则归集
+        by_det = {}
+        for m in missed_known:
+            by_det.setdefault(m["detector"], []).append(m)
+        lines += [
+            "## 任务二：已有规则漏报（调判据或阈值）",
+            "",
+            "这些切片人工认为有问题，规则已存在但没报出来。",
+            "",
+        ]
+        for det, ms in sorted(by_det.items(), key=lambda kv: -len(kv[1])):
+            lines += [f"### `{det}`（漏报 {len(ms)} 条）", ""]
+            rule = _rule_source(det)
+            if rule:
+                lines += [
+                    f"当前实现（`{rule['file']}` 第 {rule['line']} 行）：", "",
+                ] + _fenced(rule["source"].rstrip(), "python")
+            for m in ms:
+                rec = texts.get((m["case_id"], m.get("chunk_index")), {})
+                lines += [f"**{m['case_id']} #{rec.get('index', m.get('chunk_index'))}**", ""]
+                if m.get("note"):
+                    lines.append(f"- 人工说明：{m['note']}")
+                lines += [""] + _fenced(body_of(m)[:500])
+
+    # ---------- 任务三：全新需求 ----------
+    if missed_new:
+        # 按需求描述归集：同一句话被反复提出说明是共性问题
+        by_want = {}
+        for m in missed_new:
+            by_want.setdefault(m["detector"], []).append(m)
+        lines += [
+            "## 任务三：人工提出的新规则需求（需要新写代码，无护栏兜底）",
+            "",
+            "标注时填的问题类型不在现有规则里，说明这是规则还没覆盖的情况。",
+            "描述是人工手写的，可能是一句要求而非规则名——请先判断它到底要解决什么，",
+            "再决定是新增检测规则、还是该改切分逻辑（后者会影响生产切分结果，",
+            "属于另一个层面的改动，不要顺手就改）。",
+            "",
+        ]
+        for det, ms in sorted(by_want.items(), key=lambda kv: -len(kv[1])):
+            lines += [f"### 「{det}」（提出 {len(ms)} 次）", ""]
+            for m in ms:
+                rec = texts.get((m["case_id"], m.get("chunk_index")), {})
+                lines += [
+                    f"**{m['case_id']} #{rec.get('index', m.get('chunk_index'))}"
+                    f"（{m.get('filename', '')}）**", "",
+                ]
+                if m.get("note"):
+                    lines.append(f"- 人工说明：{m['note']}")
+                # 当前这块上已有的命中，说明别的规则是怎么看它的
+                other = [f"{f['detector']}" for f in rec.get("findings", [])]
+                if other:
+                    lines.append(f"- 当前已有规则命中：{'、'.join(sorted(set(other)))}")
+                lines += [""] + _fenced(body_of(m)[:500])
+
+    # ---------- 任务四：框选区域 ----------
+    if regions:
+        lines += [
+            "## 任务四：切分器漏切的版面区域（仅供参考，不必直接改规则）",
+            "",
+            "人在原文上直接圈出来的地方——切分器压根没在那儿切出块，",
+            "所以它不属于任何切片，也无法用现有的切片级规则表达。",
+            "这类问题多半出在解析或切分阶段，而不是检测规则；",
+            "列在这里是为了让你知道还有哪些问题没被规则覆盖到。",
+            "",
+            "| 样本 | 页码 | 人工判定 | 备注 |",
+            "|---|---|---|---|",
+        ]
+        for r in regions:
+            reg = r.get("region") or []
+            lines.append(
+                f"| {r.get('case_id', '')} | 第 {reg[0] if reg else '?'} 页 | "
+                f"{r.get('detector') or '未指定'} | {r.get('note') or ''} |"
+            )
+        lines.append("")
+
+    # 没有任何待办时明确说明，避免拿到一份空文件不知道是不是出错了
+    if not (fp_groups or missed_known or missed_new or regions):
+        lines += [
+            "## 暂无待办",
+            "",
+            "还没有任何人工标注。请先到「切片预览」里判定检测结果，",
+            "或在原文视图上框出规则没覆盖到的区域。",
+            "",
+        ]
+
+    # 返回报告与关键计数，界面据此展示概要
+    return {
+        "ok": True,
+        "markdown": "\n".join(lines),
+        "counts": {
+            "false_positive_rules": len(fp_groups),  # 有误报的规则数
+            "false_positive": sum(g["count"] for g in fp_groups),  # 误报总条数
+            "missed_known": len(missed_known),  # 已有规则的漏报
+            "missed_new": len(missed_new),  # 全新需求
+            "regions": len(regions),  # 框选区域
+        },
     }

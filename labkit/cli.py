@@ -8,6 +8,7 @@
 
 import argparse  # 导入 argparse 构建子命令
 import sys  # 导入 sys 控制退出码
+from pathlib import Path  # 导入 Path 写出优化任务书
 
 
 def cmd_ingest(args):
@@ -183,7 +184,28 @@ def cmd_guard(args):
     出现「回归」说明这次改动碰坏了本来能检出的东西。
     """
     # 延迟导入，其它子命令不承担切分依赖的加载开销
-    from .guard import OUTCOMES, analyze_false_positives, check
+    from .guard import OUTCOMES, analyze_false_positives, build_full_report, check
+
+    # 生成优化任务书：这是独立用途，出完就结束，不再跑核对
+    if args.report:
+        # 生成报告，内容取自全部人工标注
+        rep = build_full_report()
+        # 未指定路径时打印到标准输出，便于直接管道给别的命令
+        if args.report == "-":
+            print(rep["markdown"])
+        else:
+            # 写入指定文件
+            out = Path(args.report).expanduser()
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(rep["markdown"], encoding="utf-8")
+            # 回报落盘位置与内容概要，便于确认生成的是不是想要的
+            c = rep["counts"]
+            print(f"已写入 {out}")
+            print(f"  误报 {c['false_positive']} 条（涉及 {c['false_positive_rules']} 条规则）、"
+                  f"已有规则漏报 {c['missed_known']} 条、新需求 {c['missed_new']} 条、"
+                  f"框选区域 {c['regions']} 块")
+        return
+
     # 执行核对
     r = check(only=[args.case] if args.case else None)
     # 汇总一行说清结果
@@ -453,6 +475,9 @@ def build_parser():
     p_guard.add_argument("--todo", action="store_true", help="只列出回归与待修正")
     # 顺带打印误报归纳
     p_guard.add_argument("--why", action="store_true", help="附带误报共性分析")
+    # 生成可直接交给模型的优化任务书
+    p_guard.add_argument("--report", nargs="?", const="-", metavar="路径",
+                         help="生成优化任务书 Markdown；不给路径则打印到标准输出")
     # 绑定处理函数
     p_guard.set_defaults(func=cmd_guard)
 

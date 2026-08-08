@@ -587,6 +587,38 @@ def api_all_regions():
     })
 
 
+@app.get("/api/guard/report")
+def api_full_report():
+    """生成一份完整的优化任务书，可直接交给模型动手改。
+
+    与单条规则报告的区别是「完整」：把当前全部待办放在一起，
+    并写清代码位置、注册方式与验证命令，拿到的人不必回头再问。
+    """
+    # 切分参数与预览页保持一致，否则证据对不上
+    raw = request.args.get("parser_config")
+    # 解析失败时用默认配置
+    try:
+        config = json.loads(raw) if raw else None
+    except (TypeError, ValueError):
+        config = None
+    # 生成报告
+    r = guard.build_full_report(parser_config=config)
+    # 需要下载时以附件形式返回，浏览器直接存成文件
+    if request.args.get("download") == "1":
+        # 文件名带日期，多次生成不会互相覆盖
+        from datetime import datetime
+        name = f"切分规则优化任务_{datetime.now().strftime('%Y%m%d_%H%M')}.md"
+        # 用 Response 直出，避免再写一次临时文件
+        # mimetype 会自行补上 charset，此处不要再手写，否则响应头里会出现两次
+        resp = Response(r["markdown"], mimetype="text/markdown")
+        # RFC 5987 编码文件名，中文名才不会乱码
+        from urllib.parse import quote
+        resp.headers["Content-Disposition"] = f"attachment; filename*=UTF-8''{quote(name)}"
+        return resp
+    # 默认返回 JSON，供页面预览
+    return jsonify(r)
+
+
 @app.get("/api/guard/report/<detector>")
 def api_rule_report(detector):
     """为某条规则生成优化报告。
