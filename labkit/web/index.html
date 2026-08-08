@@ -1432,7 +1432,7 @@ async function loadRules() {
     const q = new URLSearchParams({ run: rulesRun, parser_config: JSON.stringify(runParams()) });
     const [stats, fp] = await Promise.all([
       api(`/api/annotations?${q}`),
-      api("/api/guard/false-positives"),
+      api(`/api/guard/false-positives?${q}`),
     ]);
     renderRules(stats.stats || {}, fp.groups || []);
   } catch (e) {
@@ -1553,7 +1553,9 @@ function renderRules(stats, groups) {
       <h3>原文上圈出的区域</h3>
       <p class="hint" style="margin:0 0 0.9rem">
         在切片预览的原文视图里框出来的地方——切分器压根没在那儿切出块，
-        所以它不属于任何切片，也不会出现在上面的规则统计里。点一条即可跳回原文看那块区域。
+        所以它不属于任何切片，也不会出现在上面的规则统计里。点一条即可跳回原文看那块区域。<br>
+        <strong>这一块不随版本过滤</strong>：切分器没在那儿产出块，也就没有「该规则是否仍命中」
+        可判，无法自动核对。只能标出它<strong>发现于哪个代码版本</strong>，是否已解决由人自己看。
       </p>
       <div id="regionList"><div class="empty">加载中…</div></div>
     </div>`;
@@ -1583,6 +1585,11 @@ async function loadRegions() {
         <div class="guard-head">
           <span class="pill medium">${esc(detCn(it.detector) || "未指定类型")}</span>
           <span class="mono">${esc(it.case_id)}　第 ${it.region[0]} 页</span>
+          ${it.code_hash
+            ? (it.code_hash === currentCodeHash
+                ? `<span class="pill low" title="圈定时的代码与当前一致">当前版本发现</span>`
+                : `<span class="pill low" title="圈定于 ${esc(it.code_hash)}，之后代码已改动">发现于旧版本</span>`)
+            : `<span class="pill low" title="早期记录未存代码版本">版本未知</span>`}
           <span class="spacer"></span>
           <button class="mini" data-region-del="${esc(it.id)}" data-case="${esc(it.case_id)}">删除</button>
         </div>
@@ -1624,10 +1631,11 @@ $("view-rules").addEventListener("click", async (e) => {
   // 点明细行：跳回该切片
   const jump = e.target.closest("[data-jump-case]");
   if (jump) {
+    // 带上规则质量页选定的版本，两边看到的是同一份切分结果
     return gotoChunks(jump.dataset.jumpCase, "", {
       index: parseInt(jump.dataset.jumpIdx),
       evidence: jump.dataset.jumpEv || "",
-    });
+    }, rulesRun);
   }
 });
 
@@ -1639,7 +1647,12 @@ async function showMarks(verdict, detector) {
   $("markDetail").innerHTML = `<div class="card"><div class="empty"><span class="spin"></span> 加载中…</div></div>`;
   // 拉取失败如实回报
   try {
-    const q = new URLSearchParams({ verdict, detector });
+    // 带上版本：点开「仍在误报 17」应当正好看到 17 条，
+    // 不带的话会掺进已经修好的，与上面的数字对不上
+    const q = new URLSearchParams({
+      verdict, detector, run: rulesRun,
+      parser_config: JSON.stringify(runParams()),
+    });
     const d = await api(`/api/guard/marks?${q}`);
     const items = d.items || [];
     // 渲染明细，每条可点击跳回原切片
@@ -1720,7 +1733,8 @@ async function showRuleReport(detector) {
   // 失败时如实回报
   try {
     // 切分参数与预览页一致，否则证据对不上
-    const q = new URLSearchParams({ parser_config: JSON.stringify(runParams()) });
+    // 带上版本：报告里的证据必须与统计出自同一版本
+    const q = new URLSearchParams({ run: rulesRun, parser_config: JSON.stringify(runParams()) });
     const d = await api(`/api/guard/report/${encodeURIComponent(detector)}?${q}`);
     // 报告以纯文本呈现：它的用途是整段复制给模型改代码，渲染成 HTML 反而不好取
     $("ruleReport").innerHTML = `<div class="card">
@@ -1762,6 +1776,8 @@ async function showRuleReport(detector) {
 
 // 跳回原文并定位到框选出来的区域
 function gotoRegion(caseId, filename, region) {
+  // 跟随规则质量页选定的版本，与那边看到的是同一份切分结果
+  viewingRun = rulesRun || "";
   // 切到切片预览
   document.querySelector('.tab[data-view="chunks"]').click();
   // 样本列表就绪后加载该样本，原文完全就绪后再定位。
@@ -2579,9 +2595,12 @@ async function loadChunkCaseList() {
 // detector 为空表示看全部切片；target 指定要定位到的切片；
 // cfg 指定用哪套参数切分——差异条目的序号只在其所属轮次的参数下成立，
 // 用当前顶栏参数切分会导致序号对不上，定位到错误的块。
-function gotoChunks(caseId, detector, target) {
+function gotoChunks(caseId, detector, target, runId) {
   // 记录筛选条件，供渲染时使用
   chunkFilter = detector || "";
+  // 跟随来源页选定的版本。从规则质量页点进来时，那边按某一轮统计，
+  // 预览却用当前代码实时切分的话，看到的切片与刚才的数字根本对不上
+  if (runId !== undefined) viewingRun = runId || "";
   // 切到切片预览标签页
   document.querySelector('.tab[data-view="chunks"]').click();
   // 样本列表就绪后再加载目标样本，加载完成再执行定位

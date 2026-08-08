@@ -491,6 +491,8 @@ def api_add_region(case_id):
             payload.get("region") or [],  # 区域坐标
             detector=payload.get("detector", ""),  # 人工判定的问题类型
             note=payload.get("note", ""),  # 备注
+            # 记下当前代码指纹：区域问题无法自动核对，只能标明发现于哪个版本
+            code_hash=runs.code_fingerprint()["hash"],
         )
     except ValueError as e:
         return jsonify({"ok": False, "message": str(e)}), 400
@@ -569,12 +571,23 @@ def api_false_positives():
     逐条看误报很难看出规律；把同一条规则的反例放在一起，
     命中的是什么、出现在什么格式的文档里，往往一眼就能看出来。
     """
-    # 可按规则或样本收窄
+    # 版本一并带上：不按版本过滤会出现「仍在误报 17 条、共性却写 24 条」的矛盾
+    only = request.args.get("case")
+    # 切分参数与统计保持一致
+    raw = request.args.get("parser_config")
+    # 解析失败时用默认配置
+    try:
+        config = json.loads(raw) if raw else None
+    except (TypeError, ValueError):
+        config = None
+    # 归纳
     return jsonify({
         "ok": True,
         "groups": guard.analyze_false_positives(
             detector=request.args.get("detector"),  # 只看某一条规则
-            only=[request.args.get("case")] if request.args.get("case") else None,  # 只看某个样本
+            only=[only] if only else None,  # 只看某个样本
+            run_id=request.args.get("run") or "",  # 目标版本；空串表示当前代码
+            parser_config=config,  # 切分参数
         ),
     })
 
@@ -587,13 +600,24 @@ def api_marks():
     # 非法结论明确报错而不是返回空列表
     if verdict not in annotations.VERDICTS:
         return jsonify({"ok": False, "message": f"未知的标注结论：{verdict}"}), 400
-    # 返回明细
+    # 切分参数与统计保持一致
+    raw = request.args.get("parser_config")
+    # 解析失败时用默认配置
+    try:
+        config = json.loads(raw) if raw else None
+    except (TypeError, ValueError):
+        config = None
+    # 可按样本收窄
+    only = request.args.get("case")
+    # 返回明细；按版本过滤后条数与统计数字一致
     return jsonify({
         "ok": True,
         "items": guard.list_marks(
             verdict,  # 结论
             detector=request.args.get("detector"),  # 只看某一类问题
-            only=[request.args.get("case")] if request.args.get("case") else None,  # 只看某个样本
+            only=[only] if only else None,  # 只看某个样本
+            run_id=request.args.get("run") or "",  # 目标版本；空串表示当前代码
+            parser_config=config,  # 切分参数
         ),
     })
 
@@ -668,6 +692,7 @@ def api_rule_report(detector):
         detector,  # 规则名
         only=[request.args.get("case")] if request.args.get("case") else None,  # 可只看某个样本
         parser_config=config,  # 切分参数
+        run_id=request.args.get("run") or "",  # 目标版本；空串表示当前代码
     )
     # 无反例时返回 404，界面据此提示先去标注
     return (jsonify(r), 200) if r.get("ok") else (jsonify(r), 404)

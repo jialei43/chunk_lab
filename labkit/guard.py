@@ -301,12 +301,25 @@ def stats(run_id=None, only=None, cfg=None, parser_config=None, checked=None):
     }
 
 
-def analyze_false_positives(detector=None, only=None):
+def analyze_false_positives(detector=None, only=None, run_id=None,
+                            parser_config=None, checked=None):
     """归纳误报的共同特征，指出规则该往哪儿改。
 
     逐条看误报很难看出规律；把同一条规则的反例放在一起，
     命中的是什么子串、出现在什么上下文，往往一眼就能看出来。
+
+    与统计口径必须一致：给定版本时只归纳**该版本下仍在误报**的反例。
+    否则会出现「仍在误报 17 条，共性却写着 24 条」这种自相矛盾的展示——
+    差额正是已经修好的那些。
     """
+    # 需要按版本过滤时先核对一次，得到仍在误报的集合
+    open_keys = None
+    if run_id is not None or checked is not None:
+        r = checked if checked is not None else check(
+            only=only, parser_config=parser_config, run_id=run_id)
+        # 仍在误报的标注键；已修复的不该再出现在归纳里
+        open_keys = {(it["case_id"], it.get("marked_index"))
+                     for it in r["items"] if it["outcome"] == "open"}
     # 按检测器归集误报
     groups = {}
     # 遍历有标注的样本
@@ -321,6 +334,9 @@ def analyze_false_positives(detector=None, only=None):
             # 指定了检测器时只看这一条规则
             det = mark.get("detector") or "(未指定)"
             if detector and det != detector:
+                continue
+            # 按版本过滤：该版本下已经不再误报的不算待办
+            if open_keys is not None and (cid, mark.get("chunk_index")) not in open_keys:
                 continue
             # 收入该规则的反例。带上切片序号与文件名，
             # 界面才能从这里直接跳回原切片去看上下文
@@ -358,12 +374,26 @@ def analyze_false_positives(detector=None, only=None):
     return out
 
 
-def list_marks(verdict, detector=None, only=None):
+def list_marks(verdict, detector=None, only=None, run_id=None,
+               parser_config=None, checked=None):
     """按结论列出标注明细，供界面直接跳回原切片。
 
     统计只给出数量，看不到具体是哪些切片。要动手改规则就得能从数字点进去，
     落到那一块正文上——这里提供的就是这条通路。
+
+    给定版本时只列**该版本下仍然成立**的条目，与统计数字保持一致：
+    点开「仍在误报 17」应当正好看到 17 条，而不是掺着已经修好的。
     """
+    # 需要按版本过滤时先核对一次
+    keep = None
+    if run_id is not None or checked is not None:
+        r = checked if checked is not None else check(
+            only=only, parser_config=parser_config, run_id=run_id)
+        # 各类结论对应的「仍然成立」判据
+        want = {"false_positive": "open", "confirmed": "pass", "missed": "still_missing"}
+        # 只保留结论仍成立的标注
+        keep = {(it["case_id"], it.get("marked_index"))
+                for it in r["items"] if it["outcome"] == want.get(verdict)}
     # 收集明细
     out = []
     # 遍历有标注的样本
@@ -378,6 +408,9 @@ def list_marks(verdict, detector=None, only=None):
             # 指定了问题类型时只看这一类
             det = mark.get("detector") or "(未指定)"
             if detector and det != detector:
+                continue
+            # 按版本过滤，与统计数字保持一致
+            if keep is not None and (cid, mark.get("chunk_index")) not in keep:
                 continue
             # 带上定位所需的全部信息
             out.append({
@@ -430,7 +463,7 @@ def _rule_source(detector):
     return {"file": "labkit/detectors.py", "line": line, "source": src, "consts": consts}
 
 
-def build_optimization_report(detector, only=None, parser_config=None):
+def build_optimization_report(detector, only=None, parser_config=None, run_id=None):
     """为某条规则生成优化报告。
 
     报告要能直接拿去改代码，因此同时给出三样东西：规则的当前实现、
@@ -439,8 +472,9 @@ def build_optimization_report(detector, only=None, parser_config=None):
     """
     # 检测阈值取默认
     cfg = DetectorConfig()
-    # 该规则的误报归纳
-    groups = analyze_false_positives(detector=detector, only=only)
+    # 该规则的误报归纳，按目标版本过滤——已修好的不该再出现在优化报告里
+    groups = analyze_false_positives(detector=detector, only=only,
+                                     run_id=run_id, parser_config=parser_config)
     # 没有反例时没什么可优化的
     if not groups:
         return {"ok": False, "message": f"规则 {detector} 没有被标为误报的切片，无从生成优化报告"}
@@ -450,16 +484,19 @@ def build_optimization_report(detector, only=None, parser_config=None):
     # 重跑一遍拿当前证据：标注里只存了正文摘要，
     # 而改规则真正需要知道的是「这条规则在这块正文上匹配到了什么」
     cases_needed = sorted({s["case_id"] for s in g["samples"]})
-    # 逐样本重切并取证据
+    # 逐样本取该版本的切片与命中
     evidences = {}
     for case in load_cases(only=cases_needed):
         # 样本标识
         cid = case["case_id"]
-        # 用当前代码切分并检测
-        data = inspect_case(case, cfg=cfg, parser_config=parser_config)
-        # 切分失败时跳过该样本，其余样本照常
-        if data.get("error"):
+        # 按目标版本取切片：指定版本时读快照，否则用当前代码实切。
+        # 报告里的证据必须来自与统计同一个版本，否则对不上
+        chunks_of_case, err = _chunks_of(case, run_id, cfg, parser_config)
+        # 取不到时跳过该样本，其余样本照常
+        if chunks_of_case is None:
             continue
+        # 统一成与实切相同的结构
+        data = {"chunks": chunks_of_case}
         # 本样本内已认领的切片，避免多条标注落到同一个上
         used = set()
         # 逐条反例定位并取证据
@@ -664,9 +701,9 @@ def build_full_report(parser_config=None, run_id=None):
     # 那是成绩，不是待办
     open_fps = {(it["case_id"], it.get("marked_index"))
                 for it in checked["items"] if it["outcome"] == "open"}
-    # 误报归纳后按核对结果过滤
+    # 误报归纳复用同一份核对结果，避免同一次请求里重复核对
     fp_groups = []
-    for g in analyze_false_positives():
+    for g in analyze_false_positives(checked=checked):
         # 只保留仍在误报的反例
         kept = [x for x in g["samples"] if (x["case_id"], x.get("chunk_index")) in open_fps]
         # 一条不剩说明这条规则的误报已全部修好
@@ -688,8 +725,7 @@ def build_full_report(parser_config=None, run_id=None):
                      for it in checked["items"] if it["outcome"] == "still_missing"}
     # 人工提出的需求：结论为漏报、且问题类型不是已实现的检测器
     from . import detectors as _det
-    missed = [m for m in list_marks("missed")
-              if (m["case_id"], m.get("chunk_index")) in still_missing]
+    missed = list_marks("missed", checked=checked)
     # 已实现的检测器名集合，用于区分「规则漏了」与「规则还不存在」
     implemented = {n[len("detect_"):] for n in dir(_det) if n.startswith("detect_")}
     # 拆成两类：已有规则漏报（调阈值即可）与全新需求（要写代码）

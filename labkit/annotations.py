@@ -167,11 +167,16 @@ def load_regions(case_id):
         return []
 
 
-def save_region(case_id, region, detector="", note=""):
+def save_region(case_id, region, detector="", note="", code_hash=""):
     """新增一条区域标注，返回写入的条目。
 
     region 形如 [页码, x0, x1, top, bottom]，单位与切片坐标一致（PDF 点），
     这样人工圈出的范围能直接和切分器给出的位置作比较。
+
+    同时记下圈定时的代码指纹。区域标注无法像切片标注那样自动核对——
+    切分器压根没在那儿切出块，也就没有「该检测器是否仍命中」可判——
+    所以只能靠这个指纹说明「这是在哪个版本下发现的问题」，
+    由人自己判断它是否还存在。
     """
     # 坐标必须完整，否则日后无法还原到版面上
     if not isinstance(region, (list, tuple)) or len(region) < 5:
@@ -194,6 +199,8 @@ def save_region(case_id, region, detector="", note=""):
         "region": [pn, x0, x1, top, bottom],  # 区域坐标
         "detector": detector,  # 人工判定的问题类型
         "note": note,  # 备注，说明为什么圈这里
+        # 圈定时的代码指纹。区域问题无法自动核对，只能标明发现于哪个版本
+        "code_hash": code_hash,
         "at": datetime.now().isoformat(timespec="seconds"),  # 标注时间
     }
     # 追加并写回
