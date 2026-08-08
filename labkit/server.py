@@ -20,6 +20,7 @@ from .evaluate import (compare_reports, diff_chunk_texts, diff_findings, evaluat
                        inspect_case, load_cases)  # 导入评估相关能力
 from .ingest import ingest_from_path  # 导入按路径导入语料的能力
 from .offline import DEFAULT_PARSER_CONFIG, build_parser_config  # 导入切分配置默认值与合并逻辑
+from .parsing import UPLOAD_DIR, get_task, list_tasks, start_parse  # 导入解析任务管理
 from .paths import REPORT_DIR  # 导入报告目录常量
 from .report import build_markdown  # 导入报告生成能力，用于按需重建缺失的报告
 
@@ -136,6 +137,57 @@ def api_corpus():
         }
         for c in cases
     ])
+
+
+@app.post("/api/parse")
+def api_parse():
+    """上传文件并启动 MinerU 解析，立即返回任务标识。
+
+    解析耗时数分钟，必须异步：同步等待会让请求超时、界面假死。
+    产物落在实验室自己的目录，与生产的 MinerU 输出彻底分开。
+    """
+    # 取上传的文件
+    file = request.files.get("file")
+    # 没有文件时明确提示
+    if file is None or not file.filename:
+        return jsonify({"ok": False, "message": "未选择文件"}), 400
+    # 确保上传目录存在
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    # 保留原始文件名：切分器按扩展名分派类型，改名会导致走错分支
+    dest = UPLOAD_DIR / Path(file.filename).name
+    # 落盘
+    file.save(dest)
+    # 启动后台解析
+    task_id = start_parse(
+        dest,  # 已落盘的文件路径
+        Path(file.filename).name,  # 原始文件名
+        backend=request.form.get("backend") or "pipeline",  # 处理后端类型
+        parse_method=request.form.get("parse_method") or "auto",  # 解析方法
+        auto_import=request.form.get("auto_import", "1") != "0",  # 解析后是否自动入库
+        kind=request.form.get("kind", ""),  # 文档大类
+        note=request.form.get("note", ""),  # 备注
+    )
+    # 返回任务标识供前端轮询
+    return jsonify({"ok": True, "task_id": task_id})
+
+
+@app.get("/api/parse/<task_id>")
+def api_parse_status(task_id):
+    """查询解析任务状态。"""
+    # 读取任务
+    task = get_task(task_id)
+    # 任务不存在时返回 404；服务重启会清空任务表，这是预期行为
+    if task is None:
+        return jsonify({"ok": False, "message": "任务不存在（服务重启会清空任务列表）"}), 404
+    # 返回任务状态
+    return jsonify({"ok": True, "task": task})
+
+
+@app.get("/api/parse")
+def api_parse_list():
+    """列出最近的解析任务。"""
+    # 返回最近若干条
+    return jsonify({"ok": True, "tasks": list_tasks()})
 
 
 @app.get("/api/sources")

@@ -229,6 +229,16 @@ input[type="text"], input[type="number"], select {
   .cfg-row { grid-template-columns: 1fr; gap: 0.25rem; }
 }
 
+/* ========== 解析任务 ========== */
+.parse-form .cfg-row { grid-template-columns: 8rem 14rem 1fr; }
+.task-row {
+  padding: 0.7rem 0; border-bottom: 1px solid var(--line);
+}
+.task-row:last-child { border-bottom: none; }
+.task-head { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; font-size: 0.9rem; }
+.task-msg { font-size: 0.82rem; color: var(--ink-soft); margin-top: 0.25rem; }
+.task-head .spin { width: 0.7rem; height: 0.7rem; }
+
 /* ========== 报告预览弹层 ========== */
 .modal {
   display: none; position: fixed; inset: 0; z-index: 40;
@@ -493,6 +503,7 @@ tr.is-baseline { background: var(--accent-soft); }
   <button class="tab active" data-view="overview">概览</button>
   <button class="tab" data-view="chunks">切片预览</button>
   <button class="tab" data-view="corpus">语料库</button>
+  <button class="tab" data-view="parse">解析文件</button>
   <button class="tab" data-view="sources">添加语料</button>
 </nav>
 
@@ -591,6 +602,64 @@ tr.is-baseline { background: var(--accent-soft); }
           <tbody id="corpusRows"></tbody>
         </table>
       </div>
+    </div>
+  </div>
+
+  <!-- ---------- 解析文件 ---------- -->
+  <div class="view" id="view-parse">
+    <div class="card">
+      <h3>上传文件并用 MinerU 解析</h3>
+      <p class="hint" style="margin:0 0 1rem">
+        解析产物写入实验室自己的 <code>mineru_out/</code>，与生产的 MinerU 输出目录完全分开，
+        且不会像生产那样解析完就删除——离线重放依赖这些产物。解析完成后自动导入语料库。
+      </p>
+
+      <div class="parse-form">
+        <div class="cfg-row">
+          <label class="cfg-label">选择文件</label>
+          <div class="cfg-input" style="grid-column:span 2">
+            <input type="file" id="parseFile" accept=".pdf,.docx,.doc,.pptx,.ppt,.xlsx,.xls,.png,.jpg,.jpeg">
+          </div>
+        </div>
+        <div class="cfg-row">
+          <label class="cfg-label">处理后端类型</label>
+          <div class="cfg-input">
+            <select id="parseBackend">
+              <option value="pipeline">pipeline</option>
+              <option value="vlm-engine">vlm-engine</option>
+              <option value="hybrid-engine">hybrid-engine</option>
+              <option value="vlm-http-client">vlm-http-client</option>
+              <option value="hybrid-http-client">hybrid-http-client</option>
+            </select>
+          </div>
+          <div class="cfg-hint">与知识库 MinerU 模型配置中的「MinerU处理后端类型」一致。不同 backend 产出的块数可能差两成。</div>
+        </div>
+        <div class="cfg-row">
+          <label class="cfg-label">解析方法</label>
+          <div class="cfg-input">
+            <select id="parseMethod">
+              <option value="auto">auto</option>
+              <option value="txt">txt</option>
+              <option value="ocr">ocr</option>
+            </select>
+          </div>
+          <div class="cfg-hint">对应 MinerU 选项中的「解析方法」。</div>
+        </div>
+        <div class="cfg-row">
+          <label class="cfg-label">解析后入库</label>
+          <div class="cfg-input"><input type="checkbox" id="parseAutoImport" checked></div>
+          <div class="cfg-hint">解析完成后自动加入语料库，同名样本会被覆盖。</div>
+        </div>
+        <div style="margin-top:0.9rem">
+          <button class="btn primary" id="btnParse">开始解析</button>
+          <span class="hint" style="margin-left:0.6rem">大文件可能需要数分钟，可离开本页，任务在后台继续。</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>解析任务</h3>
+      <div id="parseTasks"><div class="empty">暂无任务</div></div>
     </div>
   </div>
 
@@ -885,6 +954,7 @@ document.querySelectorAll(".tab").forEach(tab => {
     if (tab.dataset.view === "corpus") loadCorpus();
     if (tab.dataset.view === "sources") loadSources();
     if (tab.dataset.view === "chunks") loadChunkCaseList();
+    if (tab.dataset.view === "parse") loadParseTasks();
   });
 });
 
@@ -1833,6 +1903,106 @@ function renderChunk(c, highlight) {
     <div class="chunk-body ${isTable ? "is-table" : ""}">${body}</div>
     ${issues ? `<div class="chunk-issues">${issues}</div>` : ""}
   </div>`;
+}
+
+// ========== 解析文件 ==========
+// 解析耗时数分钟，因此走「提交任务 + 轮询进度」，而不是同步等待请求返回。
+let parsePollTimer = null;
+
+// 提交解析
+$("btnParse").addEventListener("click", async () => {
+  const input = $("parseFile");
+  // 未选文件时直接提示，不发无效请求
+  if (!input.files || !input.files[0]) return toast("请先选择文件");
+  const fd = new FormData();
+  fd.append("file", input.files[0]);
+  fd.append("backend", $("parseBackend").value);
+  fd.append("parse_method", $("parseMethod").value);
+  fd.append("auto_import", $("parseAutoImport").checked ? "1" : "0");
+
+  const btn = $("btnParse");
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span> 提交中…';
+  try {
+    // 上传走 multipart，不能带 JSON 的 Content-Type，故不复用 api()
+    const res = await fetch("/api/parse", { method: "POST", body: fd });
+    const d = await res.json();
+    if (!res.ok || !d.ok) throw new Error(d.message || "提交失败");
+    toast("已提交，正在后台解析");
+    // 清空选择，避免重复提交同一文件
+    input.value = "";
+    // 立即刷新任务列表并开始轮询
+    await loadParseTasks();
+    startParsePolling();
+  } catch (e) {
+    toast("提交失败：" + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "开始解析";
+  }
+});
+
+// 加载任务列表
+async function loadParseTasks() {
+  try {
+    const d = await api("/api/parse");
+    renderParseTasks(d.tasks || []);
+    // 有任务仍在运行时保持轮询，全部结束则停下来
+    if ((d.tasks || []).some(t => t.status === "running")) startParsePolling();
+    else stopParsePolling();
+  } catch (e) {
+    $("parseTasks").innerHTML = `<div class="empty" style="color:var(--bad)">${esc(e.message)}</div>`;
+  }
+}
+
+// 渲染任务列表
+function renderParseTasks(tasks) {
+  if (!tasks.length) {
+    $("parseTasks").innerHTML = `<div class="empty">暂无任务</div>`;
+    return;
+  }
+  $("parseTasks").innerHTML = tasks.map(t => {
+    // 状态徽标：运行中带转圈，失败标红
+    const badge = t.status === "running"
+      ? `<span class="pill kind"><span class="spin"></span> 解析中</span>`
+      : t.status === "done" ? `<span class="pill good">完成</span>`
+      : `<span class="pill bad">失败</span>`;
+    // 进度条仅在运行中展示
+    const bar = t.status === "running"
+      ? `<div class="bar-track" style="margin-top:0.4rem"><div class="bar-fill" style="width:${Math.round((t.progress || 0) * 100)}%"></div></div>`
+      : "";
+    return `<div class="task-row">
+      <div class="task-head">
+        ${badge}
+        <strong>${esc(t.filename)}</strong>
+        <span class="hint mono">${esc(t.backend)} · ${esc(t.parse_method)}</span>
+        <span class="spacer"></span>
+        ${t.case_id ? `<button class="mini" data-goto-case="${esc(t.case_id)}">查看切片</button>` : ""}
+      </div>
+      <div class="task-msg">${esc(t.error || t.message || "")}</div>
+      ${t.block_count ? `<div class="hint">原始块数 ${t.block_count}${t.case_id ? `　样本 ${esc(t.case_id)}` : ""}</div>` : ""}
+      ${bar}
+    </div>`;
+  }).join("");
+  // 完成的任务可直接跳到切片预览查看效果
+  $("parseTasks").querySelectorAll("[data-goto-case]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      // 语料已变化，刷新缓存后再跳转
+      corpusCache = await api("/api/corpus");
+      gotoChunks(btn.dataset.gotoCase, "");
+    });
+  });
+}
+
+// 轮询控制：只在有任务运行时轮询，避免无谓请求
+function startParsePolling() {
+  if (parsePollTimer) return;
+  parsePollTimer = setInterval(loadParseTasks, 3000);
+}
+function stopParsePolling() {
+  if (!parsePollTimer) return;
+  clearInterval(parsePollTimer);
+  parsePollTimer = null;
 }
 
 // ========== 添加语料：扫描本机产物 ==========

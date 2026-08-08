@@ -20,3 +20,8 @@ __pycache__/
 # 但轻量索引保留版本管理，指标趋势因此可长期追溯
 runs/*.json
 !runs/index.json
+
+# MinerU 解析产物与上传文件：体积大且可重新生成，不入库。
+# 该目录与生产的 MinerU 输出目录彻底分开，避免实验解析污染生产产物。
+mineru_out/
+uploads/
