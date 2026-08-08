@@ -13,7 +13,7 @@ from pathlib import Path  # 导入 Path 定位前端静态文件
 import markdown  # 导入 markdown 把评估报告渲染成 HTML 供页面预览
 from flask import Flask, Response, jsonify, request, send_from_directory  # 导入 Flask 及其响应工具
 
-from . import annotations, runs  # 导入标注与运行历史模块
+from . import annotations, crawling, runs  # 导入标注、爬取与运行历史模块
 from .preview import attach_source, attach_source_from_path, find_source, render_chunk  # 导入原文截图能力
 from .detectors import DetectorConfig  # 导入检测阈值配置
 from .discover import scan_products  # 导入本机产物扫描
@@ -293,6 +293,97 @@ def api_chunk_shot(case_id):
         payload.get("filename", ""),  # 原始文件名
         payload.get("positions") or [],  # 切片坐标
     ))
+
+
+@app.post("/api/crawl")
+def api_crawl():
+    """启动一次列表页抓取，立即返回任务标识。
+
+    抓取耗时不可预期，必须异步；参数与命令行 ./run.sh crawl 完全一致，
+    两边共用同一个 Crawler 实现。
+    """
+    # 读取请求体
+    payload = request.get_json(silent=True) or {}
+    # 起始页为必填
+    url = (payload.get("url") or "").strip()
+    # 缺少 URL 时明确提示
+    if not url:
+        return jsonify({"ok": False, "message": "请填写起始列表页 URL"}), 400
+    # 只接受 http(s)，避免被诱导去读本地文件
+    if not url.startswith(("http://", "https://")):
+        return jsonify({"ok": False, "message": "仅支持 http/https 地址"}), 400
+    # 启动后台抓取
+    task_id = crawling.start_crawl(
+        url,  # 起始列表页
+        exts=payload.get("exts") or "pdf,doc,docx,ppt,pptx,xls,xlsx",  # 目标扩展名
+        next_text=payload.get("next_text", ""),  # 翻页文字
+        next_selector=payload.get("next_selector", ""),  # 翻页选择器
+        detail_selector=payload.get("detail_selector", ""),  # 详情页选择器
+        max_pages=int(payload.get("max_pages") or 10),  # 翻页上限
+        max_files=int(payload.get("max_files") or 0),  # 文件数上限
+        delay=float(payload.get("delay") or 1.0),  # 请求间隔
+        obey_robots=payload.get("obey_robots", True),  # 是否遵守 robots.txt
+        dry_run=bool(payload.get("dry_run")),  # 是否只演练
+    )
+    # 返回任务标识供前端轮询
+    return jsonify({"ok": True, "task_id": task_id})
+
+
+@app.get("/api/crawl")
+def api_crawl_list():
+    """列出最近的抓取任务与已下载文件。"""
+    # 任务与文件一并返回，前端一次请求即可刷新整页
+    return jsonify({"ok": True, "tasks": crawling.list_tasks(),
+                    "files": crawling.list_downloads()})
+
+
+@app.get("/api/crawl/<task_id>")
+def api_crawl_status(task_id):
+    """查询抓取任务状态。"""
+    # 读取任务
+    task = crawling.get_task(task_id)
+    # 不存在时返回 404；服务重启会清空任务表
+    if task is None:
+        return jsonify({"ok": False, "message": "任务不存在（服务重启会清空任务列表）"}), 404
+    # 返回状态
+    return jsonify({"ok": True, "task": task})
+
+
+@app.post("/api/crawl/parse")
+def api_crawl_parse():
+    """把已下载的文件送去 MinerU 解析并入库。"""
+    # 读取请求体
+    payload = request.get_json(silent=True) or {}
+    # 待解析的文件路径列表
+    paths = payload.get("paths") or []
+    # 无选中项时直接返回
+    if not paths:
+        return jsonify({"ok": False, "message": "没有选中文件"}), 400
+    # 逐个提交解析任务；解析本身是异步的，这里只负责排队
+    task_ids = []
+    # 遍历选中文件
+    for raw in paths:
+        # 只允许下载目录内的文件，避免被诱导解析任意路径
+        p = Path(raw).resolve()
+        # 越界路径直接跳过
+        try:
+            p.relative_to(crawling.DOWNLOAD_DIR.resolve())
+        except ValueError:
+            continue
+        # 文件必须存在
+        if not p.is_file():
+            continue
+        # 提交解析
+        task_ids.append(start_parse(
+            p,  # 文件路径
+            p.name,  # 原始文件名
+            backend=payload.get("backend") or "pipeline",  # 处理后端类型
+            parse_method=payload.get("parse_method") or "auto",  # 解析方法
+            auto_import=True,  # 解析完直接入库，省去再走一遍导入
+            note="来自网页抓取",  # 备注来源
+        ))
+    # 返回已提交的任务
+    return jsonify({"ok": True, "task_ids": task_ids, "count": len(task_ids)})
 
 
 @app.get("/api/sources")

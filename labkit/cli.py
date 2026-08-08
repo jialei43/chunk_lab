@@ -279,6 +279,14 @@ def cmd_inspect(args):
     return 0
 
 
+def cmd_crawl(args):
+    """从列表页抓取文件。转发给爬虫模块的命令行入口。"""
+    # 延迟导入，未用到抓取时不加载 requests 与 bs4
+    from .crawler import main as crawl_main
+    # 直接复用其参数解析，避免两处维护同一组选项
+    return crawl_main(args.rest)
+
+
 def cmd_serve(args):
     """启动本地 Web 控制台。"""
     # 延迟导入，使不用 Web 界面时不必加载 Flask
@@ -364,6 +372,15 @@ def build_parser():
     p_ins.add_argument("--children-delimiter", default="", help="父子分块分隔符")
     # 绑定处理函数
     p_ins.set_defaults(func=cmd_inspect)
+
+    # crawl 子命令：其余参数原样转交爬虫模块
+    p_crawl = sub.add_parser("crawl", help="从列表页抓取文件",
+                             add_help=False)
+    # 收集全部剩余参数，由爬虫模块自行解析
+    p_crawl.add_argument("rest", nargs=argparse.REMAINDER,
+                         help="爬虫参数，用 ./run.sh crawl --help 查看")
+    # 绑定处理函数
+    p_crawl.set_defaults(func=cmd_crawl)
 
     # serve 子命令
     p_serve = sub.add_parser("serve", help="启动 Web 控制台")
