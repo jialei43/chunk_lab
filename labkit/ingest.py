@@ -135,6 +135,16 @@ CASES = [
 ]
 
 
+def _middle_json_path(content_list_path):
+    """由 content_list.json 路径推出同目录下 middle.json 的路径，不存在时返回 None。"""
+    # MinerU 输出的两个文件同目录同前缀，仅后缀不同
+    stem = content_list_path.name.replace("_content_list.json", "")
+    # 拼出候选路径
+    candidate = content_list_path.parent / f"{stem}_middle.json"
+    # 存在才返回
+    return candidate if candidate.is_file() else None
+
+
 def ingest_case(case, overwrite=False):
     """把单个样本复制进语料库并生成 case.yaml，返回该样本目录。"""
     # 源产物路径
@@ -153,6 +163,16 @@ def ingest_case(case, overwrite=False):
     dest_dir.mkdir(parents=True, exist_ok=True)
     # 复制产物，copy2 保留修改时间便于追溯产物新鲜度
     shutil.copy2(source, dest_json)
+    # 一并复制 middle.json：ragflow 解析时会用它做跨页续排合并、双栏 bbox 修复
+    # 与卡片文本归位，且这些修复只发生在内存中，不写回磁盘的 content_list.json。
+    # 缺了它，离线重放会把线上已经合上的跨页断句当成切分缺陷，结论完全失真。
+    middle_src = _middle_json_path(source)
+    # 源目录存在 middle.json 时复制过来。
+    # 必须保留 MinerU 的原始文件名：生产的 _load_mineru_middle_data 按
+    # "{stem}_middle.json" 查找，改名会让它找不到从而静默跳过全部增强。
+    if middle_src is not None:
+        # 保持原文件名复制到样本目录
+        shutil.copy2(middle_src, dest_dir / middle_src.name)
     # 读取块数写进描述文件，便于在不打开产物的情况下了解样本规模
     with dest_json.open("r", encoding="utf-8") as fh:
         # 解析后取长度即为 MinerU 原始块数量

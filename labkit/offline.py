@@ -13,6 +13,7 @@
 """
 
 import json  # 导入 json 以读取 MinerU 的 content_list.json 产物
+import logging  # 导入 logging 记录增强步骤的降级情况
 import re  # 导入 re 用于从文件名中剥离扩展名
 from pathlib import Path  # 导入 Path 统一处理路径
 
@@ -20,7 +21,9 @@ from .paths import ensure_ragflow_importable  # 导入路径注入函数，必�
 
 ensure_ragflow_importable()  # 在导入任何 ragflow 模块之前把仓库根注入 sys.path
 
-from deepdoc.parser.mineru_parser import MinerUParser  # noqa: E402  导入真实解析器类，仅用它的位置标签与截图能力
+from deepdoc.parser.mineru_parser import (MinerUParser, _detect_card_grid_pages,  # noqa: E402
+                                          _detect_two_column_text_pages,
+                                          _enrich_mineru_from_middle_json)  # 导入真实解析器与产物增强逻辑
 from rag.app.mineru_chunker import chunk_mineru_blocks  # noqa: E402  导入被测的切分入口，这是本实验室的核心观测对象
 from rag.nlp import rag_tokenizer  # noqa: E402  导入分词器，用于构造与生产一致的 doc 标题字段
 
@@ -79,6 +82,49 @@ def load_content_list(path):
     return data
 
 
+def enrich_blocks(blocks, content_list_path):
+    """复刻生产 _read_output 中的产物增强步骤。
+
+    ragflow 读完 content_list.json 后会立刻用 middle.json 做三件事：
+    双栏 bbox 修复、卡片错位文本归位、跨页续排合并。这些修复只发生在内存里，
+    不写回磁盘，因此直接读取磁盘上的 content_list.json 得到的是**增强前**的数据。
+
+    漏掉这一步的后果不是细微偏差：实测某年报 940 块经增强后合并为 934 块，
+    离线因此把 6 处线上已经接好的跨页断句报成了「句子截断」——凭空造出缺陷。
+    """
+    # 样本目录下的 middle.json；导入时保留了 MinerU 原始命名 "{stem}_middle.json"
+    matches = list(Path(content_list_path).parent.glob("*_middle.json"))
+    # 缺失时保持原样，并回报未增强，供调用方在报告中标注
+    if not matches:
+        return blocks, None
+    # 取第一个匹配项，一个样本目录只会有一份 middle.json
+    middle = matches[0]
+    # 从文件名还原 stem，生产的加载函数据此拼出待查找的文件名
+    stem = middle.name[: -len("_middle.json")]
+    # 复刻生产的双栏页识别
+    two_column_pages = _detect_two_column_text_pages(blocks)
+    # 复刻生产的卡片信息图页识别
+    card_grid_pages = _detect_card_grid_pages(blocks)
+    # 调用生产的增强逻辑，stem 由文件名还原以便它定位到 middle.json
+    try:
+        # 执行增强；该函数就地修改 blocks 并返回三类修复计数
+        counts = _enrich_mineru_from_middle_json(
+            blocks,  # 待增强的块列表，函数内部就地修改
+            middle.parent,  # 产物所在目录
+            stem,  # 文件名主干，用于拼出 "{stem}_middle.json"
+            stem,  # sanitize 后的主干，离线场景与原始主干一致
+            logging.getLogger("chunk-lab.enrich"),  # 日志器
+            two_column_pages,  # 双栏页集合
+            card_grid_pages,  # 卡片页集合
+        )
+    except Exception as e:
+        # 增强失败不应中断评估，但必须回报，避免把降级结果当成正常结果
+        logging.warning(f"[chunk-lab] middle.json 增强失败，将使用未增强产物：{e}")
+        return blocks, None
+    # 返回增强后的块与修复计数
+    return blocks, {"two_column": counts[0], "card": counts[1], "continuation": counts[2]}
+
+
 def build_doc(filename):
     """构造 ES 文档公共字段，与 naive.py 中生产路径的构造方式保持一致。"""
     # docnm_kwd 存原始文件名，切分器会用它判断文档类型（如 DOCX 目录治理只对 .docx 生效）
@@ -113,6 +159,8 @@ def run_offline_chunking(
     """
     # 读取缓存的 MinerU 块，这一步替代了耗时数分钟的真实解析
     blocks = load_content_list(content_list_path)
+    # 复刻生产的 middle.json 增强，缺了它跨页断句会被误报成切分缺陷
+    blocks, _enrich_counts = enrich_blocks(blocks, content_list_path)
     # 构造解析器实例：无参构造不触发任何网络请求，仅提供位置标签与截图方法
     parser = MinerUParser()
     # 把块挂到解析器上，与生产中 parse_pdf/parse_file 解析完成后的状态一致
