@@ -15,10 +15,8 @@ import json  # 导入 json 读写快照
 import subprocess  # 导入 subprocess 读取 ragflow 的 git 版本信息
 from datetime import datetime  # 导入 datetime 生成轮次标识与时间戳
 
-from .paths import BASELINE_DIR, LAB_ROOT, RAGFLOW_ROOT  # 导入目录常量
+from .paths import BASELINE_DIR, RAGFLOW_ROOT, RUNS_DIR  # 导入目录常量
 
-# 运行历史目录：每轮一个 JSON 文件
-RUNS_DIR = LAB_ROOT / "runs"
 # 轻量索引文件：只存每轮摘要，避免为渲染列表而读取全部大文件
 INDEX_FILE = RUNS_DIR / "index.json"
 # 基线指针文件：记录当前作为对比基准的轮次

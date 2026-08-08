@@ -10,6 +10,34 @@ RagFlow MinerU 切分逻辑的离线实验室。用于持续发现切分缺陷�
 - 本目录与它们平级，物理上不在任何一方的工作树内。在 `ragflow/` 下执行 `git status` / `git add -A` **看不到本目录的存在**——不是靠 ignore 规则挡住，是根本不在范围内。
 - 本实验室对 ragflow **只读**：导入它的切分代码、读取 MinerU 产物，不写入任何文件，不安装任何依赖，`pyproject.toml` 与 `uv.lock` 保持零改动。
 
+## 数据目录（在仓库之外）
+
+语料、历史轮次、报告、MinerU 解析产物全部存在**仓库之外**，默认 `~/MinerU/chunk_lab/`：
+
+```
+~/MinerU/chunk_lab/
+├── corpus/       语料（含 middle.json，实测 20MB+）
+├── runs/         历史轮次快照与切分文本
+├── reports/      Markdown 评估报告
+├── baselines/    基准指针
+├── mineru_out/   MinerU 解析产物（与生产的输出目录分开）
+└── uploads/      上传的原始文件
+```
+
+这样安排是因为这些数据体积大且持续增长，留在仓库内会让 IDE 索引整个项目时明显变慢。仓库内只保留代码（约 500KB）。
+
+修改位置，两种方式，优先级从高到低：
+
+```bash
+# 1. 环境变量，适合临时切换
+CHUNKLAB_DATA_DIR=/path/to/data ./run.sh eval
+
+# 2. 本机配置文件（复制 labconfig.example.json 为 labconfig.json，不入版本管理）
+{ "data_dir": "~/MinerU/chunk_lab" }
+```
+
+当前生效的路径在 Web 控制台的「切分配置」弹层顶部可以看到。
+
 ## 运行：Web 控制台（推荐）
 
 ```bash

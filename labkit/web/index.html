@@ -210,6 +210,15 @@ input[type="text"], input[type="number"], select {
   border: 1px solid var(--line-strong); border-radius: 4px;
 }
 
+/* 数据目录展示：数据在仓库之外，需明确标出位置 */
+.paths-box { margin-bottom: 1.6rem; }
+.path-row {
+  display: flex; gap: 0.8rem; align-items: baseline;
+  font-size: 0.82rem; padding: 0.2rem 0;
+}
+.path-row span { color: var(--muted); min-width: 5rem; }
+.path-row code { font-size: 0.78rem; word-break: break-all; }
+
 /* ========== 切分配置表单 ========== */
 .cfg-group { margin-bottom: 1.6rem; }
 .cfg-group-title {
@@ -693,6 +702,7 @@ tr.is-baseline { background: var(--accent-soft); }
       <button class="btn" id="configClose">关闭</button>
     </div>
     <div class="modal-body">
+      <div id="configPaths" class="paths-box"></div>
       <div id="configFields"></div>
     </div>
   </div>
@@ -796,6 +806,7 @@ function toast(msg) {
 let configFields = [];   // 字段定义
 let configDefaults = {}; // 服务端给的默认值
 let parserConfig = {};   // 当前生效的配置
+let configPaths = {};    // 数据目录位置，数据已移出仓库故需在界面上标明
 
 // 加载字段定义与默认值
 async function loadConfig() {
@@ -803,6 +814,7 @@ async function loadConfig() {
     const d = await api("/api/config");
     configFields = d.fields || [];
     configDefaults = d.defaults || {};
+    configPaths = d.paths || {};
     // 首次加载时用默认值作为当前配置
     if (!Object.keys(parserConfig).length) parserConfig = { ...configDefaults };
     renderConfigSummary();
@@ -841,6 +853,17 @@ function renderConfigForm() {
       ${fields.map(renderConfigField).join("")}
     </div>`;
   };
+  // 数据落地位置：数据目录在仓库之外，不标出来使用者会找不到文件
+  $("configPaths").innerHTML = configPaths.data_root ? `
+    <div class="cfg-group-title">数据目录</div>
+    <div class="path-row"><span>数据根目录</span><code>${esc(configPaths.data_root)}</code></div>
+    <div class="path-row"><span>语料</span><code>${esc(configPaths.corpus)}</code></div>
+    <div class="path-row"><span>解析产物</span><code>${esc(configPaths.mineru_out)}</code></div>
+    <p class="hint" style="margin:0.5rem 0 0">
+      数据刻意放在仓库之外，避免大量产物拖慢 IDE 索引。
+      可通过 ${esc(configPaths.configurable_by || "")} 修改。
+    </p>` : "";
+
   $("configFields").innerHTML =
     group("chunk", "切分参数", "影响切分结果，调整后重新运行评估即可看到差异。") +
     group("parse", "解析参数（只读）",

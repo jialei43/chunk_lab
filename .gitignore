@@ -1,10 +1,14 @@
-# 每轮运行的报告属于易变产物，不纳入版本管理（基线快照在 baselines/ 另行管理）
-reports/
+# 本机配置：数据目录等因机器而异的设置，不纳入版本管理
+labconfig.json
 
-# 语料中的原始文件与 MinerU 产物体积大，默认不入库；case.yaml 等描述文件显式放行
-corpus/**
-!corpus/**/case.yaml
-!corpus/.gitkeep
+# 数据目录已统一移到仓库之外（默认 ~/MinerU/chunk_lab），仓库内只保留代码。
+# 以下规则用于兼容把数据目录配置回仓库内的情况，正常不会命中。
+corpus/
+runs/
+reports/
+baselines/
+mineru_out/
+uploads/
 
 # Python 运行期产物
 __pycache__/
@@ -15,13 +19,3 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
-
-# 历史轮次：完整快照含 findings 明细，体积大不入库；
-# 但轻量索引保留版本管理，指标趋势因此可长期追溯
-runs/*.json
-!runs/index.json
-
-# MinerU 解析产物与上传文件：体积大且可重新生成，不入库。
-# 该目录与生产的 MinerU 输出目录彻底分开，避免实验解析污染生产产物。
-mineru_out/
-uploads/

@@ -4,6 +4,8 @@
 避免把 ragflow 的绝对路径散落到各处，将来搬迁只需要改这一个文件。
 """
 
+import json  # 导入 json 读取本机配置文件
+import os  # 导入 os 读取环境变量
 import sys  # 导入 sys 以便把 ragflow 源码根目录插入模块搜索路径
 from pathlib import Path  # 导入 Path 做跨平台路径拼接，避免手写字符串分隔符
 
@@ -13,14 +15,72 @@ LAB_ROOT = Path(__file__).resolve().parent.parent
 # ragflow 后端仓库根目录：与 chunk-lab 平级，是被测代码所在地（本实验室只读它，不写它）
 RAGFLOW_ROOT = LAB_ROOT.parent / "ragflow"
 
-# 语料目录：每个样本一个子目录，存放原始文件与 MinerU 缓存产物
-CORPUS_DIR = LAB_ROOT / "corpus"
+# 本机配置文件：记录数据目录等因机器而异的设置，不纳入版本管理
+CONFIG_FILE = LAB_ROOT / "labconfig.json"
 
-# 回归基线目录：存放历次快照，纳入 chunk-lab 自己的版本管理以便追溯指标变化
-BASELINE_DIR = LAB_ROOT / "baselines"
+# 数据根目录的默认位置。
+# 刻意放在仓库之外：语料含大量 middle.json（实测 20MB+），加上解析产物与
+# 历史快照，留在仓库内会让 IDE 索引整个项目时明显变慢。仓库内只保留代码。
+DEFAULT_DATA_ROOT = Path.home() / "MinerU" / "chunk_lab"
 
-# 报告目录：每轮运行的输出，属于易变产物，由 .gitignore 排除
-REPORT_DIR = LAB_ROOT / "reports"
+
+def load_config():
+    """读取本机配置文件，缺失或损坏时返回空配置。"""
+    # 配置文件不存在属正常情况，使用默认值即可
+    if not CONFIG_FILE.is_file():
+        return {}
+    # 配置损坏不应让整个工具不可用，降级为默认配置
+    try:
+        # 读取并解析
+        with CONFIG_FILE.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        # 仅接受字典结构
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        # 解析失败按空配置处理
+        return {}
+
+
+def resolve_data_root():
+    """解析数据根目录。
+
+    优先级：环境变量 > 本机配置文件 > 默认位置。
+    与 ragflow 解析 MinerU 配置的优先级一致，便于理解与临时覆盖。
+    """
+    # 环境变量优先，便于临时切换而不改文件
+    env = os.environ.get("CHUNKLAB_DATA_DIR")
+    # 非空时展开 ~ 后采用
+    if env:
+        return Path(env).expanduser().resolve()
+    # 其次读本机配置文件
+    configured = load_config().get("data_dir")
+    # 配置了才采用
+    if configured:
+        return Path(configured).expanduser().resolve()
+    # 最后回落到默认位置
+    return DEFAULT_DATA_ROOT
+
+
+# 数据根目录：语料、历史轮次、报告、解析产物全部放在这里，与代码分离
+DATA_ROOT = resolve_data_root()
+
+# 语料目录：每个样本一个子目录，存放 MinerU 产物与样本描述
+CORPUS_DIR = DATA_ROOT / "corpus"
+
+# 回归基线目录：存放指向某一轮的基准指针
+BASELINE_DIR = DATA_ROOT / "baselines"
+
+# 报告目录：每轮运行的 Markdown 评估报告
+REPORT_DIR = DATA_ROOT / "reports"
+
+# 历史轮次目录：每轮的完整快照与切分文本
+RUNS_DIR = DATA_ROOT / "runs"
+
+# MinerU 解析产物目录，与生产的 MinerU 输出目录分开
+MINERU_OUT = DATA_ROOT / "mineru_out"
+
+# 上传文件的暂存目录
+UPLOAD_DIR = DATA_ROOT / "uploads"
 
 
 def ensure_ragflow_importable():

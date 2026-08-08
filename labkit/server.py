@@ -21,7 +21,7 @@ from .evaluate import (compare_reports, diff_chunk_texts, diff_findings, evaluat
 from .ingest import ingest_from_path  # 导入按路径导入语料的能力
 from .offline import DEFAULT_PARSER_CONFIG, build_parser_config  # 导入切分配置默认值与合并逻辑
 from .parsing import UPLOAD_DIR, get_task, list_tasks, start_parse  # 导入解析任务管理
-from .paths import REPORT_DIR  # 导入报告目录常量
+from .paths import CORPUS_DIR, DATA_ROOT, MINERU_OUT, REPORT_DIR  # 导入目录常量
 from .report import build_markdown  # 导入报告生成能力，用于按需重建缺失的报告
 
 # 前端静态文件目录
@@ -116,8 +116,18 @@ def api_config():
 
     字段定义集中在服务端，前端只负责渲染，避免两边各维护一份而逐渐走样。
     """
-    # 默认值取自与生产知识库对齐的配置
-    return jsonify({"fields": CONFIG_FIELDS, "defaults": dict(DEFAULT_PARSER_CONFIG)})
+    # 默认值取自与生产知识库对齐的配置；同时回报数据目录，
+    # 数据已移到仓库外，界面上不显示的话使用者会找不到东西存在哪
+    return jsonify({
+        "fields": CONFIG_FIELDS,  # 字段定义
+        "defaults": dict(DEFAULT_PARSER_CONFIG),  # 切分配置默认值
+        "paths": {  # 数据落地位置，便于直接定位文件
+            "data_root": str(DATA_ROOT),  # 数据根目录
+            "corpus": str(CORPUS_DIR),  # 语料目录
+            "mineru_out": str(MINERU_OUT),  # 解析产物目录
+            "configurable_by": "环境变量 CHUNKLAB_DATA_DIR，或 chunk-lab/labconfig.json 的 data_dir",
+        },
+    })
 
 
 @app.get("/api/corpus")

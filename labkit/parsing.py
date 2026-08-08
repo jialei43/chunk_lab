@@ -12,16 +12,11 @@ import threading  # 导入 threading 在后台执行耗时解析
 import uuid  # 导入 uuid 生成任务标识
 from datetime import datetime  # 导入 datetime 记录任务时间
 
-from .paths import LAB_ROOT, ensure_ragflow_importable  # 导入目录常量与路径注入
+from .paths import MINERU_OUT, UPLOAD_DIR, ensure_ragflow_importable  # 导入目录常量与路径注入
 
 ensure_ragflow_importable()  # 在导入 ragflow 模块之前注入源码路径
 
 from chunklab_bridge.parse import parse_document  # noqa: E402  导入解析桥接
-
-# MinerU 解析产物目录，与生产输出目录分开
-MINERU_OUT = LAB_ROOT / "mineru_out"
-# 上传文件的暂存目录
-UPLOAD_DIR = LAB_ROOT / "uploads"
 
 # 任务表：task_id -> 任务状态。仅存活于进程内，服务重启后清空，
 # 这对开发时工具足够，不值得为此引入持久化。
