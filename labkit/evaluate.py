@@ -12,7 +12,7 @@ from datetime import datetime  # 导入 datetime 给报告打时间戳
 import yaml  # 导入 yaml 读取语料描述文件
 
 from .detectors import DetectorConfig, run_detectors  # 导入检测配置与执行入口
-from .offline import normalize_chunks, run_offline_chunking  # 导入离线切分驱动
+from .offline import build_parser_config, normalize_chunks, run_offline_chunking  # 导入离线切分驱动
 from .paths import BASELINE_DIR, CORPUS_DIR, REPORT_DIR  # 导入语料、基线与报告目录常量
 
 
@@ -55,21 +55,18 @@ def load_cases(only=None):
     return cases
 
 
-def evaluate_case(case, cfg=None, children_delimiter=None):
+def evaluate_case(case, cfg=None, parser_config=None):
     """评估单个样本：离线切分 + 全部检测器，返回统计与命中。"""
     # 未指定配置时使用默认阈值
     cfg = cfg or DetectorConfig()
     # 执行离线切分；切分失败应作为样本级问题上报而不是中断整轮评估
     try:
-        # 按样本描述中的参数调用离线驱动
+        # 整份配置直接透传，字段的合并与派生由 offline.build_parser_config 统一处理
         chunks = run_offline_chunking(
             case["content_list"],  # 缓存产物路径
             case["filename"],  # 原始文件名，决定切分器的类型判断
-            parser_config={  # 本次评估的切分配置
-                "children_delimiter": children_delimiter,  # 父子分块分隔符
-                "chunk_token_num": cfg.chunk_token_num,  # token 预算与检测阈值保持同一来源
-            },
-            slide_mode=bool(case.get("slide_mode")),  # PPTX 按页切分开关
+            parser_config=parser_config,  # 完整 parser_config，与知识库配置同构
+            backend=case.get("backend", "hybrid_auto"),  # 产物 backend，决定 _read_output 的查找
         )
     except Exception as e:
         # 切分崩溃是最严重的问题，直接作为一条结果返回
@@ -109,7 +106,7 @@ def evaluate_case(case, cfg=None, children_delimiter=None):
     }
 
 
-def inspect_case(case, cfg=None, children_delimiter=None):
+def inspect_case(case, cfg=None, parser_config=None):
     """返回单个样本的完整切片内容，并把检测命中挂到对应切片上。
 
     这是「预览切分效果」的数据源：前端据此逐块展示正文，
@@ -123,11 +120,8 @@ def inspect_case(case, cfg=None, children_delimiter=None):
         chunks = run_offline_chunking(
             case["content_list"],  # 缓存产物路径
             case["filename"],  # 原始文件名
-            parser_config={  # 切分配置
-                "children_delimiter": children_delimiter,  # 父子分块分隔符
-                "chunk_token_num": cfg.chunk_token_num,  # token 预算
-            },
-            slide_mode=bool(case.get("slide_mode")),  # PPTX 按页切分开关
+            parser_config=parser_config,  # 完整 parser_config，与评估口径一致
+            backend=case.get("backend", "hybrid_auto"),  # 产物 backend
         )
     except Exception as e:
         # 以结构化错误返回，前端可直接展示
@@ -165,14 +159,16 @@ def inspect_case(case, cfg=None, children_delimiter=None):
     }
 
 
-def evaluate_all(only=None, cfg=None, children_delimiter=None):
+def evaluate_all(only=None, cfg=None, parser_config=None):
     """评估全部语料，返回完整报告字典。"""
     # 未指定配置时使用默认阈值
     cfg = cfg or DetectorConfig()
+    # 解析本轮实际生效的完整配置，供报告记录与可比性校验
+    effective_config = build_parser_config(parser_config)
     # 加载语料
     cases = load_cases(only=only)
     # 逐个评估
-    results = [evaluate_case(c, cfg=cfg, children_delimiter=children_delimiter) for c in cases]
+    results = [evaluate_case(c, cfg=cfg, parser_config=parser_config) for c in cases]
     # 把切分文本从逐样本结果中抽出，集中交给 save_run 压缩存储，
     # 避免它随报告 JSON 一起落盘把文件撑大
     chunks_by_case = {}
@@ -194,11 +190,9 @@ def evaluate_all(only=None, cfg=None, children_delimiter=None):
     # 组装报告
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),  # 生成时间，便于追溯
-        "config": {  # 本轮使用的参数，报告之间比较时必须确认参数一致
-            "chunk_token_num": cfg.chunk_token_num,  # token 预算
-            "children_delimiter": children_delimiter,  # 父子分块分隔符
-            "oversize_ratio": cfg.oversize_ratio,  # 超长判据倍数
-        },
+        # 本轮实际生效的完整切分配置。记录全量而非若干字段，
+        # 否则两轮对比时无法判断差异是否来自未记录的参数。
+        "config": {**effective_config, "oversize_ratio": cfg.oversize_ratio},
         "case_count": len(results),  # 评估的样本数
         "chunk_total": sum(r.get("chunk_count", 0) for r in results),  # 全语料 chunk 总数
         "finding_total": sum(r.get("finding_count", 0) for r in results),  # 全语料命中总数

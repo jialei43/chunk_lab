@@ -34,13 +34,21 @@ def cmd_eval(args):
     from .evaluate import compare_reports, evaluate_all, format_comparison, format_report
     # 启动时确保旧版基线已收编为历史轮次
     runs.migrate_legacy_baseline()
-    # 构造检测配置，允许命令行覆盖关键阈值
-    cfg = DetectorConfig(chunk_token_num=args.chunk_token_num)
+    # 组装完整切分配置，与 Web 端同一口径；未指定项由默认值补齐
+    from .offline import build_parser_config
+    overrides = {"chunk_token_num": args.chunk_token_num}
+    # 仅在显式指定时覆盖，避免空值冲掉默认
+    if args.children_delimiter:
+        overrides["children_delimiter"] = args.children_delimiter
+        overrides["enable_children"] = True
+    config = build_parser_config(overrides)
+    # 检测阈值与切分预算同源
+    cfg = DetectorConfig(chunk_token_num=int(config.get("chunk_token_num") or 512))
     # 执行评估
     report = evaluate_all(
         only=args.case,  # 指定样本时只评估这些
         cfg=cfg,  # 检测阈值
-        children_delimiter=args.children_delimiter,  # 父子分块分隔符
+        parser_config=config,  # 完整切分配置
     )
     # 语料为空时明确提示，避免使用者误以为是零缺陷
     if report["case_count"] == 0:
@@ -105,9 +113,11 @@ def cmd_baseline(args):
         print(f"基准已指向：{args.run_id}")
         return 0
     # 未指定则跑一轮新的
-    cfg = DetectorConfig(chunk_token_num=args.chunk_token_num)
+    from .offline import build_parser_config
+    config = build_parser_config({"chunk_token_num": args.chunk_token_num})
+    cfg = DetectorConfig(chunk_token_num=int(config.get("chunk_token_num") or 512))
     # 全量评估
-    report = evaluate_all(cfg=cfg, children_delimiter=args.children_delimiter)
+    report = evaluate_all(cfg=cfg, parser_config=config)
     # 语料为空时不允许建立基准，否则后续对比毫无意义
     if report["case_count"] == 0:
         print("语料库为空，请先执行：./run.sh ingest")
@@ -197,8 +207,14 @@ def cmd_inspect(args):
         print("可选样本：" + ", ".join(all_ids))
         return 1
     # 按指定参数切分，保证与报告口径一致
-    cfg = DetectorConfig(chunk_token_num=args.chunk_token_num)
-    data = inspect_case(cases[0], cfg=cfg, children_delimiter=args.children_delimiter)
+    from .offline import build_parser_config
+    overrides = {"chunk_token_num": args.chunk_token_num}
+    if args.children_delimiter:
+        overrides["children_delimiter"] = args.children_delimiter
+        overrides["enable_children"] = True
+    config = build_parser_config(overrides)
+    cfg = DetectorConfig(chunk_token_num=int(config.get("chunk_token_num") or 512))
+    data = inspect_case(cases[0], cfg=cfg, parser_config=config)
     # 切分失败时直接报出
     if data.get("error"):
         print(f"切分失败：{data['error']}")

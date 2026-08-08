@@ -18,16 +18,26 @@ ensure_ragflow_importable()  # 在导入任何 ragflow 模块之前把仓库根�
 
 from chunklab_bridge.bridge import chunk_from_corpus  # noqa: E402  导入桥接层，它负责调用生产切分入口
 
-# 切分配置的默认值，须与生产知识库的实际配置一致，否则切分粒度与线上不同。
-# children_delimiter 留空：已向使用者确认生产知识库未启用父子分块。
-# 前端默认值虽为 "\n"（use-default-parser-values.ts），但那只是新建知识库时的
-# 表单预设，实际知识库以其保存的 parser_config 为准，不能拿前端默认值当生产配置。
+# 切分配置默认值，逐项对齐生产知识库配置页。
+# 字段名取自 ragflow 的权威清单 api/utils/kb_runtime_config.py，
+# 默认值取自使用者提供的实际知识库配置截图，而非前端表单预设——
+# 表单预设只是新建知识库时的初值，与既有知识库的实际配置未必相同。
 DEFAULT_PARSER_CONFIG = {
-    "chunk_token_num": 512,  # 单个 chunk 的目标 token 上限
-    "delimiter": "\n!?。；！？",  # 段落分隔符
-    "children_delimiter": "",  # 父子分块分隔符；空串表示不启用父子分块
+    "chunk_token_num": 512,  # 建议文本块大小
+    "delimiter": "\n",  # 文本分段标识符；生产实际为 \n，非 "\n!?。；！？"
+    "enable_children": False,  # 子块用于检索；关闭时不启用父子分块
+    "children_delimiter": "\n",  # 子分隔符；仅 enable_children 为真时生效
+    "toc_extraction": False,  # 目录增强；依赖对话模型，离线不生效
+    "image_table_context_window": 0,  # 图像与表格上下文窗口
+    "overlapped_percent": 0,  # 重叠百分比
+    "html4excel": False,  # Excel 转 HTML
     "layout_recognize": "mineru",  # 声明走 MinerU 路径
 }
+
+# 解析阶段参数：这些值在生成缓存产物时就已固化，离线重放改它们不会有任何效果。
+# 列出来是为了在界面上明确标注，避免使用者误以为调了能生效。
+PARSE_TIME_KEYS = ("mineru_parse_method", "mineru_lang",
+                   "mineru_formula_enable", "mineru_table_enable")
 
 
 # 按文件扩展名推断切片方法。
@@ -58,6 +68,21 @@ def build_parser_config(overrides=None):
         # 仅在显式给值时覆盖
         if v is not None:
             config[k] = v
+
+    # 「子块用于检索」关闭时必须清空子分隔符。
+    # 生产的 naive.chunk 只看 children_delimiter，不看 enable_children，
+    # 开关关着却留着分隔符会误启用父子分块，切分粒度立刻与线上不同。
+    if not config.get("enable_children"):
+        config["children_delimiter"] = ""
+
+    # 图像与表格上下文窗口在界面上是一个值，后端按两个字段消费，
+    # 未显式指定时由该窗口值统一填充，保持与知识库配置一致
+    window = config.get("image_table_context_window")
+    # 仅在窗口值有效且两个细分字段未被单独指定时填充
+    if window is not None:
+        config.setdefault("image_context_size", window)
+        config.setdefault("table_context_size", window)
+
     # 返回合并结果
     return config
 

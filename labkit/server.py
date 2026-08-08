@@ -6,6 +6,7 @@
 服务仅监听本机回环地址，是开发时工具，不面向网络暴露。
 """
 
+import json  # 导入 json 解析查询串中的切分配置
 import threading  # 导入 threading 用一把锁串行化耗时评估，避免并发重复计算
 from pathlib import Path  # 导入 Path 定位前端静态文件
 
@@ -18,6 +19,7 @@ from .discover import scan_products  # 导入本机产物扫描
 from .evaluate import (compare_reports, diff_chunk_texts, diff_findings, evaluate_all,
                        inspect_case, load_cases)  # 导入评估相关能力
 from .ingest import ingest_from_path  # 导入按路径导入语料的能力
+from .offline import DEFAULT_PARSER_CONFIG, build_parser_config  # 导入切分配置默认值与合并逻辑
 from .paths import REPORT_DIR  # 导入报告目录常量
 from .report import build_markdown  # 导入报告生成能力，用于按需重建缺失的报告
 
@@ -33,14 +35,59 @@ _eval_lock = threading.Lock()
 _last_report = None
 
 
+# 可配置的切分参数定义，字段与生产知识库配置页逐项对应。
+# name 取自 ragflow 的权威清单 api/utils/kb_runtime_config.py；
+# stage 标明该参数作用于哪个阶段：chunk 影响切分（离线可调），
+# parse 属解析阶段（已固化在缓存产物中，离线调整不会生效）。
+CONFIG_FIELDS = [
+    {"name": "parser_id", "label": "解析方法", "type": "select", "stage": "chunk",
+     "options": ["naive", "book", "one", "paper", "manual", "laws", "presentation", "table", "picture"],
+     "hint": "对应知识库的「解析方法」，General 即 naive。PPTX 在生产中固定走 presentation。"},
+    {"name": "chunk_token_num", "label": "建议文本块大小", "type": "number", "stage": "chunk",
+     "min": 64, "max": 4096, "step": 64, "hint": "单个切片的目标 token 上限。"},
+    {"name": "delimiter", "label": "文本分段标识符", "type": "text", "stage": "chunk",
+     "hint": "生产默认为 \\n。"},
+    {"name": "enable_children", "label": "子块用于检索", "type": "bool", "stage": "chunk",
+     "hint": "开启后按子分隔符再切一层，切分粒度变化极大。"},
+    {"name": "children_delimiter", "label": "子分隔符", "type": "text", "stage": "chunk",
+     "hint": "仅在「子块用于检索」开启时生效。"},
+    {"name": "overlapped_percent", "label": "重叠百分比", "type": "number", "stage": "chunk",
+     "min": 0, "max": 100, "step": 5, "hint": "相邻切片的重叠比例。"},
+    {"name": "image_table_context_window", "label": "图像与表格上下文窗口", "type": "number",
+     "stage": "chunk", "min": 0, "max": 10, "step": 1,
+     "hint": "为图片与表格切片附带的上下文段落数。"},
+    {"name": "toc_extraction", "label": "目录增强", "type": "bool", "stage": "chunk",
+     "hint": "依赖对话模型，离线评估中不会生效。"},
+    {"name": "html4excel", "label": "Excel 转 HTML", "type": "bool", "stage": "chunk",
+     "hint": "影响 XLSX 的表格产出形态。"},
+    {"name": "mineru_parse_method", "label": "MinerU 解析方法", "type": "select", "stage": "parse",
+     "options": ["auto", "txt", "ocr"], "hint": "解析阶段参数，已固化在缓存产物中。"},
+    {"name": "mineru_lang", "label": "MinerU 语言", "type": "select", "stage": "parse",
+     "options": ["Chinese", "English"], "hint": "解析阶段参数，已固化在缓存产物中。"},
+    {"name": "mineru_formula_enable", "label": "公式识别", "type": "bool", "stage": "parse",
+     "hint": "解析阶段参数，已固化在缓存产物中。"},
+    {"name": "mineru_table_enable", "label": "表格识别", "type": "bool", "stage": "parse",
+     "hint": "解析阶段参数，已固化在缓存产物中。"},
+]
+
+
 def _config_from_request(payload):
-    """从请求体解析本轮运行参数，缺省时回落到默认值。"""
-    # token 预算，同时作为超长判据基准
-    chunk_token_num = int(payload.get("chunk_token_num") or 512)
-    # 父子分块分隔符，对切分粒度影响极大
-    children_delimiter = payload.get("children_delimiter") or ""
-    # 组装检测配置并返回
-    return DetectorConfig(chunk_token_num=chunk_token_num), children_delimiter
+    """从请求体解析本轮运行参数。
+
+    切分配置整份透传给生产入口，不再逐字段挑拣——挑拣必然遗漏，
+    此前就漏掉了 delimiter 与 overlapped_percent。
+    """
+    # 取出调用方给的切分配置；兼容旧版把参数平铺在请求体顶层的写法
+    raw = payload.get("parser_config")
+    # 未提供时从顶层收集已知字段，保证旧调用仍可工作
+    if raw is None:
+        raw = {f["name"]: payload[f["name"]] for f in CONFIG_FIELDS if f["name"] in payload}
+    # 合并默认值并处理字段派生（enable_children 关闭时清空子分隔符等）
+    config = build_parser_config(raw)
+    # 检测阈值与切分预算取同一来源，避免超长判据与实际预算脱节
+    cfg = DetectorConfig(chunk_token_num=int(config.get("chunk_token_num") or 512))
+    # 返回检测配置与切分配置
+    return cfg, config
 
 
 @app.get("/")
@@ -60,6 +107,16 @@ def index():
     resp.headers["Expires"] = "0"
     # 返回响应
     return resp
+
+
+@app.get("/api/config")
+def api_config():
+    """返回可配置字段的定义与默认值，供前端渲染配置面板。
+
+    字段定义集中在服务端，前端只负责渲染，避免两边各维护一份而逐渐走样。
+    """
+    # 默认值取自与生产知识库对齐的配置
+    return jsonify({"fields": CONFIG_FIELDS, "defaults": dict(DEFAULT_PARSER_CONFIG)})
 
 
 @app.get("/api/corpus")
@@ -142,8 +199,8 @@ def api_eval():
     global _last_report
     # 读取请求体
     payload = request.get_json(silent=True) or {}
-    # 解析运行参数
-    cfg, delimiter = _config_from_request(payload)
+    # 解析运行参数：检测阈值 + 完整切分配置
+    cfg, config = _config_from_request(payload)
     # 限定评估的样本，为空表示全量
     only = payload.get("cases") or None
     # 上一轮尚未结束时拒绝新请求，避免 CPU 争抢导致两轮都变慢
@@ -152,7 +209,7 @@ def api_eval():
     # 确保无论成败都释放锁
     try:
         # 执行评估
-        report = evaluate_all(only=only, cfg=cfg, children_delimiter=delimiter)
+        report = evaluate_all(only=only, cfg=cfg, parser_config=config)
         # 存为不可变的历史轮次快照，返回其标识
         run_id = runs.save_run(report, label=payload.get("label", ""))
         # 重新读出快照，使响应带上代码指纹等落盘时补充的字段
@@ -438,12 +495,20 @@ def api_case_detail(case_id):
     # 样本不存在时返回 404
     if not cases:
         return jsonify({"ok": False, "message": f"样本不存在：{case_id}"}), 404
-    # 从查询参数解析运行配置，使预览与评估口径一致
-    cfg = DetectorConfig(chunk_token_num=int(request.args.get("chunk_token_num") or 512))
-    # 父子分块分隔符
-    delimiter = request.args.get("children_delimiter") or ""
+    # 预览与评估必须同口径，否则切片序号对不上。
+    # 配置从查询串取，值为 JSON 以便传递布尔与数字而不丢类型。
+    raw = request.args.get("parser_config")
+    # 解析失败时回落到默认配置，不因参数格式问题让预览整体不可用
+    try:
+        overrides = json.loads(raw) if raw else {}
+    except ValueError:
+        overrides = {}
+    # 合并默认值
+    config = build_parser_config(overrides)
+    # 检测阈值与切分预算同源
+    cfg = DetectorConfig(chunk_token_num=int(config.get("chunk_token_num") or 512))
     # 生成预览数据
-    return jsonify(inspect_case(cases[0], cfg=cfg, children_delimiter=delimiter))
+    return jsonify(inspect_case(cases[0], cfg=cfg, parser_config=config))
 
 
 def serve(host="127.0.0.1", port=5099, debug=False):

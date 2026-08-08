@@ -210,6 +210,25 @@ input[type="text"], input[type="number"], select {
   border: 1px solid var(--line-strong); border-radius: 4px;
 }
 
+/* ========== 切分配置表单 ========== */
+.cfg-group { margin-bottom: 1.6rem; }
+.cfg-group-title {
+  font-size: 0.78rem; font-family: var(--mono); letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--muted); font-weight: 500;
+  padding-bottom: 0.4rem; border-bottom: 1px solid var(--line); margin-bottom: 0.8rem;
+}
+.cfg-row {
+  display: grid; grid-template-columns: 10rem 10rem 1fr; gap: 0.8rem;
+  align-items: center; padding: 0.45rem 0; font-size: 0.86rem;
+}
+/* 只读参数整体降透明度，明确表示调整不会生效 */
+.cfg-row.is-readonly { opacity: 0.55; }
+.cfg-label { color: var(--ink-soft); }
+.cfg-hint { font-size: 0.76rem; color: var(--muted); line-height: 1.5; }
+@media (max-width: 34rem) {
+  .cfg-row { grid-template-columns: 1fr; gap: 0.25rem; }
+}
+
 /* ========== 报告预览弹层 ========== */
 .modal {
   display: none; position: fixed; inset: 0; z-index: 40;
@@ -463,10 +482,8 @@ tr.is-baseline { background: var(--accent-soft); }
 <header>
   <div class="brand">chunk-lab<span>MinerU 切分实验室</span></div>
   <div class="spacer"></div>
-  <div class="controls">
-    <label>token 预算 <input type="number" id="tokenNum" value="512" min="64" max="4096" step="64" style="width:5rem"></label>
-    <label>子分隔符 <input type="text" id="childDeli" value="" placeholder="留空" style="width:5rem"></label>
-  </div>
+  <span class="hint" id="configSummary">配置加载中…</span>
+  <button class="btn" id="btnConfig">切分配置</button>
   <button class="btn" id="btnBaseline">设为基线</button>
   <button class="btn primary" id="btnEval">运行评估</button>
 </header>
@@ -595,6 +612,23 @@ tr.is-baseline { background: var(--accent-soft); }
   </div>
 </main>
 
+<!-- ========== 切分配置弹层：字段与知识库配置页逐项对应 ========== -->
+<div class="modal" id="configModal">
+  <div class="modal-box" style="width:min(42rem,100%)">
+    <div class="modal-head">
+      <strong>切分配置</strong>
+      <span class="hint">字段与 RAGFlow 知识库配置页一致</span>
+      <span class="spacer"></span>
+      <button class="btn" id="configReset">恢复默认</button>
+      <button class="btn primary" id="configApply">应用</button>
+      <button class="btn" id="configClose">关闭</button>
+    </div>
+    <div class="modal-body">
+      <div id="configFields"></div>
+    </div>
+  </div>
+</div>
+
 <!-- ========== 评估报告预览弹层 ========== -->
 <div class="modal" id="reportModal">
   <div class="modal-box">
@@ -687,12 +721,139 @@ function toast(msg) {
   toastTimer = setTimeout(() => el.classList.remove("show"), 2600);
 }
 
-// 读取顶栏的运行参数，评估与预览共用同一套口径
-function runParams() {
-  return {
-    chunk_token_num: parseInt($("tokenNum").value) || 512,
-    children_delimiter: $("childDeli").value || "",
+// ========== 切分配置 ==========
+// 字段定义由服务端给出（对齐 ragflow 的 kb_runtime_config 权威清单），
+// 前端只负责渲染与收集，避免两边各维护一份而逐渐走样。
+let configFields = [];   // 字段定义
+let configDefaults = {}; // 服务端给的默认值
+let parserConfig = {};   // 当前生效的配置
+
+// 加载字段定义与默认值
+async function loadConfig() {
+  try {
+    const d = await api("/api/config");
+    configFields = d.fields || [];
+    configDefaults = d.defaults || {};
+    // 首次加载时用默认值作为当前配置
+    if (!Object.keys(parserConfig).length) parserConfig = { ...configDefaults };
+    renderConfigSummary();
+  } catch (e) {
+    $("configSummary").textContent = "配置加载失败：" + e.message;
+  }
+}
+
+// 顶栏摘要：只显示最影响切分粒度的几项
+function renderConfigSummary() {
+  const c = parserConfig;
+  const parts = [
+    `${c.parser_id || "naive"}`,
+    `token ${c.chunk_token_num}`,
+    `分段 ${JSON.stringify(c.delimiter || "")}`,
+  ];
+  // 父子分块开启时必须显式标出，它对切分粒度影响最大
+  if (c.enable_children) parts.push(`子块 ${JSON.stringify(c.children_delimiter || "")}`);
+  // 重叠不为零时也标出
+  if (c.overlapped_percent) parts.push(`重叠 ${c.overlapped_percent}%`);
+  // 与默认值有差异时加标记，避免拿非默认配置跑出的结果当基准
+  const changed = configFields.some(f =>
+    f.name in configDefaults && String(parserConfig[f.name]) !== String(configDefaults[f.name]));
+  $("configSummary").innerHTML = esc(parts.join(" · ")) +
+    (changed ? ' <span class="pill medium">已改动</span>' : "");
+}
+
+// 渲染配置表单，按阶段分组
+function renderConfigForm() {
+  const group = (stage, title, note) => {
+    const fields = configFields.filter(f => f.stage === stage);
+    if (!fields.length) return "";
+    return `<div class="cfg-group">
+      <div class="cfg-group-title">${esc(title)}</div>
+      ${note ? `<p class="hint" style="margin:0 0 0.7rem">${esc(note)}</p>` : ""}
+      ${fields.map(renderConfigField).join("")}
+    </div>`;
   };
+  $("configFields").innerHTML =
+    group("chunk", "切分参数", "影响切分结果，调整后重新运行评估即可看到差异。") +
+    group("parse", "解析参数（只读）",
+          "这些参数在生成缓存产物时已经固化，离线重放调整它们不会有任何效果；列出来是为了与知识库配置对照。");
+
+  // 绑定输入事件
+  $("configFields").querySelectorAll("[data-field]").forEach(el => {
+    el.addEventListener("change", () => {
+      const name = el.dataset.field;
+      const f = configFields.find(x => x.name === name);
+      // 按字段类型取值
+      parserConfig[name] = f.type === "bool" ? el.checked
+        : f.type === "number" ? Number(el.value)
+        : el.value;
+      // 子块开关会影响子分隔符能否编辑，需重绘
+      if (name === "enable_children") renderConfigForm();
+    });
+  });
+}
+
+// 渲染单个字段
+function renderConfigField(f) {
+  const v = parserConfig[f.name] ?? configDefaults[f.name] ?? "";
+  // 解析阶段参数一律禁用，避免使用者误以为可调
+  const disabled = f.stage === "parse" ? "disabled" : "";
+  // 子分隔符仅在子块开关打开时可编辑
+  const dep = f.name === "children_delimiter" && !parserConfig.enable_children ? "disabled" : "";
+  let input;
+  if (f.type === "bool") {
+    input = `<input type="checkbox" data-field="${esc(f.name)}" ${v ? "checked" : ""} ${disabled}>`;
+  } else if (f.type === "select") {
+    input = `<select data-field="${esc(f.name)}" ${disabled}>${
+      (f.options || []).map(o => `<option ${String(o) === String(v) ? "selected" : ""}>${esc(o)}</option>`).join("")
+    }</select>`;
+  } else if (f.type === "number") {
+    input = `<input type="number" data-field="${esc(f.name)}" value="${esc(v)}"
+      min="${f.min ?? 0}" max="${f.max ?? 9999}" step="${f.step ?? 1}" ${disabled} style="width:7rem">`;
+  } else {
+    // 文本字段把换行显示成字面 \n，否则不可见也无法输入
+    input = `<input type="text" data-field="${esc(f.name)}" value="${esc(String(v).replace(/\n/g, "\\n"))}"
+      ${disabled} ${dep} style="width:9rem">`;
+  }
+  return `<div class="cfg-row ${disabled ? "is-readonly" : ""}">
+    <label class="cfg-label">${esc(f.label)}</label>
+    <div class="cfg-input">${input}</div>
+    <div class="cfg-hint">${esc(f.hint || "")}</div>
+  </div>`;
+}
+
+// 打开配置弹层
+$("btnConfig").addEventListener("click", () => {
+  renderConfigForm();
+  $("configModal").style.display = "flex";
+});
+// 关闭
+$("configClose").addEventListener("click", () => { $("configModal").style.display = "none"; });
+$("configModal").addEventListener("click", (e) => {
+  if (e.target === $("configModal")) $("configModal").style.display = "none";
+});
+// 恢复默认
+$("configReset").addEventListener("click", () => {
+  parserConfig = { ...configDefaults };
+  renderConfigForm();
+  renderConfigSummary();
+  toast("已恢复为与生产知识库一致的默认配置");
+});
+// 应用
+$("configApply").addEventListener("click", () => {
+  // 文本字段里的 \n 是字面量，提交前还原成真正的换行
+  const out = { ...parserConfig };
+  ["delimiter", "children_delimiter"].forEach(k => {
+    if (typeof out[k] === "string") out[k] = out[k].replace(/\\n/g, "\n");
+  });
+  parserConfig = out;
+  renderConfigSummary();
+  $("configModal").style.display = "none";
+  toast("配置已应用，点「运行评估」生效");
+});
+
+// 读取当前切分配置，评估与切片预览共用同一套口径
+function runParams() {
+  return { ...parserConfig };
 }
 
 // 统一的接口请求封装
@@ -738,7 +899,7 @@ $("btnEval").addEventListener("click", async () => {
     // 请求评估，并要求同时与基线对比
     const data = await api("/api/eval", {
       method: "POST",
-      body: JSON.stringify({ ...runParams(), compare: true }),
+      body: JSON.stringify({ parser_config: runParams(), compare: true }),
     });
     lastReport = data.report;
     // 先刷新历史列表，使新轮次出现在选择器中，随后渲染才能正确选中它
@@ -1526,14 +1687,9 @@ async function selectCase(caseId, target) {
       return;
     }
     // 有定位目标时优先用该条目所属轮次的参数，保证序号可比；否则用顶栏当前参数
-    const p = (target && target.config) ? {
-      chunk_token_num: target.config.chunk_token_num ?? runParams().chunk_token_num,
-      children_delimiter: target.config.children_delimiter ?? "",
-    } : runParams();
-    const q = new URLSearchParams({
-      chunk_token_num: p.chunk_token_num,
-      children_delimiter: p.children_delimiter,
-    });
+    // 有定位目标时用该条目所属轮次的配置，保证序号可比；否则用当前配置
+    const p = (target && target.config) ? target.config : runParams();
+    const q = new URLSearchParams({ parser_config: JSON.stringify(p) });
     const data = await api(`/api/case/${encodeURIComponent(caseId)}?${q}`);
     if (data.error) {
       $("chunkStream").innerHTML = `<div class="empty" style="color:var(--bad)">切分失败：${esc(data.error)}</div>`;
@@ -1575,10 +1731,12 @@ function renderChunkView() {
   // 否则用户会困惑于为什么切片数和顶栏参数对不上。
   const used = data._usedConfig || {};
   const cur = runParams();
+  // 关键切分参数任一不同都会改变序号，必须提示，否则会困惑于切片数对不上
+  const keys = ["chunk_token_num", "delimiter", "children_delimiter", "overlapped_percent"];
   const mismatch = used.chunk_token_num !== undefined &&
-    (used.chunk_token_num !== cur.chunk_token_num || (used.children_delimiter || "") !== cur.children_delimiter);
+    keys.some(k => String(used[k] ?? "") !== String(cur[k] ?? ""));
   const paramNote = mismatch
-    ? `<p class="hint" style="margin:0.7rem 0 0;color:var(--warn)">本次按该问题所属轮次的参数切分（token=${used.chunk_token_num}，子分隔符=${JSON.stringify(used.children_delimiter || "")}），与顶栏当前参数不同，以保证序号能对上。</p>`
+    ? `<p class="hint" style="margin:0.7rem 0 0;color:var(--warn)">本次按该问题所属轮次的配置切分（token=${esc(used.chunk_token_num)}，分段=${esc(JSON.stringify(used.delimiter || ""))}，子分隔符=${esc(JSON.stringify(used.children_delimiter || ""))}），与当前配置不同，以保证序号能对上。</p>`
     : "";
 
   // 数据来源选择：实时切分用的是当前代码，历史轮次是那一轮当时的真实结果。
@@ -1774,7 +1932,9 @@ $("btnImport").addEventListener("click", async () => {
   // 必须先取语料列表：渲染逐样本表时要靠它回填中文名，
   // 顺序反了旧基线就只剩英文 case_id。
   try { corpusCache = await api("/api/corpus"); } catch (e) { /* 预取失败不阻塞，进入对应页面时会重试 */ }
-  // 先加载历史轮次，它同时驱动查看选择器、对比选择器、趋势图与历史表格
+  // 先加载切分配置定义，顶栏摘要与配置面板都依赖它
+  await loadConfig();
+  // 再加载历史轮次，它同时驱动查看选择器、对比选择器、趋势图与历史表格
   await loadRuns();
   try {
     // 默认展示最新一轮。此前默认展示基准轮，而基准可能是很旧的一次，
