@@ -254,6 +254,17 @@ input[type="text"], input[type="number"], select {
 .dl-list details { margin-top: 0.3rem; }
 .dl-list summary { cursor: pointer; font-size: 0.78rem; }
 
+/* 任务日志：等宽、可滚动、限高，避免长日志把页面撑开 */
+.task-log { margin-top: 0.5rem; }
+.task-log summary { cursor: pointer; font-size: 0.78rem; }
+.log-box {
+  margin: 0.35rem 0 0; padding: 0.6rem 0.8rem;
+  background: var(--sunk); border: 1px solid var(--line); border-radius: 4px;
+  font-family: var(--mono); font-size: 0.72rem; line-height: 1.55;
+  max-height: 18rem; overflow: auto; white-space: pre-wrap; word-break: break-word;
+  color: var(--ink-soft);
+}
+
 /* ========== 解析任务 ========== */
 .parse-form .cfg-row { grid-template-columns: 8rem 14rem 1fr; }
 .task-row {
@@ -2655,8 +2666,11 @@ function renderParseTasks(tasks) {
       ${t.block_count ? `<div class="hint">原始块数 ${t.block_count}${t.case_id ? `　样本 ${esc(t.case_id)}` : ""}</div>` : ""}
       ${t.product ? `<div class="hint mono" style="font-size:0.72rem;word-break:break-all">产物 ${esc(t.product)}</div>` : ""}
       ${bar}
+      ${renderTaskLog(t)}
     </div>`;
   }).join("");
+  // 日志区跟随最新输出
+  keepLogScrolled();
   // 完成的任务可直接跳到切片预览查看效果
   $("parseTasks").querySelectorAll("[data-goto-case]").forEach(btn => {
     btn.addEventListener("click", async () => {
@@ -2664,6 +2678,28 @@ function renderParseTasks(tasks) {
       corpusCache = await api("/api/corpus");
       gotoChunks(btn.dataset.gotoCase, "");
     });
+  });
+}
+
+// 渲染任务日志。失败的任务默认展开——那正是需要看日志的时候。
+function renderTaskLog(t) {
+  const logs = t.logs || [];
+  if (!logs.length) return "";
+  // 运行中与失败时默认展开，完成的收起以免刷屏
+  const open = t.status === "failed" ? "open" : "";
+  return `<details class="task-log" ${open}>
+    <summary class="hint">解析日志（${logs.length} 行）</summary>
+    <pre class="log-box" data-task="${esc(t.task_id)}">${esc(logs.join("\n"))}</pre>
+  </details>`;
+}
+
+// 刷新后把展开的日志滚到底部，跟随最新输出
+function keepLogScrolled() {
+  document.querySelectorAll(".task-log[open] .log-box").forEach(el => {
+    // 已在底部附近才自动跟随，否则会打断正在往上翻查的人
+    if (el.scrollHeight - el.scrollTop - el.clientHeight < 60) {
+      el.scrollTop = el.scrollHeight;
+    }
   });
 }
 

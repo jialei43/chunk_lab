@@ -12,6 +12,7 @@
 """
 
 import queue  # 导入 queue 作为解析任务的串行队列
+import logging  # 导入 logging 捕获解析过程的日志
 import threading  # 导入 threading 在后台执行耗时解析
 import uuid  # 导入 uuid 生成任务标识
 from datetime import datetime  # 导入 datetime 记录任务时间
@@ -27,6 +28,11 @@ def mineru_defaults():
     """返回 MinerU 连接配置的当前默认值，供界面展示与表单预填。"""
     # 复用桥接层的解析逻辑，保证界面显示的与实际使用的一致
     return resolve_mineru_config()
+
+# 单个任务保留的日志条数上限。
+# 解析大文件时日志可能上千条，全留会持续占用内存；
+# 排查问题真正需要的是最近发生了什么，故只保留尾部。
+MAX_LOG_LINES = 400
 
 # 任务表：task_id -> 任务状态。仅存活于进程内，服务重启后清空，
 # 这对开发时工具足够，不值得为此引入持久化。
@@ -85,6 +91,49 @@ def _update(task_id, **fields):
             _tasks[task_id].update(fields)
 
 
+def append_log(task_id, line):
+    """向任务追加一行日志，超出上限时丢弃最早的。"""
+    # 加锁保证并发安全
+    with _lock:
+        # 任务不存在时忽略，可能已被清理
+        task = _tasks.get(task_id)
+        if task is None:
+            return
+        # 追加并截断，只保留最近的若干行
+        logs = task.setdefault("logs", [])
+        logs.append(line)
+        if len(logs) > MAX_LOG_LINES:
+            del logs[: len(logs) - MAX_LOG_LINES]
+
+
+class TaskLogHandler(logging.Handler):
+    """把解析过程中的日志收集到对应任务。
+
+    按线程名过滤：每个解析任务跑在自己的线程里，不这样区分的话，
+    并发解析时几个任务的日志会互相串到一起，反而更难排查。
+    """
+
+    def __init__(self, task_id, thread_name):
+        # 初始化基类
+        super().__init__()
+        # 归属的任务
+        self.task_id = task_id
+        # 只收集该线程产生的日志
+        self.thread_name = thread_name
+
+    def emit(self, record):
+        # 非本任务线程的日志直接忽略
+        if record.threadName != self.thread_name:
+            return
+        # 格式化失败不应反过来影响解析
+        try:
+            # 时间 + 级别 + 消息，与终端日志格式接近便于对照
+            ts = datetime.fromtimestamp(record.created).strftime("%H:%M:%S")
+            append_log(self.task_id, f"{ts} {record.levelname[:4]} {record.getMessage()[:500]}")
+        except Exception:
+            pass
+
+
 def get_task(task_id):
     """查询任务状态。"""
     # 加锁读取并返回副本，避免调用方拿到会被后台改动的引用
@@ -128,6 +177,7 @@ def start_parse(file_path, filename, backend="pipeline", parse_method="auto",
             "message": "排队中",  # 进度描述
             "started_at": datetime.now().isoformat(timespec="seconds"),  # 提交时间，列表按它倒序
             "output_dir": str(output_dir or MINERU_OUT),  # 本次产物落地目录
+            "logs": [],  # 解析过程日志，供界面展开查看
             "case_id": None,  # 入库后的样本标识
             "block_count": 0,  # 产物块数
             "error": None,  # 失败原因
@@ -135,6 +185,19 @@ def start_parse(file_path, filename, backend="pipeline", parse_method="auto",
 
     # 后台执行解析，避免阻塞 HTTP 请求
     def _run():
+        # 安装日志处理器，捕获本线程内 MinerU 解析产生的全部日志。
+        # 挂在 root 上是因为解析链路涉及多个模块的 logger，逐个挂容易遗漏。
+        handler = TaskLogHandler(task_id, threading.current_thread().name)
+        # INFO 级别足以覆盖解析进度与告警
+        handler.setLevel(logging.INFO)
+        root = logging.getLogger()
+        root.addHandler(handler)
+        # 还必须放宽 root 自身的级别：默认是 WARNING，INFO 消息在传到 handler
+        # 之前就被丢掉了，只给 handler 设级别没有任何作用。
+        # 队列是串行的，同一时刻只有一个任务，故不存在并发改级别的冲突。
+        old_level = root.level
+        if old_level > logging.INFO:
+            root.setLevel(logging.INFO)
         # 捕获全部异常，任何失败都要记录到任务状态而不是让线程静默死掉
         try:
             # 解析进度回调，写入任务状态供前端轮询
@@ -142,9 +205,10 @@ def start_parse(file_path, filename, backend="pipeline", parse_method="auto",
                 # 进度值可能为 None 或负数（负数表示失败），统一做保护
                 if isinstance(prog, (int, float)) and prog >= 0:
                     _update(task_id, progress=float(prog))
-                # 有描述时一并更新
+                # 有描述时一并更新，并记入日志形成完整时间线
                 if msg:
                     _update(task_id, message=str(msg)[:200])
+                    append_log(task_id, f"{datetime.now().strftime('%H:%M:%S')} 进度 {msg}")
 
             # 轮到本任务执行，从排队中切到运行中并记录真实开始时间
             _update(task_id, status="running", message="正在调用 MinerU 解析…",
