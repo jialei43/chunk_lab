@@ -592,6 +592,262 @@ def detect_markdown_residue(records, case_id, cfg):
     return findings
 
 
+def detect_table_split(records, case_id, cfg):
+    """检测表格被拆散：表头与表体落到不同切片。
+
+    只查 HTML 标签配对是不够的——标签闭合完好的表体切片照样可能没有表头，
+    单独看根本不知道每列是什么。生产有「长表按行组切分并重复表头」的机制，
+    因此没有表头的表格切片说明该机制没生效。
+    """
+    # 收集命中
+    findings = []
+    # 逐块检查，需要看前一块故用索引
+    for i, r in enumerate(records):
+        # 只检查表格块
+        if r.get("doc_type_kwd") != "table":
+            continue
+        # 取正文，表格块保留原始 HTML
+        content = r["content"]
+        # 无表格标签说明不是真正的表格切片，交由其它检测器处理
+        if not re.search(r"<table\b", content, re.IGNORECASE):
+            continue
+        # 含表头行即为完整表格，符合「重复表头」的预期
+        if re.search(r"<th\b", content, re.IGNORECASE):
+            continue
+        # 首行若是加粗或标题样式的单元格，也视为具备表头
+        first_row = re.search(r"<tr\b[^>]*>(.*?)</tr>", content, re.IGNORECASE | re.DOTALL)
+        # 首行含 <b>/<strong> 通常是以样式表达的表头
+        if first_row and re.search(r"<(b|strong)\b", first_row.group(1), re.IGNORECASE):
+            continue
+        # 取前一块判断是否为同一张表的延续
+        prev = records[i - 1] if i > 0 else None
+        # 前一块也是表格且面包屑相同，说明这是被拆开的表体
+        continued = (prev is not None and prev.get("doc_type_kwd") == "table"
+                     and (prev.get("important_kwd") or []) == (r.get("important_kwd") or []))
+        # 记录问题，区分「表体独立成块」与「整表无表头」
+        findings.append(Finding(
+            detector="table_split",  # 检测器名
+            severity="high",  # 无表头的表格切片单独检索时无法理解，危害大
+            case_id=case_id,
+            chunk_index=r["index"],
+            message="表格切片没有表头行" + ("，且紧接前一个表格切片，疑似表体被拆散" if continued else ""),
+            evidence=re.sub(r"\s+", " ", content)[:80] + "…",
+        ))
+    # 返回全部命中
+    return findings
+
+
+# 指代词表：出现在切片开头意味着该切片依赖前文才能读懂。
+# 只收对上下文依赖强的词，「这」「它」这类过于常见会造成大量误报。
+ANAPHORA_PATTERN = re.compile(
+    r"^[\s，。、]*("
+    r"如上所述|上述|前述|前文|如前|综上|由此可见|因此|据此|"
+    r"该(?:公司|部门|机构|系统|平台|项目|办法|规定|条款|方案|文件|章节|表|图)|"
+    r"其中|上表|上图|下表|下图|如下图所示|如上图所示|此外|另外"
+    r")")
+
+
+def detect_dangling_reference(records, case_id, cfg):
+    """检测指代缺失上下文：切片开头就用指代词，被指代的对象在前一个切片。
+
+    这类切片单独被检索出来时读者无从知道「该公司」「上述办法」指的是什么，
+    是 RAG 场景下最影响可用性的一类问题，但形式上完全合法，
+    只看首尾标点的检测器抓不到。
+    """
+    # 收集命中
+    findings = []
+    # 从第二块开始检查，首块没有前文可依赖
+    for i, r in enumerate(records):
+        # 只检查正文块
+        if not _is_text_chunk(r):
+            continue
+        # 文档首块即便有指代词也无前文可指，跳过
+        if i == 0:
+            continue
+        # 取剥离面包屑后的正文
+        body = strip_breadcrumb(r).lstrip()
+        # 空正文由标题孤块检测器负责
+        if not body:
+            continue
+        # 匹配开头的指代词
+        m = ANAPHORA_PATTERN.match(body)
+        # 未命中说明开头不依赖前文
+        if not m:
+            continue
+        # 指代对象若在本切片内已出现（如「该公司」后文又写了公司全名），则不算缺失。
+        # 用指代词后紧跟的名词做粗判：本块内该名词出现两次以上说明有先行词。
+        word = m.group(1)
+        # 取指代词中的核心名词部分用于计数
+        noun = word[1:] if word.startswith("该") else ""
+        # 本块内该名词出现多次说明上下文自足
+        if noun and body.count(noun) >= 2:
+            continue
+        # 记录问题，证据给出开头片段便于人工判断
+        findings.append(Finding(
+            detector="dangling_reference",  # 检测器名
+            severity="medium",  # 内容完整但脱离上下文，检索命中后可读性差
+            case_id=case_id,
+            chunk_index=r["index"],
+            message=f"切片以指代词「{word}」开头，被指代对象在前文，单独检索时读不懂",
+            evidence=body[:60] + "…",
+        ))
+    # 返回全部命中
+    return findings
+
+
+def detect_list_split(records, case_id, cfg):
+    """检测列表被拆散：编号项跨切片断开。
+
+    「一、二、三」被拆到两个切片时，任何一片单独看都是不完整的枚举。
+    """
+    # 收集命中
+    findings = []
+    # 从第二块开始，需要与前一块比较
+    for i in range(1, len(records)):
+        # 当前块与前一块
+        cur, prev = records[i], records[i - 1]
+        # 只比较正文块
+        if not _is_text_chunk(cur) or not _is_text_chunk(prev):
+            continue
+        # 面包屑不同说明跨章节，列表本就该断开
+        if (cur.get("important_kwd") or []) != (prev.get("important_kwd") or []):
+            continue
+        # 取两块正文
+        cur_body = strip_breadcrumb(cur).strip()
+        prev_body = strip_breadcrumb(prev).strip()
+        # 任一为空则无从判断
+        if not cur_body or not prev_body:
+            continue
+        # 当前块首行与前一块末行都是列表项，说明列表被从中间切开
+        cur_first = cur_body.split("\n")[0]
+        prev_last = prev_body.split("\n")[-1]
+        # 两侧都匹配列表模式才判定
+        if not (LIST_PREFIX_PATTERN.match(cur_first) and LIST_PREFIX_PATTERN.match(prev_last)):
+            continue
+        # 记录问题
+        findings.append(Finding(
+            detector="list_split",  # 检测器名
+            severity="medium",  # 枚举不完整影响理解，但每项本身可读
+            case_id=case_id,
+            chunk_index=cur["index"],
+            message=f"列表被拆散：前一块（#{prev['index']}）末尾与本块开头都是列表项",
+            evidence=prev_last[:34] + " ⏎▸ " + cur_first[:34],
+        ))
+    # 返回全部命中
+    return findings
+
+
+# 标题模式：只认强章节特征。
+# 早期版本把「\d+[、．.]」也当标题，结果把「7 月，胡文辉副局长应邀赴…」这类
+# 正文和「15．关于…的决定」这类列表项全部误判，故收紧为必须含章节量词。
+HEADING_TAIL_PATTERN = re.compile(
+    r"^(?:第[一二三四五六七八九十百\d]+[章节编篇部]|"
+    r"[一二三四五六七八九十]+[、．.]\s*[^\d]|"
+    r"\d+(?:\.\d+)+\s*\S)")
+# 标题不应含这些正文特征：出现即说明是句子而非标题
+HEADING_EXCLUDE = re.compile(r"[，,；;：:]|月，|年，|日，")
+
+
+def detect_heading_tail(records, case_id, cfg):
+    """检测标题与正文分离：标题落在切片末尾，正文在下一个切片。
+
+    heading_only 只覆盖「整块仅有标题」，覆盖不到这种更隐蔽的情况：
+    标题被吸附在上一块结尾，下一块的正文因此失去了标题上下文。
+    """
+    # 收集命中
+    findings = []
+    # 逐块检查，需要看下一块
+    for i, r in enumerate(records[:-1]):
+        # 只检查正文块
+        if not _is_text_chunk(r):
+            continue
+        # 取正文并按行拆分
+        body = strip_breadcrumb(r).rstrip()
+        # 单行块由 heading_only 负责，这里只看多行块的末行
+        lines = [ln for ln in body.split("\n") if ln.strip()]
+        # 少于两行无从判断「标题被吸附在末尾」
+        if len(lines) < 2:
+            continue
+        # 末行
+        tail = lines[-1].strip()
+        # 末行需短且形似标题
+        if len(tail) > 30 or not HEADING_TAIL_PATTERN.match(tail):
+            continue
+        # 末行以句末标点结束说明是正文句子而非标题
+        if tail[-1] in SENTENCE_ENDINGS:
+            continue
+        # 含逗号分号等句内标点的是正文，不是标题
+        if HEADING_EXCLUDE.search(tail):
+            continue
+        # 前一行也是同类编号项时，这是列表而非标题，交由 list_split 处理
+        if LIST_PREFIX_PATTERN.match(lines[-2].strip()):
+            continue
+        # 下一块必须有正文，才构成「标题与正文被分开」
+        nxt = records[i + 1]
+        # 下一块非正文块时不构成该问题
+        if not _is_text_chunk(nxt) or not strip_breadcrumb(nxt).strip():
+            continue
+        # 记录问题
+        findings.append(Finding(
+            detector="heading_tail",  # 检测器名
+            severity="medium",  # 下一块正文失去标题上下文，影响召回准确性
+            case_id=case_id,
+            chunk_index=r["index"],
+            message="标题落在切片末尾，其正文在下一切片，二者被分开",
+            evidence=tail + " ⏎▸ " + strip_breadcrumb(nxt).lstrip()[:30],
+        ))
+    # 返回全部命中
+    return findings
+
+
+# 图表与公式的引用标记，用于判断切片是否只有编号而无讲解
+CAPTION_PATTERN = re.compile(r"^\s*(图|表|式|附表|附图)\s*[\d一二三四五六七八九十]+[\s:：.、]?")
+# 公式标记：LaTeX 定界符或行内公式痕迹
+FORMULA_PATTERN = re.compile(r"\$\$|\\\[|\\begin\{(?:equation|align)")
+
+
+def detect_caption_orphan(records, case_id, cfg):
+    """检测图注/表注/公式脱离上下文：切片只有编号标题，没有讲解正文。
+
+    「图 3-1 系统架构图」单独成块时既检索不到，也解释不了任何东西；
+    公式同理，编号与讲解被分开后两边都失去意义。
+    """
+    # 收集命中
+    findings = []
+    # 逐块检查
+    for r in records:
+        # 只检查正文块，图片块由 empty_image 负责
+        if not _is_text_chunk(r):
+            continue
+        # 取剥离面包屑后的正文
+        body = strip_breadcrumb(r).strip()
+        # 空正文交由标题孤块检测器
+        if not body:
+            continue
+        # 目录条目形如「附表 1 xxx统计数据 81」，末尾的数字是页码而非内容。
+        # 它们属于目录页残留，应由噪声治理处理，误判成孤立图注会掩盖真正的问题。
+        if re.search(r"\s\d{1,4}$", body):
+            continue
+        # 判断是否为孤立的图表注：以编号开头且整体很短
+        is_caption = bool(CAPTION_PATTERN.match(body)) and len(body) <= 40
+        # 判断是否为孤立公式：含公式标记且几乎没有说明文字
+        is_formula = bool(FORMULA_PATTERN.search(body)) and len(re.sub(r"[^一-鿿]", "", body)) < 10
+        # 两者都不是则跳过
+        if not (is_caption or is_formula):
+            continue
+        # 记录问题，区分两种形态便于针对性修复
+        findings.append(Finding(
+            detector="caption_orphan",  # 检测器名
+            severity="medium",  # 单独成块无检索价值，且使被引用对象失去说明
+            case_id=case_id,
+            chunk_index=r["index"],
+            message="图表注或公式独立成块，缺少讲解正文" if is_caption else "公式独立成块，缺少讲解正文",
+            evidence=body[:60],
+        ))
+    # 返回全部命中
+    return findings
+
+
 # 全部检测器登记表：新增检测器只需在此追加，运行与报告端无需改动
 ALL_DETECTORS = [
     detect_truncated_sentence,  # 句子截断
@@ -606,6 +862,11 @@ ALL_DETECTORS = [
     detect_duplicate_content,  # 相邻块重复
     detect_spaced_characters,  # 汉字间异常空格
     detect_markdown_residue,  # Markdown 标记残留
+    detect_table_split,  # 表格被拆散（表头与表体分离）
+    detect_dangling_reference,  # 指代缺失上下文
+    detect_list_split,  # 列表／编号项被拆散
+    detect_heading_tail,  # 标题落在切片末尾，与其正文分离
+    detect_caption_orphan,  # 图表注与公式脱离上下文
 ]
 
 

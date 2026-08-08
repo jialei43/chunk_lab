@@ -11,6 +11,9 @@ from datetime import datetime  # 导入 datetime 给报告打时间戳
 
 import yaml  # 导入 yaml 读取语料描述文件
 
+import logging  # 导入 logging 记录归因等辅助步骤的降级情况
+
+from .attribution import attribute_findings, summarize_attribution  # 导入问题归因
 from .detectors import DetectorConfig, run_detectors  # 导入检测配置与执行入口
 from .offline import build_parser_config, normalize_chunks, run_offline_chunking  # 导入离线切分驱动
 from .paths import BASELINE_DIR, CORPUS_DIR, REPORT_DIR  # 导入语料、基线与报告目录常量
@@ -83,6 +86,19 @@ def evaluate_case(case, cfg=None, parser_config=None):
     records = normalize_chunks(chunks)
     # 跑全部检测器
     findings = run_detectors(records, case["case_id"], cfg)
+    # 补充归因：把问题对照原始块，判断该改切分代码还是解析/噪声治理。
+    # 不做这个区分，报告里每条都指向 mineru_chunker，而其中不少改那里修不好。
+    finding_dicts = [asdict(f) for f in findings]
+    # 归因失败不应影响评估主流程
+    try:
+        # 加载该样本的原始块（含 middle.json 增强），与切分时同一份输入
+        from chunklab_bridge.bridge import load_blocks
+        _parser, blocks = load_blocks(case["corpus_dir"], backend=case.get("backend", "hybrid_auto"))
+        # 逐条补充归因结论与修复建议
+        finding_dicts = attribute_findings(finding_dicts, blocks, records)
+    except Exception as e:
+        # 记录但不中断，报告中该字段缺失即可
+        logging.warning(f"[chunk-lab] 归因失败 case={case.get('case_id')}: {e}")
     # 按检测器名统计命中数，作为该样本的指标向量
     by_detector = {}
     # 逐条累计
@@ -102,7 +118,9 @@ def evaluate_case(case, cfg=None, parser_config=None):
         "block_count": case.get("block_count", 0),  # MinerU 原始块数，用于观察合并率
         "by_detector": by_detector,  # 各检测器命中数，回归比较的核心指标
         "finding_count": len(findings),  # 命中总数
-        "findings": [asdict(f) for f in findings],  # 命中明细，供人工复核
+        "findings": finding_dicts,  # 命中明细（含归因），供人工复核
+        # 归因汇总：直接回答「这些问题里有多少真该改切分代码」
+        "attribution": summarize_attribution(finding_dicts),
     }
 
 
