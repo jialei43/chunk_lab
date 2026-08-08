@@ -22,7 +22,9 @@ from .evaluate import (compare_reports, diff_chunk_texts, diff_findings, evaluat
                        inspect_case, load_cases)  # 导入评估相关能力
 from .ingest import ingest_from_path  # 导入按路径导入语料的能力
 from .offline import DEFAULT_PARSER_CONFIG, build_parser_config  # 导入切分配置默认值与合并逻辑
-from .parsing import get_task, list_tasks, mineru_defaults, start_parse  # 导入解析任务管理
+from .parsing import (get_task, list_tasks, mineru_defaults, start_cloud_parse,
+                      start_parse)  # 导入解析任务管理
+from .paths import resolve_mineru_token  # 导入云端凭据读取
 from .paths import CORPUS_DIR, DATA_ROOT, MINERU_OUT, REPORT_DIR, UPLOAD_DIR  # 导入目录常量
 from .report import build_markdown  # 导入报告生成能力，用于按需重建缺失的报告
 
@@ -139,6 +141,13 @@ def api_config():
             # 离线重放依赖这些产物，删了就没法重放
             "delete_output": False,
         },
+        # 云端解析可用性：界面据此决定是否显示云端入口，
+        # 未配置 token 时给出配置指引而不是让人点了才报错
+        "cloud": {
+            "available": bool(resolve_mineru_token()),
+            "backend": "vlm",
+            "hint": "在 chunk-lab/labconfig.json 填 mineru_token，或设置环境变量 MINERU_API_TOKEN",
+        },
     })
 
 
@@ -232,6 +241,53 @@ def api_parse():
         "count": len(tasks),  # 实际提交数量
         "skipped": skipped,  # 因同名被跳过的文件
     })
+
+
+@app.post("/api/parse/cloud")
+def api_parse_cloud():
+    """把已下载的文件批量送到 MinerU 官方云端解析。
+
+    本地一份 PDF 要十几分钟，云端快得多且一次可提交至多 200 个文件。
+    """
+    # 读取请求体
+    payload = request.get_json(silent=True) or {}
+    # 待解析文件
+    paths = payload.get("paths") or []
+    # 无选中项直接返回
+    if not paths:
+        return jsonify({"ok": False, "message": "没有选中文件"}), 400
+    # 未配置 token 时提前拦下，避免提交后才失败
+    if not resolve_mineru_token():
+        return jsonify({"ok": False,
+                        "message": "未配置 MinerU token。请在 chunk-lab/labconfig.json "
+                                   "填 mineru_token，或设置环境变量 MINERU_API_TOKEN"}), 400
+    # 限定在允许目录内，避免被诱导上传本机任意文件到云端
+    try:
+        allowed_dir = crawling.resolve_out_dir(payload.get("out_dir")).resolve()
+    except ValueError as e:
+        return jsonify({"ok": False, "message": str(e)}), 400
+    # 逐个校验
+    valid = []
+    for raw in paths:
+        p = Path(raw).resolve()
+        # 越界或不存在的一律跳过
+        try:
+            p.relative_to(allowed_dir)
+        except ValueError:
+            continue
+        if p.is_file():
+            valid.append(p)
+    # 没有合法文件时明确提示
+    if not valid:
+        return jsonify({"ok": False, "message": "选中的文件都不在允许的目录内"}), 400
+    # 官方单批上限 200，超出时提示分批
+    if len(valid) > 200:
+        return jsonify({"ok": False,
+                        "message": f"官方单批最多 200 个文件，当前 {len(valid)} 个，请分批提交"}), 400
+    # 启动云端批量解析
+    task_id = start_cloud_parse(valid, auto_import=True, note="来自网页抓取，云端解析")
+    # 返回任务标识
+    return jsonify({"ok": True, "task_id": task_id, "count": len(valid)})
 
 
 @app.get("/api/parse/<task_id>")

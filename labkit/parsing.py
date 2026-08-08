@@ -17,6 +17,8 @@ import threading  # 导入 threading 在后台执行耗时解析
 import uuid  # 导入 uuid 生成任务标识
 from datetime import datetime  # 导入 datetime 记录任务时间
 
+from pathlib import Path  # 导入 Path 处理文件路径
+
 from .paths import MINERU_OUT, UPLOAD_DIR, ensure_ragflow_importable  # 导入目录常量与路径注入
 
 ensure_ragflow_importable()  # 在导入 ragflow 模块之前注入源码路径
@@ -28,6 +30,11 @@ def mineru_defaults():
     """返回 MinerU 连接配置的当前默认值，供界面展示与表单预填。"""
     # 复用桥接层的解析逻辑，保证界面显示的与实际使用的一致
     return resolve_mineru_config()
+
+# 需要放宽级别以便捕获日志的 logger。
+# 刻意不用 root：实测放宽 root 会让 ragflow 的数据库查询、定时任务诊断等
+# 海量日志一并涌入，解析日志反而被淹没。这里只列解析链路涉及的模块。
+TARGET_LOGGERS = ("MinerUParser", "deepdoc", "rag", "chunklab_bridge", "labkit")
 
 # 单个任务保留的日志条数上限。
 # 解析大文件时日志可能上千条，全留会持续占用内存；
@@ -157,6 +164,123 @@ def list_tasks(limit=100):
     return items[:limit]
 
 
+def start_cloud_parse(file_paths, auto_import=True, kind="", note="", lang="ch"):
+    """启动一次云端批量解析。
+
+    与本地解析的关键差异是「批量」：官方精准解析 API 一次可提交至多 200 个文件，
+    共用一个批次轮询。逐个提交既慢又浪费配额，故这里整批走。
+    """
+    # 生成任务标识
+    task_id = uuid.uuid4().hex[:12]
+    # 统一为 Path 列表
+    paths = [Path(p) for p in file_paths]
+    # 初始化任务状态
+    with _lock:
+        _tasks[task_id] = {
+            "task_id": task_id,  # 任务标识
+            "filename": f"{len(paths)} 个文件（云端批量）",  # 展示名
+            "backend": "cloud/vlm",  # 标明走云端，便于与本地任务区分
+            "parse_method": "auto",  # 解析方法
+            "status": "queued",  # 运行状态
+            "progress": 0.0,  # 进度比例
+            "message": "排队中",  # 进度描述
+            "started_at": datetime.now().isoformat(timespec="seconds"),  # 提交时间
+            "output_dir": str(MINERU_OUT),  # 产物目录
+            "logs": [],  # 过程日志
+            "case_id": None,  # 入库后的样本标识
+            "block_count": 0,  # 产物块数
+            "error": None,  # 失败原因
+            "cloud_files": [],  # 逐文件云端状态
+        }
+
+    # 后台执行
+    def _run():
+        # 安装日志处理器，云端解析的过程日志同样需要可见
+        handler = TaskLogHandler(task_id, threading.current_thread().name)
+        handler.setLevel(logging.INFO)
+        root = logging.getLogger()
+        root.addHandler(handler)
+        # 只放宽解析链路相关 logger，不动 root——
+        # 放宽 root 会让 ragflow 的数据库查询与定时任务日志把解析日志淹没
+        old_levels = {}
+        for name in TARGET_LOGGERS:
+            lg = logging.getLogger(name)
+            old_levels[name] = lg.level
+            if lg.level == logging.NOTSET or lg.level > logging.INFO:
+                lg.setLevel(logging.INFO)
+        try:
+            # 延迟导入，未用云端时不承担其加载
+            from .mineru_cloud import parse_files
+            # 进入运行态
+            _update(task_id, status="running", message="正在上传到 MinerU 云端…")
+
+            # 逐文件状态回调，写入任务供界面展示
+            def on_progress(name, state, item):
+                # 汇总当前各文件状态
+                with _lock:
+                    task = _tasks.get(task_id)
+                    if task is None:
+                        return
+                    files = {f["name"]: f for f in task.get("cloud_files", [])}
+                    files[name] = {"name": name, "state": state,
+                                   "message": item.get("err_msg") or ""}
+                    task["cloud_files"] = list(files.values())
+                    # 已完成数用于粗略进度
+                    done = sum(1 for f in files.values() if f["state"] in ("done", "failed"))
+                    task["progress"] = done / max(1, len(paths))
+                    task["message"] = f"云端解析中：{done}/{len(paths)} 已结束"
+                append_log(task_id, f"{datetime.now().strftime('%H:%M:%S')} 云端 {name}: {state}")
+
+            # 执行批量解析
+            results = parse_files(paths, MINERU_OUT, on_progress=on_progress)
+            # 统计成功数
+            ok = [r for r in results if r.get("ok")]
+            _update(task_id, message=f"云端解析完成：成功 {len(ok)}/{len(results)}",
+                    progress=1.0)
+
+            # 按需入库
+            if auto_import:
+                from .ingest import ingest_from_path
+                case_ids = []
+                # 逐个入库；单个失败不影响其它
+                for r in ok:
+                    try:
+                        cid, status = ingest_from_path(
+                            r["product"], r["name"], kind=kind,
+                            note=note or "MinerU 云端解析（vlm）导入", overwrite=True)
+                        case_ids.append(cid)
+                        append_log(task_id, f"入库 {cid}：{status}")
+                    except Exception as e:
+                        append_log(task_id, f"入库失败 {r['name']}：{e}")
+                # 记录最后一个样本，便于界面提供跳转
+                if case_ids:
+                    _update(task_id, case_id=case_ids[-1])
+                _update(task_id, message=f"完成：解析 {len(ok)}/{len(results)}，入库 {len(case_ids)}")
+
+            # 失败项写进日志，便于逐个排查
+            for r in results:
+                if not r.get("ok"):
+                    append_log(task_id, f"失败 {r['name']}：{r.get('message')}")
+            # 标记完成
+            _update(task_id, status="done")
+        except Exception as e:
+            _update(task_id, status="failed", error=f"{type(e).__name__}: {e}",
+                    message="云端解析失败")
+            import traceback
+            for line in traceback.format_exc().splitlines()[-12:]:
+                append_log(task_id, line)
+        finally:
+            # 还原各 logger 级别并摘掉处理器
+            for name, lv in old_levels.items():
+                logging.getLogger(name).setLevel(lv)
+            root.removeHandler(handler)
+
+    # 云端解析不占本机资源，无需排入本地串行队列，直接起线程
+    threading.Thread(target=_run, daemon=True, name=f"cloud-{task_id}").start()
+    # 返回任务标识
+    return task_id
+
+
 def start_parse(file_path, filename, backend="pipeline", parse_method="auto",
                 auto_import=True, kind="", note="", mineru_api="", output_dir=""):
     """把一次解析放入队列，立即返回任务标识。
@@ -192,12 +316,17 @@ def start_parse(file_path, filename, backend="pipeline", parse_method="auto",
         handler.setLevel(logging.INFO)
         root = logging.getLogger()
         root.addHandler(handler)
-        # 还必须放宽 root 自身的级别：默认是 WARNING，INFO 消息在传到 handler
-        # 之前就被丢掉了，只给 handler 设级别没有任何作用。
-        # 队列是串行的，同一时刻只有一个任务，故不存在并发改级别的冲突。
-        old_level = root.level
-        if old_level > logging.INFO:
-            root.setLevel(logging.INFO)
+        # 还必须放宽级别：logger 默认级别高于 INFO 时，消息在传到 handler
+        # 之前就被丢弃，只给 handler 设级别没有任何作用。
+        #
+        # 但不能放宽 root——实测那会让 ragflow 内部的数据库查询、定时任务诊断
+        # 等海量日志一并涌入，把解析日志淹没。只提升解析链路相关的 logger。
+        old_levels = {}
+        for name in TARGET_LOGGERS:
+            lg = logging.getLogger(name)
+            old_levels[name] = lg.level
+            if lg.level == logging.NOTSET or lg.level > logging.INFO:
+                lg.setLevel(logging.INFO)
         # 捕获全部异常，任何失败都要记录到任务状态而不是让线程静默死掉
         try:
             # 解析进度回调，写入任务状态供前端轮询

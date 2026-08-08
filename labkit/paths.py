@@ -109,6 +109,32 @@ def resolve_scan_dirs():
 SCAN_DIRS = resolve_scan_dirs()
 
 
+def resolve_mineru_token():
+    """读取 MinerU 官方云端 API 的 token。
+
+    优先级：环境变量 > 本机配置文件。刻意不接受从请求体传入——
+    token 属于长期凭据，随请求传递会散落到日志与浏览器历史里。
+    """
+    # 环境变量优先，便于临时切换账号
+    env = os.environ.get("MINERU_API_TOKEN")
+    # 非空即采用
+    if env:
+        return env.strip()
+    # 其次读本机配置文件
+    return str(load_config().get("mineru_token") or "").strip()
+
+
+def resolve_cloud_backend():
+    """云端解析使用的 backend，默认 vlm-engine。"""
+    # 环境变量优先
+    env = os.environ.get("MINERU_CLOUD_BACKEND")
+    # 非空即采用
+    if env:
+        return env.strip()
+    # 其次读配置，最后回落默认
+    return str(load_config().get("mineru_cloud_backend") or "vlm-engine").strip()
+
+
 def ensure_ragflow_importable():
     """把 ragflow 源码根目录加入 sys.path，使 `rag.app.*` 等模块可被直接导入。
 

@@ -778,8 +778,11 @@ tr.is-baseline { background: var(--accent-soft); }
       <h3>已下载文件 <span class="run-tag" id="crawlDirTag"></span></h3>
       <div class="controls" style="margin-bottom:0.8rem">
         <button class="btn" id="btnCrawlSelectAll">全选</button>
-        <button class="btn primary" id="btnCrawlParse" disabled>解析选中并入库</button>
-        <span class="hint">解析会调用 MinerU，耗时较长，可在「解析文件」页查看进度。</span>
+        <button class="btn" id="btnCrawlParse" disabled>本地解析并入库</button>
+        <button class="btn primary" id="btnCrawlParseCloud" disabled>云端解析并入库</button>
+        <span class="hint" id="cloudHint">
+          本地解析一份 PDF 常需十几分钟且串行排队；云端一次可提交至多 200 个文件，用 vlm 模型。
+        </span>
       </div>
       <div id="crawlFiles"><div class="empty">暂无文件</div></div>
     </div>
@@ -1009,6 +1012,7 @@ let configFields = [];   // 字段定义
 let configDefaults = {}; // 服务端给的默认值
 let parserConfig = {};   // 当前生效的配置
 let configPaths = {};    // 数据目录位置，数据已移出仓库故需在界面上标明
+let configCloud = {};    // 云端解析可用性，未配 token 时禁用相关入口
 
 // 加载字段定义与默认值
 async function loadConfig() {
@@ -1017,6 +1021,11 @@ async function loadConfig() {
     configFields = d.fields || [];
     configDefaults = d.defaults || {};
     configPaths = d.paths || {};
+    configCloud = d.cloud || {};
+    // 未配置 token 时把原因显示出来，而不是让按钮无声地不可点
+    if (!configCloud.available && $("cloudHint")) {
+      $("cloudHint").innerHTML = `<span style="color:var(--warn)">云端解析不可用：${esc(configCloud.hint || "未配置 token")}</span>`;
+    }
     // 用实际生效的默认值预填解析表单，避免使用者不知道会连到哪、产物落在哪
     const m = d.mineru || {};
     if ($("parseApi") && !$("parseApi").value) $("parseApi").placeholder = m.mineru_api || "";
@@ -2509,7 +2518,11 @@ function renderCrawlFiles(files) {
 function updateCrawlParseBtn() {
   const n = $("crawlFiles").querySelectorAll(".crawl-cb:checked").length;
   $("btnCrawlParse").disabled = n === 0;
-  $("btnCrawlParse").textContent = n ? `解析选中并入库 (${n})` : "解析选中并入库";
+  $("btnCrawlParse").textContent = n ? `本地解析并入库 (${n})` : "本地解析并入库";
+  // 云端按钮还要看是否配了 token，未配置时禁用并说明原因
+  const cloudOk = (configCloud && configCloud.available);
+  $("btnCrawlParseCloud").disabled = n === 0 || !cloudOk;
+  $("btnCrawlParseCloud").textContent = n ? `云端解析并入库 (${n})` : "云端解析并入库";
 }
 
 // 全选
@@ -2518,6 +2531,26 @@ $("btnCrawlSelectAll").addEventListener("click", () => {
   const allChecked = boxes.length && boxes.every(b => b.checked);
   boxes.forEach(b => { b.checked = !allChecked; });
   updateCrawlParseBtn();
+});
+
+// 把选中文件送到云端批量解析
+$("btnCrawlParseCloud").addEventListener("click", async () => {
+  const paths = [...$("crawlFiles").querySelectorAll(".crawl-cb:checked")].map(b => b.dataset.path);
+  if (!paths.length) return;
+  const btn = $("btnCrawlParseCloud");
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spin"></span> 提交中…';
+  try {
+    const d = await api("/api/parse/cloud", {
+      method: "POST",
+      body: JSON.stringify({ paths, out_dir: $("crawlOutDir").value.trim() }),
+    });
+    toast(`已提交 ${d.count} 个文件到云端，可在「解析文件」页查看进度`);
+  } catch (e) {
+    toast("提交失败：" + e.message);
+  } finally {
+    updateCrawlParseBtn();
+  }
 });
 
 // 把选中文件送去解析
