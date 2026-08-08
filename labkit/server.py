@@ -15,7 +15,8 @@ from flask import Flask, Response, jsonify, request, send_from_directory  # 导�
 
 from . import annotations, crawling, guard, runs  # 导入标注、爬取、回归护栏与运行历史模块
 from .detect import detect  # 导入列表页结构自动识别
-from .preview import attach_source, attach_source_from_path, find_source, render_chunk  # 导入原文截图能力
+from .preview import (attach_source, attach_source_from_path, find_source,
+                      render_chunk, viewable_pdf)  # 导入原文截图与格式转换能力
 from .detectors import DetectorConfig  # 导入检测阈值配置
 from .discover import scan_products  # 导入本机产物扫描
 from .evaluate import (compare_reports, diff_chunk_texts, diff_findings, evaluate_all,
@@ -143,8 +144,13 @@ def api_preview_file(case_id):
     # 未关联时返回 404，前端据此提示去关联原文
     if src is None:
         return jsonify({"ok": False, "message": "该样本尚未关联原始文件"}), 404
+    # Office 文档转成 PDF 后才能在浏览器里渲染；首次转换要几秒，之后走缓存
+    pdf, why = viewable_pdf(src)
+    # 转换不可用时把原因带出去，界面据此提示而不是显示空白框
+    if pdf is None:
+        return jsonify({"ok": False, "message": why}), 415
     # 按目录与文件名下发；conditional 让浏览器可用 If-Modified-Since 复用缓存
-    return send_from_directory(src.parent, src.name, conditional=True)
+    return send_from_directory(pdf.parent, pdf.name, conditional=True)
 
 
 @app.get("/api/config")

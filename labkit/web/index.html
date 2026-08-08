@@ -2682,7 +2682,11 @@ const pdfView = (() => {
   }
 
   // 左栏整体收起：Office 文档没有 bbox、未关联原文时都用它
-  function hide(reason) {
+  function hide(reason, mine) {
+    // 已经切到别的样本时不要动界面。Office 转换要好几秒，慢的旧请求失败后
+    // 若照样收起左栏，会把新样本已经显示出来的原文覆盖掉——
+    // 表现为「明明是图片样本，却提示 Office 转换失败」
+    if (mine !== undefined && mine !== epoch) return;
     // 收起左栏，右侧切片独占整宽
     $("docSplit").classList.add("no-pdf");
     // 同时清掉旧文档
@@ -2694,6 +2698,13 @@ const pdfView = (() => {
     // 该页尚未建立或已在渲染中时跳过
     const rec = pages[n];
     if (!rec || rec.rendering || rec.scale === scale) return;
+    // 图片没有"渲染"这一步，内容已在 <img> 里，尺寸由 relayout 设好
+    if (rec.isImage) {
+      rec.canvas.style.width = `${rec.baseW * scale}px`;
+      rec.canvas.style.height = `${rec.baseH * scale}px`;
+      rec.scale = scale;
+      return;
+    }
     // 标记渲染中，避免滚动抖动导致重复触发
     rec.rendering = true;
     // 记下本次的加载序号，异步返回后据此判断是否已过期
@@ -2770,16 +2781,18 @@ const pdfView = (() => {
   async function load(caseId, filename) {
     // 每次加载递增序号，旧的异步渲染据此作废
     epoch += 1;
-    // 非 PDF 无法渲染：Office 文档的 MinerU 块本来也没有 bbox，
-    // 强行转 PDF 会大幅拖慢流程，此前已决定不做
-    if (!/\.pdf$/i.test(filename || "")) {
-      hide(`仅 PDF 支持原文对照，该样本是 ${esc((filename || "").split(".").pop() || "未知格式")}`);
-      return;
-    }
+    // 记下本次加载的序号，异步失败时据此判断是否已被新样本取代
+    const mine = epoch;
+    // 没有文件名就无从加载
+    if (!filename) { hide("该样本没有关联原文", mine); return; }
     // 展开左栏
     $("docSplit").classList.remove("no-pdf");
-    // 清掉上一份
-    reset("正在加载原文…");
+    // 按类型分派：图片浏览器原生就能显示，转 PDF 只会又糊又慢；
+    // 其余格式（含 Office，由服务端转 PDF）统一交给 pdf.js
+    const isImage = /\.(png|jpe?g|bmp|webp|gif|tiff?)$/i.test(filename);
+    const isOffice = !isImage && !/\.pdf$/i.test(filename);
+    // 清掉上一份。Office 首次要转 PDF，等待时间明显更长，文案要说清在等什么
+    reset(isOffice ? "正在转换 Office 原文（首次需要几秒）…" : "正在加载原文…");
     // 拉取失败时给出可操作的提示而不是空白
     try {
       // 原文由服务端按样本定位，前端只管拿
@@ -2787,9 +2800,19 @@ const pdfView = (() => {
       // 先探一次，未关联原文时能拿到明确的 404
       const head = await fetch(url, { method: "HEAD" });
       if (!head.ok) {
-        hide("该样本尚未关联原始文件，可在「语料库」里关联后再看对照");
+        // 415 是格式不支持或转换失败，服务端在响应体里写了原因；
+        // HEAD 拿不到响应体，故再发一次 GET 取详情
+        if (head.status === 415) {
+          const d = await fetch(url).then(r => r.json()).catch(() => ({}));
+          hide(d.message || "该格式的原文暂不支持预览", mine);
+        } else {
+          hide("该样本尚未关联原始文件，可在「语料库」里关联后再看对照", mine);
+        }
         return;
       }
+      // 图片：建一张"页"直接显示。与 PDF 共用同一套页结构，
+      // 缩放、定位高亮、框选标记因此全部复用，无需另写一份
+      if (isImage) { await loadImage(url, mine); return; }
       // 交给 pdf.js 加载
       const task = pdfjsLib.getDocument({ url });
       const d = await task.promise;
@@ -2838,8 +2861,52 @@ const pdfView = (() => {
       // 页码显示总页数
       $("pdfPageLabel").textContent = `共 ${doc.numPages} 页`;
     } catch (e) {
-      hide(`原文加载失败：${e.message}`);
+      hide(`原文加载失败：${e.message}`, mine);
     }
+  }
+
+  // 加载一张图片作为原文视图
+  async function loadImage(url, mine) {
+    // 等图片解码完才知道原始尺寸，缩放与坐标换算都依赖它
+    const img = new Image();
+    // 加载失败要如实回报，而不是留一个空白框
+    await new Promise((resolve, reject) => {
+      img.onload = resolve;
+      img.onerror = () => reject(new Error("图片加载失败"));
+      img.src = url;
+    });
+    // 解码期间切换了样本则丢弃，避免把旧图片画到新样本上
+    if (mine !== undefined && mine !== epoch) return;
+    // 容器清空后建唯一一页
+    const scroll = $("pdfScroll");
+    scroll.innerHTML = "";
+    const el = document.createElement("div");
+    el.className = "pdf-page";
+    el.dataset.page = "1";
+    // 覆盖层承载高亮框与框选，与 PDF 页结构保持一致
+    const layer = document.createElement("div");
+    layer.className = "pdf-layer";
+    // 图片本身按 CSS 尺寸缩放，浏览器的重采样质量足够
+    img.style.display = "block";
+    el.appendChild(img);
+    el.appendChild(layer);
+    scroll.appendChild(el);
+    // 图片自然尺寸即 100% 缩放下的尺寸；MinerU 给图片块的 bbox
+    // 用的就是这个像素坐标系，所以坐标换算与 PDF 完全一致
+    pages = [null, {
+      el, canvas: img, layer, scale: null, rendering: false,
+      baseW: img.naturalWidth, baseH: img.naturalHeight,
+      isImage: true,
+    }];
+    // 用一个最小对象冒充文档，让缩放、定位等共用逻辑无需再分支
+    doc = { numPages: 1, getPage: async () => ({
+      getViewport: ({ scale: sc }) => ({ width: img.naturalWidth * sc, height: img.naturalHeight * sc }),
+    }), destroy() {} };
+    // 初始缩放取适应宽度，与 PDF 的默认行为一致
+    scale = fitWidthScale(img.naturalWidth);
+    relayout();
+    // 页码栏说明这是单张图片
+    $("pdfPageLabel").textContent = "图片";
   }
 
   // 适应宽度对应的缩放：容器宽度减去内边距与滚动条余量
@@ -2878,13 +2945,29 @@ const pdfView = (() => {
   }
 
   // 定位到某个切片：滚动到首个位置所在页并高亮全部位置
-  function focus(positions) {
-    // 无文档或无坐标时不动
-    if (!doc || !positions || !positions.length) return false;
+  function focus(positions, pageFallback) {
+    // 无文档时不动
+    if (!doc) return false;
     // 记下待高亮的位置
-    boxes = positions.filter(p => p && p.length >= 5);
-    // 一个有效坐标都没有时不动
-    if (!boxes.length) return false;
+    boxes = (positions || []).filter(p => p && p.length >= 5 && p[2] > p[1] && p[4] > p[3]);
+    // 没有可用坐标时退回按页定位。Office 文档的块只有页码没有 bbox，
+    // 框不出具体区域，但翻到那一页仍然有用——不这么做就只能干瞪眼
+    if (!boxes.length) {
+      // 连页码都没有时确实无从定位
+      const pn = (pageFallback || [])[0];
+      if (!pn) return false;
+      // 该页不存在时同样放弃
+      const rec = pages[pn];
+      if (!rec) return false;
+      // 清掉上一次的高亮框，避免停留在别处误导
+      redrawBoxes();
+      // 确保该页已渲染并滚动过去
+      renderPage(pn);
+      $("pdfScroll").scrollTo({ top: Math.max(0, rec.el.offsetTop - 12), behavior: "smooth" });
+      // 页码提示里说明只能定位到页
+      $("pdfPageLabel").textContent = `第 ${pn} / ${doc.numPages} 页（仅页级定位）`;
+      return true;
+    }
     // 画框
     redrawBoxes();
     // 滚动到首个位置：让它出现在视口上方三分之一处，便于同时看到上下文
@@ -3359,7 +3442,8 @@ function focusChunkInPdf(idx, card) {
   $("chunkStream").querySelectorAll(".chunk.on").forEach(el => el.classList.remove("on"));
   card.classList.add("on");
   // 交给原文视图滚动定位；没有坐标的切片如实提示而不是静默无反应
-  if (!pdfView.focus(c.position_int || [])) {
+  // 没有 bbox 时用页码兜底：Office 文档的块只有页码，翻到那一页仍然有用
+  if (!pdfView.focus(c.position_int || [], c.page_num_int || [])) {
     toast("该切片没有坐标，无法在原文中定位");
   }
 }

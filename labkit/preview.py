@@ -6,14 +6,21 @@
 两个前置条件，缺一不可：
   - 样本要有**原始文件**。多数语料是从 MinerU 产物导入的，产物里不含原文，
     因此需要单独关联，界面上提供上传入口。
-  - 切片要有 **position_int**。Office 文档的块通常没有 bbox，只有页码，
+  - 切片要有 **position_int**。Office 文档的块没有 bbox，只有页码，
     这类样本只能定位到页、无法框出具体区域。
+
+Office 原文通过 LibreOffice 转成 PDF 后复用同一套视图，转换结果按源文件的
+修改时间缓存。
 """
 
 import base64  # 导入 base64 把图片编码进 JSON 响应
 import io  # 导入 io 在内存中保存图片
-import shutil  # 导入 shutil 复制关联的原始文件
+import shutil  # 导入 shutil 复制关联的原始文件、定位 LibreOffice
+import subprocess  # 导入 subprocess 调用 LibreOffice 转换 Office 文档
+import tempfile  # 导入 tempfile 承接 LibreOffice 的转换产物
+import threading  # 导入 threading 串行化 LibreOffice 调用
 from functools import lru_cache  # 导入 lru_cache 缓存整页渲染结果
+from pathlib import Path  # 导入 Path 处理转换产物路径
 
 from .paths import DATA_ROOT, ensure_ragflow_importable  # 导入目录常量与路径注入
 
@@ -25,9 +32,106 @@ SOURCE_DIR = DATA_ROOT / "sources"
 RENDER_SCALE = 2
 # 截图在命中区域四周留出的边距（页面坐标下的比例），便于看清上下文
 MARGIN_RATIO = 0.02
+# Office 文档转换后的 PDF 存放目录，与原文分开放，便于整体清理
+CONVERT_DIR = DATA_ROOT / "sources" / "converted"
+# 可转换的格式，与 LibreOffice 的能力一致
+CONVERTIBLE_SUFFIXES = {".docx", ".doc", ".pptx", ".ppt", ".xlsx", ".xls", ".odt", ".odp", ".ods", ".rtf"}
+# 浏览器能直接显示的图片格式。这些刻意不转 PDF——转一道既糊又慢，
+# 而且图片的 MinerU 块本来就带 bbox，直接显示才能做精确定位
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".gif", ".tif", ".tiff"}
+# 单次转换的超时。LibreOffice 偶尔会卡住，不设上限会让请求一直挂着
+CONVERT_TIMEOUT = 120
+# 转换互斥锁。LibreOffice 同一时刻只允许一个实例使用同一份用户配置，
+# 并发调用会让它直接崩溃（libc++abi: terminating）——实测快速切换样本必现。
+# 转换本身也是 CPU 密集的，串行执行没有损失
+_convert_lock = threading.Lock()
+
 # 整页图像的缓存页数。A4 在 144 DPI 下约 1191×1684 像素、单页约 6MB，
 # 12 页约 70MB——够覆盖切片列表一屏内的跨页范围，又不至于把内存吃光
 PAGE_CACHE_SIZE = 12
+
+
+def viewable_pdf(src):
+    """返回可供 pdf.js 渲染的 PDF 路径；Office 文档先转换。
+
+    Office 文档没法直接在浏览器里渲染，转成 PDF 是最省事的路子——转完就能
+    复用已有的整套原文视图（缩放、翻页、定位、截图），不必为每种格式再写
+    一遍渲染逻辑。
+
+    转换结果按源文件的修改时间缓存：LibreOffice 启动一次就要几秒，
+    每次预览都转会让打开 Office 样本变得难以忍受。源文件一变，缓存即失效。
+
+    返回 (路径, 说明)。转换不可用时路径为 None，说明里写清原因，
+    由界面如实提示而不是显示一个空白框。
+    """
+    # PDF 与图片都可直接下发，无需转换
+    if src.suffix.lower() == ".pdf" or src.suffix.lower() in IMAGE_SUFFIXES:
+        return src, ""
+    # 支持转换的格式，与 LibreOffice 的能力一致
+    if src.suffix.lower() not in CONVERTIBLE_SUFFIXES:
+        return None, f"暂不支持预览 {src.suffix or '未知格式'} 的原文"
+    # 缺少 LibreOffice 时如实告知安装方式，而不是留下一个无解的空白
+    exe = _soffice()
+    if exe is None:
+        return None, ("需要 LibreOffice 才能预览 Office 原文，"
+                      "可执行 brew install --cask libreoffice 安装")
+    # 转换结果按「文件名 + 源文件修改时间」命名，源文件一变即产生新文件
+    CONVERT_DIR.mkdir(parents=True, exist_ok=True)
+    # 用修改时间做版本，避免源文件更新后仍拿到旧转换结果
+    stamp = src.stat().st_mtime_ns
+    # 目标路径
+    dest = CONVERT_DIR / f"{src.stem}_{stamp}.pdf"
+    # 已转换过就直接用
+    if dest.is_file():
+        return dest, ""
+    # 转换到临时目录再改名：LibreOffice 只能指定输出目录、不能指定文件名，
+    # 直接输出到缓存目录会与「按时间戳命名」的约定冲突
+    with _convert_lock, tempfile.TemporaryDirectory() as tmp:
+        # 等锁期间别的请求可能已经转好了同一份，再查一次省下一次转换
+        if dest.is_file():
+            return dest, ""
+        # 执行转换；超时与失败都要转成可读信息，不能让界面拿到 500
+        try:
+            proc = subprocess.run(
+                [exe, "--headless", "--convert-to", "pdf", "--outdir", tmp, str(src)],
+                capture_output=True, text=True, timeout=CONVERT_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            return None, f"转换超时（超过 {CONVERT_TIMEOUT} 秒），该文档可能过大"
+        except OSError as e:
+            return None, f"调用 LibreOffice 失败：{e}"
+        # 找出转换产物：LibreOffice 按源文件名生成，扩展名换成 pdf
+        out = Path(tmp) / f"{src.stem}.pdf"
+        # 产物不存在说明转换失败，把 stderr 带出来便于排查
+        if not out.is_file():
+            detail = (proc.stderr or proc.stdout or "").strip()[:200]
+            return None, f"转换失败{('：' + detail) if detail else ''}"
+        # 移入缓存目录
+        shutil.move(str(out), str(dest))
+    # 顺带清掉同一文档的旧版本，避免源文件反复更新后堆积
+    for old in CONVERT_DIR.glob(f"{src.stem}_*.pdf"):
+        # 保留本次结果
+        if old != dest:
+            # 删除失败忽略，下次还会再试
+            try:
+                old.unlink()
+            except OSError:
+                pass
+    # 返回转换结果
+    return dest, ""
+
+
+def _soffice():
+    """定位 LibreOffice 可执行文件，找不到返回 None。"""
+    # 优先用 PATH 里的
+    exe = shutil.which("soffice") or shutil.which("libreoffice")
+    # 找到即用
+    if exe:
+        return exe
+    # macOS 上常见的应用内路径，装了 app 但没配 PATH 时也能用
+    mac = Path("/Applications/LibreOffice.app/Contents/MacOS/soffice")
+    # 存在即用
+    return str(mac) if mac.is_file() else None
 
 
 @lru_cache(maxsize=PAGE_CACHE_SIZE)
@@ -135,10 +239,11 @@ def render_chunk(case_id, filename, positions, page_hint=None):
     # 未关联原文时明确回报，由界面提示去关联
     if src is None:
         return {"ok": False, "reason": "no_source", "message": "该样本尚未关联原始文件"}
-    # 仅 PDF 可渲染页面；Office 文档需要先转 PDF，成本高且会拖慢流程，暂不支持
-    if src.suffix.lower() != ".pdf":
-        return {"ok": False, "reason": "not_pdf",
-                "message": f"仅支持 PDF 截图，该样本是 {src.suffix or '未知格式'}"}
+    # Office 文档先转 PDF 再裁图，转换结果有缓存，只有首次要等几秒
+    src, why = viewable_pdf(src)
+    # 转换不可用时如实回报原因，而不是返回一张空图
+    if src is None:
+        return {"ok": False, "reason": "not_pdf", "message": why}
     # 无坐标时无法框出区域
     if not positions:
         return {"ok": False, "reason": "no_position",
