@@ -56,7 +56,8 @@ def list_tasks(limit=20):
 def start_crawl(url, out_dir=None, exts="pdf,doc,docx,ppt,pptx,xls,xlsx",
                 next_text="", next_selector="", detail_selector="",
                 max_pages=10, max_files=0, delay=1.0,
-                obey_robots=True, dry_run=False, workers=4, link_pattern=""):
+                obey_robots=True, dry_run=False, workers=4, link_pattern="",
+                json_field="", url_prefix="", page_param=""):
     """启动一次后台抓取，立即返回任务标识。"""
     # 生成短任务标识
     task_id = uuid.uuid4().hex[:12]
@@ -107,6 +108,9 @@ def start_crawl(url, out_dir=None, exts="pdf,doc,docx,ppt,pptx,xls,xlsx",
                 dry_run=dry_run,  # 是否只演练
                 workers=workers,  # 并发下载数
                 link_pattern=link_pattern or None,  # 下载链接正则
+                json_field=json_field or None,  # JSON 中的文件路径字段
+                url_prefix=url_prefix,  # 相对路径的拼接前缀
+                page_param=page_param,  # JSON 接口翻页参数名
                 on_progress=on_progress,  # 进度回调
             )
             # 执行抓取

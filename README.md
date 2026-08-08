@@ -10,14 +10,25 @@ cd /Users/jialei/Desktop/RagFlow/chunk-lab
 ./serve.sh start     # 后台启动，然后打开 http://127.0.0.1:5099
 ./serve.sh stop      # 停止
 ./serve.sh restart   # 重启
-./serve.sh status    # 查看是否在运行
+./serve.sh status    # 查看是否在运行，以及实际的热加载模式
 ./serve.sh log       # 跟随查看日志（Ctrl+C 只退出查看，不影响服务）
 ```
 
 前台运行（Ctrl+C 停止）：`./run.sh serve`
 换端口：`CHUNKLAB_PORT=6000 ./serve.sh start`
 
-**改代码不必手动重启**：默认开启热加载，改 `labkit/` 下的 Python 或前端页面后约 2 秒自动生效。不需要时用 `./run.sh serve --no-reload` 关掉。
+**改代码不必手动重启**：默认开启热加载，改 `labkit/` 下的 Python 或前端页面后约 2 秒自动生效。
+
+热加载可在启动时指定，前台后台都支持：
+
+```bash
+./serve.sh start --no-reload        # 后台启动并关闭热加载
+./serve.sh restart --reload         # 显式开启（默认即开启）
+CHUNKLAB_RELOAD=0 ./serve.sh start  # 环境变量方式，可 export 长期生效
+./run.sh serve --no-reload          # 前台运行时同样可关
+```
+
+命令行参数优先于 `CHUNKLAB_RELOAD`。关掉热加载能省下重载器多起一个进程、模块重复加载十几秒的开销，代价是改代码后必须 `./serve.sh restart` 才生效。`./serve.sh status` 显示的模式从运行中进程的命令行反查，不受当前环境变量影响。
 
 常用命令：
 

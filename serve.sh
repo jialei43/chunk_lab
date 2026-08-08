@@ -12,6 +12,14 @@ set -u  # 未定义变量视为错误；不用 -e，各命令的失败要单独�
 LAB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 监听端口，与 labkit/cli.py 中 serve 子命令的默认值保持一致
 PORT="${CHUNKLAB_PORT:-5099}"
+# 热加载开关，默认开启，与前台 ./run.sh serve 的默认行为一致；
+# 关掉可省去重载器多起一个进程、模块重复加载十几秒的开销
+RELOAD="${CHUNKLAB_RELOAD:-1}"
+# 归一化环境变量取值：不归一化的话 CHUNKLAB_RELOAD=false 会被当成开启
+case "$(printf '%s' "$RELOAD" | tr '[:upper:]' '[:lower:]')" in
+  0|false|no|off) RELOAD=0 ;;  # 明确表示关闭的几种写法
+  *) RELOAD=1 ;;  # 其余一律视为开启
+esac
 # 运行时文件目录：跟随数据目录放在仓库之外，避免污染代码目录
 RUNTIME_DIR="${CHUNKLAB_DATA_DIR:-$HOME/MinerU/chunk_lab}/runtime"
 # PID 文件与日志文件
@@ -47,7 +55,13 @@ cmd_start() {
   mkdir -p "$RUNTIME_DIR"
   # 后台启动；cd 到脚本目录保证 run.sh 与相对路径可用
   cd "$LAB" || return 1
-  nohup "$LAB/run.sh" serve --port "$PORT" >"$LOG_FILE" 2>&1 &
+  # 关闭热加载时追加 --no-reload；变量为空则不产生多余参数，故此处有意不加引号
+  local reload_flag=""
+  # 仅在显式关闭时带上该参数，保持默认命令行与改动前一致
+  [ "$RELOAD" = "0" ] && reload_flag="--no-reload"
+  # 启动服务；日志重定向到固定文件，便于 log 子命令跟随查看
+  # shellcheck disable=SC2086
+  nohup "$LAB/run.sh" serve --port "$PORT" $reload_flag >"$LOG_FILE" 2>&1 &
   # 记录 PID
   echo $! >"$PID_FILE"
   # 等待端口就绪：加载 ragflow 模块较慢，固定 sleep 要么不够要么浪费
@@ -55,6 +69,12 @@ cmd_start() {
   for i in $(seq 1 40); do
     if is_running; then
       echo "已启动　http://127.0.0.1:${PORT}"
+      # 明确回报本次的热加载模式，避免改了代码不生效却不知道原因
+      if [ "$RELOAD" = "0" ]; then
+        echo "热加载：已关闭（改代码需 ${0} restart 才生效）"
+      else
+        echo "热加载：已开启，改 labkit/ 下的代码会自动重启"
+      fi
       echo "日志：$LOG_FILE"
       return 0
     fi
@@ -106,6 +126,21 @@ cmd_stop() {
 cmd_status() {
   if is_running; then
     echo "运行中　PID $(port_pid)　http://127.0.0.1:${PORT}"
+    # 模式从正在运行的进程命令行反查，而不是看本次调用的 CHUNKLAB_RELOAD——
+    # 后者只反映「现在打算怎么启」，不是「正在跑的是什么」
+    local cmdlines=""
+    local pid
+    # 逐个取进程命令行，热加载模式下父子两个进程都要看
+    for pid in $(port_pids); do
+      cmdlines="${cmdlines}$(ps -o command= -p "$pid" 2>/dev/null)
+"
+    done
+    # 命令行里带 --no-reload 即为关闭状态
+    if printf '%s' "$cmdlines" | grep -q -- "--no-reload"; then
+      echo "热加载：已关闭"
+    else
+      echo "热加载：已开启"
+    fi
     echo "日志：$LOG_FILE"
   else
     echo "未运行"
@@ -122,24 +157,54 @@ cmd_log() {
   tail -f "$LOG_FILE"
 }
 
+# 打印用法说明，未知子命令与未知选项都走这里
+usage() {
+  echo "用法：${0} {start|stop|restart|status|log} [--reload|--no-reload]"
+  echo
+  echo "  start    后台启动服务"
+  echo "  stop     停止服务（先 TERM，超时后 KILL，并确认端口释放）"
+  echo "  restart  重启"
+  echo "  status   查看是否在运行，以及实际的热加载模式"
+  echo "  log      跟随查看日志"
+  echo
+  echo "  --no-reload  关闭热加载：省去重载器多起一个进程、模块重复加载十几秒"
+  echo "  --reload     开启热加载（默认），改 labkit/ 下的代码自动重启"
+  echo
+  echo "前台运行（Ctrl+C 停止）：./run.sh serve [--no-reload]"
+  echo "换端口：CHUNKLAB_PORT=6000 ${0} start"
+  echo "长期关闭热加载：export CHUNKLAB_RELOAD=0（命令行参数优先级更高）"
+}
+
+# 取出子命令，剩余部分作为选项解析
+CMD="${1:-}"
+# 有参数时移除子命令，使 $@ 只剩选项
+[ $# -gt 0 ] && shift
+
+# 逐个解析选项；命令行显式指定时覆盖 CHUNKLAB_RELOAD
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --no-reload) RELOAD=0 ;;  # 显式关闭热加载
+    --reload)    RELOAD=1 ;;  # 显式开启热加载
+    *)
+      # 未知选项不静默忽略，否则拼错参数会以为已生效
+      echo "未知选项：$1" >&2
+      echo >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
+
 # 分发子命令
-case "${1:-}" in
+case "$CMD" in
   start)   cmd_start ;;
   stop)    cmd_stop ;;
   restart) cmd_stop && cmd_start ;;
   status)  cmd_status ;;
   log)     cmd_log ;;
   *)
-    echo "用法：${0} {start|stop|restart|status|log}"
-    echo
-    echo "  start    后台启动服务"
-    echo "  stop     停止服务（先 TERM，超时后 KILL，并确认端口释放）"
-    echo "  restart  重启"
-    echo "  status   查看是否在运行"
-    echo "  log      跟随查看日志"
-    echo
-    echo "前台运行（Ctrl+C 停止）：./run.sh serve"
-    echo "换端口：CHUNKLAB_PORT=6000 ${0} start"
+    usage
     exit 1
     ;;
 esac

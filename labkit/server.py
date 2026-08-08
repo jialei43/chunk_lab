@@ -369,6 +369,9 @@ def api_crawl():
         delay=float(payload.get("delay") or 1.0),  # 全局最小请求间隔
         workers=int(payload.get("workers") or 4),  # 并发下载数
         link_pattern=payload.get("link_pattern", ""),  # 下载链接正则
+        json_field=payload.get("json_field", ""),  # JSON 中的文件路径字段
+        url_prefix=payload.get("url_prefix", ""),  # 相对路径的拼接前缀
+        page_param=payload.get("page_param", ""),  # JSON 接口翻页参数名
         obey_robots=payload.get("obey_robots", True),  # 是否遵守 robots.txt
         dry_run=bool(payload.get("dry_run")),  # 是否只演练
     )

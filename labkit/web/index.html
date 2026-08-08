@@ -672,7 +672,26 @@ tr.is-baseline { background: var(--accent-soft); }
             只按扩展名会全部漏掉。填正则可补上，与扩展名取并集。
           </div>
         </div>
+        <div class="cfg-row" style="border-top:1px dashed var(--line);padding-top:0.6rem;margin-top:0.4rem">
+          <label class="cfg-label">JSON 字段</label>
+          <div class="cfg-input"><input type="text" id="crawlJsonField" placeholder="announcements.adjunctUrl" style="width:100%"></div>
+          <div class="cfg-hint">
+            <strong>列表页返回 JSON 而非 HTML 时填这里</strong>（很多站点的列表其实是接口）。
+            点号分隔的字段路径，指向文件地址所在的字段。填了它，下方的翻页与详情页选择器就不再使用。
+          </div>
+        </div>
         <div class="cfg-row">
+          <label class="cfg-label">地址前缀</label>
+          <div class="cfg-input"><input type="text" id="crawlUrlPrefix" placeholder="http://static.cninfo.com.cn" style="width:100%"></div>
+          <div class="cfg-hint">JSON 里多是相对路径，拼上前缀才能下载。</div>
+        </div>
+        <div class="cfg-row">
+          <label class="cfg-label">翻页参数名</label>
+          <div class="cfg-input"><input type="text" id="crawlPageParam" placeholder="pageNum" style="width:100%"></div>
+          <div class="cfg-hint">接口靠改参数翻页，没有「下一页」链接可循。</div>
+        </div>
+
+        <div class="cfg-row" style="border-top:1px dashed var(--line);padding-top:0.6rem;margin-top:0.4rem">
           <label class="cfg-label">翻页链接文字</label>
           <div class="cfg-input"><input type="text" id="crawlNextText" placeholder="下一页" style="width:100%"></div>
           <div class="cfg-hint">留空则只抓当前这一页。也可用下方选择器精确指定。</div>
@@ -2255,6 +2274,9 @@ function crawlParams(dryRun) {
     out_dir: $("crawlOutDir").value.trim(),
     exts: $("crawlExts").value.trim(),
     link_pattern: $("crawlLinkPattern").value.trim(),
+    json_field: $("crawlJsonField").value.trim(),
+    url_prefix: $("crawlUrlPrefix").value.trim(),
+    page_param: $("crawlPageParam").value.trim(),
     next_text: $("crawlNextText").value.trim(),
     next_selector: $("crawlNextSel").value.trim(),
     detail_selector: $("crawlDetailSel").value.trim(),

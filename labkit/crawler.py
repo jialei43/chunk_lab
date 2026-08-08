@@ -110,7 +110,8 @@ class Crawler:
     def __init__(self, start_url, out_dir, exts, delay=DEFAULT_DELAY, max_pages=10,
                  max_files=0, max_mb=DEFAULT_MAX_MB, next_text=None, next_selector=None,
                  detail_selector=None, same_host=True, obey_robots=True, dry_run=False,
-                 on_progress=None, workers=DEFAULT_WORKERS, link_pattern=None):
+                 on_progress=None, workers=DEFAULT_WORKERS, link_pattern=None,
+                 json_field=None, url_prefix="", page_param=""):
         # 起始列表页
         self.start_url = start_url
         # 下载目录
@@ -120,6 +121,14 @@ class Crawler:
         # 链接正则：不少站点的下载地址不带扩展名（如 /pdf/2401.12345、download?id=9），
         # 只看扩展名会把它们全部漏掉，故允许额外用正则指定
         self.link_pattern = re.compile(link_pattern) if link_pattern else None
+        # JSON 模式：相当多的列表页其实是接口，直接返回 JSON 而非 HTML。
+        # 用 HTML 解析器去处理只会一无所获（页面里连一个 <a> 都没有）。
+        # json_field 指明文件路径所在的字段，支持点号路径，如 "announcements.adjunctUrl"。
+        self.json_field = json_field
+        # JSON 里的路径通常是相对的，需要拼上前缀才是可下载的地址
+        self.url_prefix = url_prefix.rstrip("/") if url_prefix else ""
+        # 翻页参数名：JSON 接口一般用 ?pageNum=N 翻页，没有「下一页」链接可循
+        self.page_param = page_param
         # 请求间隔
         self.delay = delay
         # 最多翻多少页，防止无限翻页
@@ -380,6 +389,66 @@ class Crawler:
         # 返回链接列表
         return out
 
+    def extract_from_json(self, data, base_url):
+        """从 JSON 响应中提取文件地址。
+
+        json_field 用点号指明路径，如 "announcements.adjunctUrl" 表示
+        取 announcements 数组里每个元素的 adjunctUrl 字段。
+        """
+        # 未配置字段路径时无从提取
+        if not self.json_field:
+            return []
+        # 拆出路径各级
+        parts = [p for p in self.json_field.split(".") if p]
+        # 逐级下钻，遇到数组则对每个元素继续
+        def walk(node, keys):
+            # 路径走完，当前节点即为目标值
+            if not keys:
+                return [node] if isinstance(node, str) else []
+            # 当前层级的键
+            key, rest = keys[0], keys[1:]
+            # 数组则逐个元素继续下钻
+            if isinstance(node, list):
+                out = []
+                for item in node:
+                    out += walk(item, keys)
+                return out
+            # 字典则取该键继续
+            if isinstance(node, dict) and key in node:
+                return walk(node[key], rest)
+            # 路径不匹配
+            return []
+
+        # 收集原始路径
+        raws = walk(data, parts)
+        # 拼成绝对地址：优先用配置的前缀，否则相对当前请求地址
+        out = []
+        for raw in raws:
+            # 已是绝对地址则直接采用
+            if raw.startswith(("http://", "https://")):
+                out.append(raw)
+            elif self.url_prefix:
+                out.append(f"{self.url_prefix}/{raw.lstrip('/')}")
+            else:
+                out.append(urljoin(base_url, raw))
+        # 返回全部地址
+        return out
+
+    def next_json_page(self, url, page):
+        """构造 JSON 接口的下一页地址。
+
+        接口翻页靠改参数而非「下一页」链接，故按 page_param 递增。
+        """
+        # 未配置翻页参数时不翻页
+        if not self.page_param:
+            return None
+        # 已存在该参数则替换，否则追加
+        if re.search(rf"[?&]{re.escape(self.page_param)}=\d+", url):
+            return re.sub(rf"([?&]{re.escape(self.page_param)}=)\d+", rf"\g<1>{page + 1}", url)
+        # 追加参数，注意判断是否已有查询串
+        sep = "&" if "?" in url else "?"
+        return f"{url}{sep}{self.page_param}={page + 1}"
+
     def find_next_page(self, soup, base_url):
         """定位下一页链接。选择器优先，其次按链接文字匹配。"""
         # 选择器方式最可靠
@@ -559,6 +628,36 @@ class Crawler:
             log.error(f"列表页不可用：{url}")
             return None
         self.bump("pages")
+
+        # 配置了 JSON 字段就按接口处理：这类列表页返回的是数据而非 HTML，
+        # 用 HTML 解析器只会一无所获
+        if self.json_field:
+            # 解析失败时如实报告，便于区分「字段配错」与「返回的不是 JSON」
+            try:
+                data = resp.json()
+            except Exception as e:
+                log.error(f"响应不是合法 JSON（检查地址是否为接口）：{e}")
+                return None
+            # 从 JSON 中提取文件地址；同域限制对拼接后的静态域名不适用，故不过滤
+            targets = self.extract_from_json(data, url)
+            self.report(f"本页命中 {len(targets)} 个目标文件，并发 {self.workers} 下载")
+            # 有文件数上限时先截断
+            if self.max_files:
+                with self.state_lock:
+                    remain = max(0, self.max_files - self.stats["downloaded"])
+                targets = targets[:remain]
+            # 并发下载
+            with ThreadPoolExecutor(max_workers=self.workers) as pool:
+                futures = [pool.submit(self.download_guarded, u) for u in targets]
+                for fut in as_completed(futures):
+                    try:
+                        fut.result()
+                    except Exception as e:
+                        log.error(f"下载线程异常：{e}")
+            # 保存进度并返回下一页
+            self.save_progress()
+            return self.next_json_page(url, self.stats["pages"])
+
         # 用响应声明的编码解析，中文站点常见 GBK
         resp.encoding = resp.apparent_encoding or resp.encoding
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -665,6 +764,14 @@ def main(argv=None):
     p.add_argument("-o", "--out", default=None, help="下载目录，默认为数据目录下的 downloads/")
     # 目标扩展名
     p.add_argument("--ext", default=DEFAULT_EXTS, help=f"目标扩展名，逗号分隔，默认 {DEFAULT_EXTS}")
+    p.add_argument("--json-field",
+                   help="列表页返回 JSON 时，文件路径所在的字段，点号分隔，"
+                        "如 announcements.adjunctUrl")
+    p.add_argument("--url-prefix", default="",
+                   help="JSON 中的路径为相对地址时，拼接用的前缀，"
+                        "如 http://static.cninfo.com.cn")
+    p.add_argument("--page-param", default="",
+                   help="JSON 接口的翻页参数名，如 pageNum")
     p.add_argument("--link-pattern",
                    help="下载链接的正则，用于识别不带扩展名的地址，如 '/pdf/' 或 'download\\?id='")
     # 翻页规则
@@ -713,6 +820,9 @@ def main(argv=None):
         dry_run=args.dry_run,  # 是否只演练
         workers=args.workers,  # 并发下载数
         link_pattern=args.link_pattern,  # 下载链接正则
+        json_field=args.json_field,  # JSON 中的文件路径字段
+        url_prefix=args.url_prefix,  # 相对路径的拼接前缀
+        page_param=args.page_param,  # JSON 接口翻页参数名
     )
     return crawler.run()
 
