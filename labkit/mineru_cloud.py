@@ -50,15 +50,47 @@ def _headers(token):
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
 
+# 官方错误码到可操作提示的映射。
+# 原始报文形如 {"msgCode":"A0211","msg":"user token expired"}，
+# 直接抛给使用者看不出该做什么，故翻译成明确的下一步。
+ERROR_HINTS = {
+    "A0211": "token 已过期，请到 MinerU 控制台重新生成，并更新 labconfig.json 的 mineru_token",
+    "A0212": "token 无效，请检查是否复制完整（不要带引号或空格）",
+    "A0202": "token 缺失或格式不对，应为 Bearer 形式的密钥",
+}
+
+
+def _friendly(body):
+    """把官方错误报文翻译成可操作的提示。"""
+    # 取出错误码与原始消息
+    code = str(body.get("msgCode") or "")
+    raw = body.get("msg") or ""
+    # 已知错误码给出明确指引，并保留原始消息便于对照
+    hint = ERROR_HINTS.get(code)
+    if hint:
+        return f"{hint}（原始报错：{raw}）"
+    # 未知错误码原样返回
+    return raw or str(body)[:200]
+
+
 def _check(resp, what):
     """校验响应并取出 data 段。
 
     官方接口即便 HTTP 200，业务失败也会在 code 字段里体现，
     只看状态码会把失败当成功。
     """
-    # HTTP 层失败直接抛出，附带响应体便于定位
+    # HTTP 层失败：先尝试解析报文给出可操作提示，而不是甩一串原始 JSON
     if resp.status_code != 200:
-        raise MinerUCloudError(f"{what} 失败：HTTP {resp.status_code} {resp.text[:200]}")
+        # 报文可能不是 JSON，解析失败时退回原文
+        try:
+            body = resp.json()
+        except Exception:
+            body = {}
+        # 鉴权类错误单独标注，这是最常见的失败原因
+        if resp.status_code == 401:
+            raise MinerUCloudError(f"{what} 失败（鉴权未通过）：{_friendly(body)}")
+        raise MinerUCloudError(f"{what} 失败：HTTP {resp.status_code} "
+                               f"{_friendly(body) if body else resp.text[:200]}")
     # 解析响应体
     try:
         body = resp.json()
@@ -66,7 +98,7 @@ def _check(resp, what):
         raise MinerUCloudError(f"{what} 返回的不是 JSON：{resp.text[:200]}")
     # 业务码非 0 视为失败
     if body.get("code") not in (0, 200):
-        raise MinerUCloudError(f"{what} 失败：{body.get('msg') or body}")
+        raise MinerUCloudError(f"{what} 失败：{_friendly(body)}")
     # 返回数据段
     return body.get("data") or {}
 
