@@ -16,7 +16,10 @@ from .paths import DATA_ROOT  # 导入数据根目录
 # 下载目录，与语料、产物等一并放在数据目录下（仓库之外）
 DOWNLOAD_DIR = DATA_ROOT / "downloads"
 
-# 任务表：task_id -> 状态。仅存活于进程内，服务重启后清空
+# 任务表：task_id -> 状态。仅存活于进程内，服务重启后清空。
+# 注意热加载：改动 labkit/ 下的代码或前端页面会触发自动重启，
+# 正在运行的抓取线程随之终止、任务记录也一并丢失。
+# 开发时若发现任务凭空消失，多半是这个原因而非 bug。
 _tasks = {}
 # 保护任务表的锁
 _lock = threading.Lock()

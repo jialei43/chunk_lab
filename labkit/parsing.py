@@ -33,6 +33,47 @@ def mineru_defaults():
 _tasks = {}
 # 保护任务表的锁，后台线程与请求线程都会访问它
 _lock = threading.Lock()
+# 待执行任务队列，元素是无参可调用对象；不设上限，排队多少都收下
+_job_queue = queue.Queue()
+# 唯一的执行线程引用，懒启动后长期存活
+_worker = None
+# 保护执行线程创建的锁，避免批量提交时并发创建出多条线程
+_worker_lock = threading.Lock()
+
+
+def _worker_loop():
+    """队列消费循环：逐个取出任务执行，同一时刻只跑一个解析。"""
+    # 常驻循环，服务存活期间一直等待新任务
+    while True:
+        # 取出一个待执行任务，队列为空时阻塞等待
+        job = _job_queue.get()
+        # 任何异常都不能让消费线程退出，否则后续任务将永远排队
+        try:
+            # 执行任务，其内部已自行捕获并记录失败
+            job()
+        finally:
+            # 无论成败都标记该项完成，保持队列计数正确
+            _job_queue.task_done()
+
+
+def _ensure_worker():
+    """确保消费线程已启动，首次提交任务时懒启动。"""
+    # 用 global 声明以便重新赋值模块级引用
+    global _worker
+    # 加锁避免批量提交时并发创建多条线程
+    with _worker_lock:
+        # 线程不存在或已意外退出时重新创建
+        if _worker is None or not _worker.is_alive():
+            # 以守护线程运行，服务退出时不阻塞
+            _worker = threading.Thread(target=_worker_loop, daemon=True, name="parse-worker")
+            # 启动线程
+            _worker.start()
+
+
+def queue_size():
+    """返回当前排队中（含正在执行）的任务数，供界面提示批量进度。"""
+    # 直接取队列长度，近似值足够用于提示
+    return _job_queue.qsize()
 
 
 def _update(task_id, **fields):
@@ -52,8 +93,12 @@ def get_task(task_id):
         return dict(task) if task else None
 
 
-def list_tasks(limit=20):
-    """列出最近的解析任务，最新的在前。"""
+def list_tasks(limit=100):
+    """列出最近的解析任务，最新的在前。
+
+    上限取 100 而非 20：批量上传一次就可能提交几十个文件，
+    上限太低会让刚提交的任务看起来凭空消失。
+    """
     # 加锁读取全部任务
     with _lock:
         items = [dict(t) for t in _tasks.values()]
@@ -65,7 +110,10 @@ def list_tasks(limit=20):
 
 def start_parse(file_path, filename, backend="pipeline", parse_method="auto",
                 auto_import=True, kind="", note="", mineru_api="", output_dir=""):
-    """启动一次后台解析，立即返回任务标识。"""
+    """把一次解析放入队列，立即返回任务标识。
+
+    任务不会马上执行：前面还有排队任务时会等待，界面据 status 显示「排队中」。
+    """
     # 生成短任务标识，便于在界面与日志中引用
     task_id = uuid.uuid4().hex[:12]
     # 初始化任务状态
@@ -75,10 +123,10 @@ def start_parse(file_path, filename, backend="pipeline", parse_method="auto",
             "filename": filename,  # 原始文件名
             "backend": backend,  # 使用的 backend
             "parse_method": parse_method,  # 解析方法
-            "status": "running",  # 运行状态：running / done / failed
+            "status": "queued",  # 运行状态：queued / running / done / failed
             "progress": 0.0,  # 进度比例
-            "message": "已排队",  # 进度描述
-            "started_at": datetime.now().isoformat(timespec="seconds"),  # 开始时间
+            "message": "排队中",  # 进度描述
+            "started_at": datetime.now().isoformat(timespec="seconds"),  # 提交时间，列表按它倒序
             "output_dir": str(output_dir or MINERU_OUT),  # 本次产物落地目录
             "case_id": None,  # 入库后的样本标识
             "block_count": 0,  # 产物块数
@@ -98,8 +146,9 @@ def start_parse(file_path, filename, backend="pipeline", parse_method="auto",
                 if msg:
                     _update(task_id, message=str(msg)[:200])
 
-            # 标记进入解析阶段
-            _update(task_id, message="正在调用 MinerU 解析…")
+            # 轮到本任务执行，从排队中切到运行中并记录真实开始时间
+            _update(task_id, status="running", message="正在调用 MinerU 解析…",
+                    run_started_at=datetime.now().isoformat(timespec="seconds"))
             # 执行解析，产物落在实验室目录
             product = parse_document(
                 file_path,  # 待解析文件
@@ -139,11 +188,14 @@ def start_parse(file_path, filename, backend="pipeline", parse_method="auto",
             # 标记完成
             _update(task_id, status="done")
         except Exception as e:
-            # 失败时记录类型与信息，前端据此展示可读的原因
+            # 失败时记录类型与信息，前端据此展示可读的原因；
+            # 单个任务失败不影响队列中的其他任务，它们照常依次执行
             _update(task_id, status="failed", error=f"{type(e).__name__}: {e}",
                     message="解析失败")
 
-    # 以守护线程运行，服务退出时不阻塞
-    threading.Thread(target=_run, daemon=True, name=f"parse-{task_id}").start()
+    # 确保消费线程已就绪
+    _ensure_worker()
+    # 入队等待执行，而不是直接起线程并发跑
+    _job_queue.put(_run)
     # 返回任务标识供前端轮询
     return task_id
