@@ -78,6 +78,67 @@ def save_one(case_id, chunk_index, verdict, detector="", note="", excerpt=""):
     return data[str(chunk_index)]
 
 
+def save_many(case_id, items, verdict, detector="", note="", skip_annotated=True):
+    """整类批量写入标注，返回实际写入数与跳过数。
+
+    与循环调用 save_one 的区别是只读写一次文件：一条规则动辄命中上百个切片，
+    逐条走 save_one 会把整个标注文件反复全量重写上百遍。
+
+    skip_annotated 默认为真，即保留已有标注不动——批量是为了省去重复点击，
+    不该悄悄推翻此前逐条细看后给出的判断。
+    """
+    # 结论必须是已知取值，避免写入无法解释的数据
+    if verdict not in VERDICTS:
+        raise ValueError(f"未知的标注结论：{verdict}")
+    # 确保目录存在
+    ANNOTATION_DIR.mkdir(parents=True, exist_ok=True)
+    # 一次性读入已有标注，后续修改只在内存里进行
+    data = load(case_id)
+    # 全批共用一个时间戳，日后能看出这些条目出自同一次批量判定
+    now = datetime.now().isoformat(timespec="seconds")
+    # 实际写入条数
+    written = 0
+    # 因已有标注而跳过的条数
+    skipped = 0
+    # 逐条处理传入的切片
+    for item in items:
+        # 结构不对的条目直接忽略，不让一条脏数据毁掉整批
+        if not isinstance(item, dict) or "chunk_index" not in item:
+            continue
+        # 切片序号必须能转成整数，否则忽略该条
+        try:
+            idx = int(item["chunk_index"])
+        except (TypeError, ValueError):
+            continue
+        # JSON 的键必须是字符串
+        key = str(idx)
+        # 已标注过的保留原判断
+        if skip_annotated and key in data:
+            skipped += 1
+            continue
+        # 组装并写入本条标注
+        data[key] = {
+            "chunk_index": idx,  # 切片序号
+            "verdict": verdict,  # 整批统一的标注结论
+            # 检测器取调用方传入的当前筛选类型，而非切片命中的第一条规则：
+            # 一个切片可能同时命中多条规则，按命中顺序归类会把判定算到别的规则头上
+            "detector": detector,
+            "note": note,  # 整批共用的备注
+            "excerpt": (item.get("excerpt") or "")[:60],  # 正文摘要，用于日后校验序号是否错位
+            "at": now,  # 标注时间
+            "batch": True,  # 标记来自批量操作，便于与逐条细看后的判定区分
+        }
+        # 累加写入计数
+        written += 1
+    # 一条都没写入时不必碰文件
+    if written:
+        # 整批改完后一次性写回
+        with _path(case_id).open("w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+    # 返回写入与跳过的数量，供界面回报结果
+    return {"written": written, "skipped": skipped}
+
+
 def _region_path(case_id):
     """某个样本的区域标注文件路径。
 
@@ -143,6 +204,27 @@ def save_region(case_id, region, detector="", note=""):
     return item
 
 
+def all_regions():
+    """汇总全部样本在原文上圈出的异常区域。
+
+    区域标注按样本分文件存，但看的时候需要横着看：哪些文档被圈得最多、
+    人反复圈出的是同一类什么问题——这些都要跨样本才看得出来。
+    """
+    # 目录还没建立时直接返回空
+    if not ANNOTATION_DIR.is_dir():
+        return []
+    # 逐个区域文件收集
+    out = []
+    for path in sorted(ANNOTATION_DIR.glob("*.regions.json")):
+        # 文件名去掉 .regions 后缀即样本标识
+        cid = path.name[:-len(".regions.json")]
+        # 带上样本标识，界面才知道该跳回哪个文档
+        for item in load_regions(cid):
+            out.append({**item, "case_id": cid})
+    # 按标注时间倒序，最近圈的排在前面
+    return sorted(out, key=lambda x: x.get("at", ""), reverse=True)
+
+
 def delete_region(case_id, region_id):
     """按标识删除一条区域标注，返回是否删掉了东西。"""
     # 读取已有区域
@@ -171,6 +253,35 @@ def delete_one(case_id, chunk_index):
             json.dump(data, fh, ensure_ascii=False, indent=2)
     # 返回是否发生了删除
     return True
+
+
+def delete_many(case_id, chunk_indexes):
+    """批量删除标注，返回实际删除的条数。
+
+    批量误标一整类之后，逐条撤销同样是上百次点击，因此撤销也要能整批做。
+    """
+    # 一次性读入已有标注
+    data = load(case_id)
+    # 实际删除条数
+    removed = 0
+    # 逐个序号尝试删除
+    for raw in chunk_indexes:
+        # 序号必须能转成整数，否则忽略该条
+        try:
+            key = str(int(raw))
+        except (TypeError, ValueError):
+            continue
+        # 存在才删除，并累加计数
+        if key in data:
+            del data[key]
+            removed += 1
+    # 一条都没删掉时不必碰文件
+    if removed:
+        # 整批删完后一次性写回
+        with _path(case_id).open("w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+    # 返回删除数量，供界面回报结果
+    return removed
 
 
 def stats(case_id=None):

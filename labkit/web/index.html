@@ -442,6 +442,18 @@ a.mini { text-decoration: none; display: inline-block; line-height: 1.5; }
 .guard-item.improved, .guard-item.pass { border-left-color: var(--good); }
 .guard-head { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; font-size: 0.82rem; }
 .guard-head .mono { font-size: 0.75rem; color: var(--muted); }
+/* 可点击跳转的条目给出反馈，否则看不出能点 */
+.guard-item[style*="pointer"]:hover { border-color: var(--accent); background: var(--accent-soft); }
+/* 统计数字做成链接，点进去看明细 */
+#view-rules td.num a { color: var(--accent); text-decoration: none; border-bottom: 1px dashed var(--accent); }
+#view-rules td.num a:hover { border-bottom-style: solid; }
+/* 报告正文保持原样：它的用途是整段复制给模型，不做任何重排 */
+.report-pre {
+  background: var(--sunk); border: 1px solid var(--line); border-radius: 5px;
+  padding: 0.8rem 1rem; max-height: 60vh; overflow: auto;
+  font-family: var(--mono); font-size: 0.76rem; line-height: 1.6;
+  white-space: pre-wrap; word-break: break-word; margin: 0;
+}
 
 .chunk-shot { margin-top: 0.6rem; }
 .shot { margin: 0.4rem 0; }
@@ -580,6 +592,15 @@ tr.is-baseline { background: var(--accent-soft); }
   background: var(--accent); color: #fff; border-color: var(--accent);
 }
 .det-badge.filter.on b { color: #fff; }
+
+/* 整类批量判定条：仅在选中某个问题类型时出现，位于筛选结果提示之下 */
+.batch-bar {
+  display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap;
+  margin-top: 0.6rem; padding: 0.5rem 0.7rem;
+  border: 1px dashed var(--line-strong); border-radius: 5px; background: var(--surface);
+}
+/* 批量操作影响面大，禁用态要明显，避免误以为按钮没反应 */
+.batch-bar button:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* 被筛选命中的那条问题加左标线强调，便于在多问题切片中一眼定位 */
 .issue.focus {
@@ -739,6 +760,9 @@ tr.is-baseline { background: var(--accent-soft); }
       </div>
     </div>
     <div id="rulesStats"></div>
+    <!-- 从统计点进来的明细：误报、人工需求、框选区域共用这一块 -->
+    <div id="markDetail"></div>
+    <div id="ruleReport"></div>
     <div id="guardResult"></div>
   </div>
 
@@ -1396,7 +1420,7 @@ function renderRules(stats, groups) {
       <h3>逐条规则</h3>
       <div style="overflow-x:auto">
       <table>
-        <thead><tr><th>规则</th><th>确认</th><th>误报</th><th>准确率</th><th>误报共性</th></tr></thead>
+        <thead><tr><th>规则</th><th>确认</th><th>误报</th><th>准确率</th><th>误报共性</th><th></th></tr></thead>
         <tbody>${rows.map(([det, s]) => {
           // 该规则的准确率单独算，总体准确率看不出是谁拖累的
           const judged = s.confirmed + s.false_positive;
@@ -1409,10 +1433,17 @@ function renderRules(stats, groups) {
             : "—";
           return `<tr>
             <td><span class="pill ${sevClass(detSev(det))}">${esc(detCn(det))}</span></td>
-            <td class="num">${s.confirmed}</td>
-            <td class="num">${s.false_positive}</td>
+            <td class="num">${s.confirmed
+              ? `<a href="#" data-marks="confirmed" data-det="${esc(det)}">${s.confirmed}</a>`
+              : 0}</td>
+            <td class="num">${s.false_positive
+              ? `<a href="#" data-marks="false_positive" data-det="${esc(det)}">${s.false_positive}</a>`
+              : 0}</td>
             <td class="num">${pct(p)}</td>
             <td>${why}</td>
+            <td>${s.false_positive
+              ? `<button class="mini" data-report="${esc(det)}">生成优化报告</button>`
+              : ""}</td>
           </tr>`;
         }).join("")}</tbody>
       </table>
@@ -1431,13 +1462,201 @@ function renderRules(stats, groups) {
       <div style="overflow-x:auto">
       <table>
         <thead><tr><th>需求</th><th>提出次数</th></tr></thead>
-        <tbody>${wanted.map(([d, s]) => `<tr>
-          <td>${esc(d)}</td>
-          <td class="num">${s.missed || (s.confirmed + s.false_positive + s.missed)}</td>
-        </tr>`).join("")}</tbody>
+        <tbody>${wanted.map(([d, s]) => {
+          // 需求都是标漏报时提出的，点次数即可看到是在哪些切片上提的
+          const n = s.missed || (s.confirmed + s.false_positive + s.missed);
+          return `<tr>
+            <td>${esc(d)}</td>
+            <td class="num"><a href="#" data-marks="missed" data-det="${esc(d)}">${n}</a></td>
+          </tr>`;
+        }).join("")}</tbody>
       </table>
       </div>
-    </div>` : ""}`;
+    </div>` : ""}
+    <div class="card" id="regionCard">
+      <h3>原文上圈出的区域</h3>
+      <p class="hint" style="margin:0 0 0.9rem">
+        在切片预览的原文视图里框出来的地方——切分器压根没在那儿切出块，
+        所以它不属于任何切片，也不会出现在上面的规则统计里。点一条即可跳回原文看那块区域。
+      </p>
+      <div id="regionList"><div class="empty">加载中…</div></div>
+    </div>`;
+  // 区域标注单独拉取，与规则统计互不依赖
+  loadRegions();
+}
+
+// 加载并展示框选出来的区域
+async function loadRegions() {
+  // 卡片可能还没渲染出来
+  const box = $("regionList");
+  if (!box) return;
+  // 拉取失败不影响页面其余部分
+  try {
+    const d = await api("/api/guard/regions");
+    const items = d.items || [];
+    // 一条都没有时说明该怎么产生这类数据
+    if (!items.length) {
+      box.innerHTML = `<div class="empty">还没有框选记录。在「切片预览」里打开一个 PDF 样本，
+        点原文视图上的「框选标记」，拖出一块区域即可。</div>`;
+      return;
+    }
+    // 逐条一行，点击跳回原文定位
+    box.innerHTML = `<div class="guard-list">${items.map(it => `
+      <div class="guard-item" data-region="${esc(JSON.stringify(it.region))}"
+           data-case="${esc(it.case_id)}" data-file="${esc(it.filename)}" style="cursor:pointer">
+        <div class="guard-head">
+          <span class="pill medium">${esc(detCn(it.detector) || "未指定类型")}</span>
+          <span class="mono">${esc(it.case_id)}　第 ${it.region[0]} 页</span>
+          <span class="spacer"></span>
+          <button class="mini" data-region-del="${esc(it.id)}" data-case="${esc(it.case_id)}">删除</button>
+        </div>
+        ${it.note ? `<div class="hint">${esc(it.note)}</div>` : ""}
+        <div class="hint mono" style="font-size:0.72rem">${esc(it.filename)}　${esc(it.at || "")}</div>
+      </div>`).join("")}</div>`;
+  } catch (e) {
+    box.innerHTML = `<div class="empty" style="color:var(--bad)">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+// 规则质量页的点击：看明细、生成报告、跳转定位，统一走事件委托，
+// 内容是动态渲染的，逐个绑定会随每次刷新泄漏监听器
+$("view-rules").addEventListener("click", async (e) => {
+  // 看某一类标注的明细
+  const marks = e.target.closest("[data-marks]");
+  if (marks) {
+    e.preventDefault();
+    return showMarks(marks.dataset.marks, marks.dataset.det);
+  }
+  // 生成某条规则的优化报告
+  const rep = e.target.closest("[data-report]");
+  if (rep) return showRuleReport(rep.dataset.report);
+  // 删除一条区域标注
+  const del = e.target.closest("[data-region-del]");
+  if (del) {
+    // 阻止冒泡到整行的跳转
+    e.stopPropagation();
+    await fetch(`/api/annotations/${encodeURIComponent(del.dataset.case)}/regions/${del.dataset.regionDel}`,
+      { method: "DELETE" });
+    toast("已删除");
+    return loadRegions();
+  }
+  // 点区域行：跳回原文并定位到那块区域
+  const region = e.target.closest("[data-region]");
+  if (region) {
+    return gotoRegion(region.dataset.case, region.dataset.file, JSON.parse(region.dataset.region));
+  }
+  // 点明细行：跳回该切片
+  const jump = e.target.closest("[data-jump-case]");
+  if (jump) {
+    return gotoChunks(jump.dataset.jumpCase, "", {
+      index: parseInt(jump.dataset.jumpIdx),
+      evidence: jump.dataset.jumpEv || "",
+    });
+  }
+});
+
+// 展示某一类标注的全部明细
+async function showMarks(verdict, detector) {
+  // 结论的中文说法，用于标题
+  const vc = { confirmed: "确认是问题", false_positive: "误报", missed: "漏报/需求" }[verdict] || verdict;
+  // 占位
+  $("markDetail").innerHTML = `<div class="card"><div class="empty"><span class="spin"></span> 加载中…</div></div>`;
+  // 拉取失败如实回报
+  try {
+    const q = new URLSearchParams({ verdict, detector });
+    const d = await api(`/api/guard/marks?${q}`);
+    const items = d.items || [];
+    // 渲染明细，每条可点击跳回原切片
+    $("markDetail").innerHTML = `<div class="card">
+      <h3>${esc(detCn(detector) || detector)}　·　${vc} ${items.length} 条</h3>
+      <p class="hint" style="margin:0 0 0.9rem">点任意一条跳回切片预览，定位到那一块正文。</p>
+      <div class="guard-list">${items.map(it => `
+        <div class="guard-item" style="cursor:pointer"
+             data-jump-case="${esc(it.case_id)}" data-jump-idx="${it.chunk_index}"
+             data-jump-ev="${esc((it.excerpt || "").slice(0, 40))}">
+          <div class="guard-head">
+            <span class="mono">${esc(it.case_id)} #${it.chunk_index}</span>
+            <span class="hint">${esc(it.filename)}</span>
+            ${it.batch ? `<span class="pill low">批量判定</span>` : ""}
+          </div>
+          ${it.note ? `<div class="hint">人工备注：${esc(it.note)}</div>` : ""}
+          <div class="ev">${esc((it.excerpt || "").slice(0, 100).replace(/\n/g, " "))}</div>
+        </div>`).join("")}</div>
+    </div>`;
+    // 滚动到明细，否则点了数字看不出页面有变化
+    $("markDetail").scrollIntoView({ behavior: "smooth", block: "start" });
+  } catch (e) {
+    $("markDetail").innerHTML = `<div class="card"><div class="empty" style="color:var(--bad)">加载失败：${esc(e.message)}</div></div>`;
+  }
+}
+
+// 生成并展示某条规则的优化报告
+async function showRuleReport(detector) {
+  // 报告要重跑切分取当前证据，可能要等几秒
+  $("ruleReport").innerHTML = `<div class="card"><div class="empty"><span class="spin"></span> 正在重跑切分、收集命中证据…</div></div>`;
+  // 失败时如实回报
+  try {
+    // 切分参数与预览页一致，否则证据对不上
+    const q = new URLSearchParams({ parser_config: JSON.stringify(runParams()) });
+    const d = await api(`/api/guard/report/${encodeURIComponent(detector)}?${q}`);
+    // 报告以纯文本呈现：它的用途是整段复制给模型改代码，渲染成 HTML 反而不好取
+    $("ruleReport").innerHTML = `<div class="card">
+      <h3>优化报告　·　${esc(detCn(detector) || detector)}</h3>
+      <p class="hint" style="margin:0 0 0.7rem">
+        含规则当前实现与每条反例此刻的命中证据。整段复制给模型即可动手改，
+        改完跑 <code>./run.sh guard --todo</code> 验证。
+      </p>
+      <div style="display:flex;gap:0.4rem;margin-bottom:0.7rem">
+        <button class="mini" id="btnCopyReport">复制全文</button>
+        <button class="mini" id="btnDownloadReport">下载 Markdown</button>
+      </div>
+      <pre class="report-pre">${esc(d.markdown)}</pre>
+    </div>`;
+    // 复制到剪贴板
+    $("btnCopyReport").addEventListener("click", async () => {
+      // 剪贴板 API 在非安全上下文可能不可用，失败时提示手动复制
+      try {
+        await navigator.clipboard.writeText(d.markdown);
+        toast("已复制");
+      } catch { toast("复制失败，请手动选中文本复制"); }
+    });
+    // 下载为文件
+    $("btnDownloadReport").addEventListener("click", () => {
+      // 用 Blob 生成临时下载链接，不必让服务端再存一份
+      const url = URL.createObjectURL(new Blob([d.markdown], { type: "text/markdown" }));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `优化报告_${detector}.md`;
+      a.click();
+      // 及时释放，避免长时间占着内存
+      URL.revokeObjectURL(url);
+    });
+    $("ruleReport").scrollIntoView({ behavior: "smooth", block: "start" });
+  } catch (e) {
+    $("ruleReport").innerHTML = `<div class="card"><div class="empty" style="color:var(--bad)">生成失败：${esc(e.message)}</div></div>`;
+  }
+}
+
+// 跳回原文并定位到框选出来的区域
+function gotoRegion(caseId, filename, region) {
+  // 切到切片预览
+  document.querySelector('.tab[data-view="chunks"]').click();
+  // 样本列表就绪后加载该样本，原文完全就绪后再定位。
+  // 必须等 whenReady 而不是轮询 ready：后者在文档刚拿到时就为真，
+  // 此时定位会被加载流程的收尾动作覆盖掉
+  loadChunkCaseList()
+    .then(() => {
+      // 触发加载但不等它整个完成：selectCase 要跑一遍切分，上千个切片要几十秒，
+      // 而原文是并行加载的。等切分结束才定位，人得对着转圈的页面干等
+      selectCase(caseId);
+      // 只等原文就绪
+      return pdfView.whenReady();
+    })
+    .then(() => {
+      // 原文加载不出来时如实告知，而不是静默无反应
+      if (!pdfView.ready) return toast("该样本没有可定位的原文");
+      pdfView.focus([region]);
+    });
 }
 
 // 跑一次回归护栏
@@ -2652,9 +2871,18 @@ const pdfView = (() => {
     });
   }
 
+  // 最近一次加载的 promise。外部要在原文就绪后做事（比如定位到某块区域），
+  // 靠轮询 ready 是不够的：doc 一赋值 ready 就为真，而页码等收尾工作还没做完，
+  // 这时定位会被随后的收尾覆盖掉。
+  let pending = Promise.resolve();
+
   // 暴露给外部的接口
   return {
-    load, focus, zoom, setMarking, bindMarking, clearManual, drawManual, hide,
+    // 包一层以记录加载 promise，调用方式与直接调 load 一致
+    load: (...args) => (pending = load(...args)),
+    // 等原文完全就绪，包括页码等收尾
+    whenReady: () => pending,
+    focus, zoom, setMarking, bindMarking, clearManual, drawManual, hide,
     // 适应宽度：按首页宽度重算缩放
     async fitWidth() {
       if (!doc) return;
@@ -2794,6 +3022,25 @@ function renderChunkView() {
       ).join("")}
     </div>`;
 
+  // 整类批量判定条：仅在选中了具体问题类型时出现。
+  // 「全部切片」下绝大多数切片没有命中任何规则，整批判定无从谈起。
+  let batchBar = "";
+  if (chunkFilter) {
+    // 该筛选下尚未标注的切片，是批量写入的实际目标
+    const pending = shown.filter(c => !caseAnnotations[String(c.index)]).length;
+    // 已标注的数量；批量写入会跳过它们，批量撤销则正好以它们为目标
+    const annotated = shown.length - pending;
+    batchBar = `
+      <div class="batch-bar">
+        <span class="hint">整类判定「${esc(detCn(chunkFilter))}」：</span>
+        <button class="mini" data-batch="false_positive" ${pending ? "" : "disabled"}>全标为误报（${pending}）</button>
+        <button class="mini" data-batch="confirmed" ${pending ? "" : "disabled"}>全确认是问题（${pending}）</button>
+        <span class="spacer"></span>
+        ${annotated ? `<span class="hint">${annotated} 个已标注，写入时跳过</span>` : ""}
+        <button class="mini" data-batch-undo="1" ${annotated ? "" : "disabled"}>撤销这 ${annotated} 条</button>
+      </div>`;
+  }
+
   // 顶部元信息与筛选栏
   $("chunkMeta").innerHTML = `
     <div class="stat-row" style="margin-bottom:0.85rem">
@@ -2804,6 +3051,7 @@ function renderChunkView() {
     ${sourceBar}
     ${filterBar}
     ${chunkFilter ? `<p class="hint" style="margin:0.7rem 0 0">正在只看「${esc(detCn(chunkFilter))}」：${shown.length} 个切片命中。点「全部切片」取消筛选。</p>` : ""}
+    ${batchBar}
     ${paramNote}`;
 
   // 绑定筛选按钮
@@ -2813,6 +3061,13 @@ function renderChunkView() {
       renderChunkView();
     });
   });
+  // 绑定整类批量判定按钮；批量条随每次重绘重建，故在此重新绑定
+  $("chunkMeta").querySelectorAll("[data-batch]").forEach(btn => {
+    btn.addEventListener("click", () => doBatchAnnotate(btn.dataset.batch));
+  });
+  // 绑定整类批量撤销按钮
+  const undoBtn = $("chunkMeta").querySelector("[data-batch-undo]");
+  if (undoBtn) undoBtn.addEventListener("click", doBatchUndo);
   // 绑定数据来源切换
   const srcSel = $("chunkSource");
   if (srcSel) {
@@ -3007,6 +3262,82 @@ async function undoAnnotate(idx) {
     toast("已撤销");
   } catch (err) {
     toast("撤销失败：" + err.message);
+  }
+}
+
+// 取当前筛选类型命中的全部切片。
+// 批量操作的作用域以此为准：一个切片可能命中多条规则，只有按当前筛选取，
+// 判定才会算到正在看的这条规则头上。
+function currentFilterChunks() {
+  // 未选具体类型时不构成批量作用域
+  if (!chunkFilter) return [];
+  // 命中当前筛选类型的切片
+  return (currentCaseData.chunks || []).filter(c =>
+    (c.findings || []).some(f => f.detector === chunkFilter));
+}
+
+// 整类批量写入标注
+async function doBatchAnnotate(verdict) {
+  // 已标注的保留原判断，只处理尚未标注的
+  const targets = currentFilterChunks().filter(c => !caseAnnotations[String(c.index)]);
+  // 没有待判定的切片时直接告知，不发无意义的请求
+  if (!targets.length) return toast("这一类没有待判定的切片");
+  // 结论的中文说法，用于确认提示
+  const label = verdict === "confirmed" ? "确认是问题" : "标为误报";
+  // 一次写入上百条影响面大，先明确确认
+  if (!confirm(`把「${detCn(chunkFilter)}」下 ${targets.length} 个未标注切片全部${label}？`)) return;
+  // 备注整批只填一次，避免逐条弹窗
+  const note = prompt("补充说明（可留空，整批共用）：", "") ?? "";
+  try {
+    // 整批一次请求，服务端只读写一次标注文件
+    const r = await api(`/api/annotations/${encodeURIComponent(currentCase)}/batch`, {
+      method: "POST",
+      body: JSON.stringify({
+        verdict,  // 整批统一的结论
+        detector: chunkFilter,  // 记为当前筛选的问题类型
+        note,  // 整批共用的备注
+        // 逐条带上序号与正文摘要，摘要供日后校验序号是否因切分参数变化而错位
+        items: targets.map(c => ({
+          chunk_index: c.index,
+          excerpt: (c.content || "").slice(0, 60),
+        })),
+      }),
+    });
+    // 本地同步后重绘，避免整页刷新
+    targets.forEach(c => {
+      caseAnnotations[String(c.index)] = {
+        chunk_index: c.index, verdict, detector: chunkFilter, note,
+      };
+    });
+    renderChunkView();
+    // 回报实际写入数；有跳过时一并说明，避免困惑于数量对不上
+    toast(`已记录 ${r.written} 条${r.skipped ? `，跳过 ${r.skipped} 条已标注` : ""}`);
+  } catch (err) {
+    toast("批量标注失败：" + err.message);
+  }
+}
+
+// 整类批量撤销标注
+async function doBatchUndo() {
+  // 当前筛选下已标注的切片才是撤销目标
+  const targets = currentFilterChunks().filter(c => caseAnnotations[String(c.index)]);
+  // 没有已标注的切片时直接告知
+  if (!targets.length) return toast("这一类没有已标注的切片");
+  // 撤销同样影响面大，先明确确认
+  if (!confirm(`撤销「${detCn(chunkFilter)}」下这 ${targets.length} 条标注？`)) return;
+  try {
+    // 整批一次请求删除
+    const r = await api(`/api/annotations/${encodeURIComponent(currentCase)}/batch/delete`, {
+      method: "POST",
+      body: JSON.stringify({ chunk_indexes: targets.map(c => c.index) }),
+    });
+    // 本地同步后重绘
+    targets.forEach(c => delete caseAnnotations[String(c.index)]);
+    renderChunkView();
+    // 回报实际撤销条数
+    toast(`已撤销 ${r.removed} 条`);
+  } catch (err) {
+    toast("批量撤销失败：" + err.message);
   }
 }
 

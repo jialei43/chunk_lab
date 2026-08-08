@@ -407,6 +407,57 @@ def api_annotate(case_id):
     return jsonify({"ok": True, "annotation": item})
 
 
+@app.post("/api/annotations/<case_id>/batch")
+def api_annotate_batch(case_id):
+    """整类批量写入标注：把某条规则命中的全部切片一次判定完。
+
+    一条规则命中上百个切片时逐条判定不现实，因此提供整批入口；
+    已标注的切片默认跳过，不覆盖此前逐条给出的判断。
+    """
+    # 读取请求体
+    payload = request.get_json(silent=True) or {}
+    # 待标注的切片清单为必填
+    items = payload.get("items")
+    # 清单必须是列表，否则无法逐条处理
+    if not isinstance(items, list) or not items:
+        return jsonify({"ok": False, "message": "缺少 items"}), 400
+    # 结论非法时明确报错而不是写入无法解释的数据
+    try:
+        result = annotations.save_many(
+            case_id,  # 样本标识
+            items,  # 切片清单，每项含序号与正文摘要
+            payload.get("verdict", ""),  # 整批统一的标注结论
+            detector=payload.get("detector", ""),  # 当前筛选的问题类型
+            note=payload.get("note", ""),  # 整批共用的备注
+            # 是否覆盖已有标注，默认跳过
+            skip_annotated=not payload.get("overwrite", False),
+        )
+    except ValueError as e:
+        return jsonify({"ok": False, "message": str(e)}), 400
+    # 返回写入与跳过的数量
+    return jsonify({"ok": True, **result})
+
+
+@app.post("/api/annotations/<case_id>/batch/delete")
+def api_unannotate_batch(case_id):
+    """整类批量撤销标注。
+
+    用 POST 而非 DELETE：批量撤销需要在请求体里带上切片序号清单，
+    而 DELETE 携带请求体在各类客户端与代理上的支持并不一致。
+    """
+    # 读取请求体
+    payload = request.get_json(silent=True) or {}
+    # 待撤销的切片序号清单为必填
+    indexes = payload.get("chunk_indexes")
+    # 清单必须是列表，否则无法逐个删除
+    if not isinstance(indexes, list) or not indexes:
+        return jsonify({"ok": False, "message": "缺少 chunk_indexes"}), 400
+    # 执行批量删除
+    removed = annotations.delete_many(case_id, indexes)
+    # 返回实际删除条数
+    return jsonify({"ok": True, "removed": removed})
+
+
 @app.get("/api/annotations/<case_id>/regions")
 def api_regions(case_id):
     """读取某样本在原文上圈出的全部异常区域。"""
@@ -497,6 +548,67 @@ def api_false_positives():
             only=[request.args.get("case")] if request.args.get("case") else None,  # 只看某个样本
         ),
     })
+
+
+@app.get("/api/guard/marks")
+def api_marks():
+    """按结论列出标注明细，供界面从统计数字点进去落到具体切片。"""
+    # 结论必须指定，否则不知道要列哪一类
+    verdict = request.args.get("verdict", "")
+    # 非法结论明确报错而不是返回空列表
+    if verdict not in annotations.VERDICTS:
+        return jsonify({"ok": False, "message": f"未知的标注结论：{verdict}"}), 400
+    # 返回明细
+    return jsonify({
+        "ok": True,
+        "items": guard.list_marks(
+            verdict,  # 结论
+            detector=request.args.get("detector"),  # 只看某一类问题
+            only=[request.args.get("case")] if request.args.get("case") else None,  # 只看某个样本
+        ),
+    })
+
+
+@app.get("/api/guard/regions")
+def api_all_regions():
+    """汇总全部样本在原文上圈出的异常区域。
+
+    区域标注按样本分文件存，但看的时候需要横着看：哪些文档被圈得最多、
+    人反复圈出的是同一类什么问题，跨样本才看得出来。
+    """
+    # 汇总并附上文件名，界面据此才能加载原文定位
+    items = annotations.all_regions()
+    # 建立样本到文件名的映射，避免逐条去查
+    names = {c["case_id"]: c.get("filename", "") for c in load_cases()}
+    # 补上文件名后返回
+    return jsonify({
+        "ok": True,
+        "items": [{**it, "filename": names.get(it["case_id"], "")} for it in items],
+    })
+
+
+@app.get("/api/guard/report/<detector>")
+def api_rule_report(detector):
+    """为某条规则生成优化报告。
+
+    报告带上规则的当前实现与反例此刻的真实命中证据，
+    拿到就能直接动手改，不必再回头翻代码和原文。
+    """
+    # 切分参数与预览页保持一致，否则证据对不上
+    raw = request.args.get("parser_config")
+    # 解析失败时用默认配置
+    try:
+        config = json.loads(raw) if raw else None
+    except (TypeError, ValueError):
+        config = None
+    # 生成报告
+    r = guard.build_optimization_report(
+        detector,  # 规则名
+        only=[request.args.get("case")] if request.args.get("case") else None,  # 可只看某个样本
+        parser_config=config,  # 切分参数
+    )
+    # 无反例时返回 404，界面据此提示先去标注
+    return (jsonify(r), 200) if r.get("ok") else (jsonify(r), 404)
 
 
 @app.post("/api/preview/<case_id>/source")

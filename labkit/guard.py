@@ -225,12 +225,15 @@ def analyze_false_positives(detector=None, only=None):
             det = mark.get("detector") or "(未指定)"
             if detector and det != detector:
                 continue
-            # 收入该规则的反例
+            # 收入该规则的反例。带上切片序号与文件名，
+            # 界面才能从这里直接跳回原切片去看上下文
             groups.setdefault(det, []).append({
                 "case_id": cid,
                 "filename": case.get("filename", ""),
+                "chunk_index": mark.get("chunk_index"),
                 "excerpt": mark.get("excerpt", ""),
                 "note": mark.get("note", ""),
+                "batch": bool(mark.get("batch")),  # 批量判定的可信度低于逐条细看
             })
 
     # 逐条规则归纳
@@ -254,3 +257,222 @@ def analyze_false_positives(detector=None, only=None):
         })
     # 反例多的排在前面，那是最该改的规则
     return out
+
+
+def list_marks(verdict, detector=None, only=None):
+    """按结论列出标注明细，供界面直接跳回原切片。
+
+    统计只给出数量，看不到具体是哪些切片。要动手改规则就得能从数字点进去，
+    落到那一块正文上——这里提供的就是这条通路。
+    """
+    # 收集明细
+    out = []
+    # 遍历有标注的样本
+    for case in load_cases(only=only):
+        # 样本标识
+        cid = case["case_id"]
+        # 逐条标注
+        for mark in annotations.load(cid).values():
+            # 只看指定结论
+            if mark.get("verdict") != verdict:
+                continue
+            # 指定了问题类型时只看这一类
+            det = mark.get("detector") or "(未指定)"
+            if detector and det != detector:
+                continue
+            # 带上定位所需的全部信息
+            out.append({
+                "case_id": cid,
+                "filename": case.get("filename", ""),
+                "chunk_index": mark.get("chunk_index"),
+                "detector": det,
+                "excerpt": mark.get("excerpt", ""),
+                "note": mark.get("note", ""),
+                "batch": bool(mark.get("batch")),
+                "at": mark.get("at", ""),
+            })
+    # 按样本与序号排序，同一文档的条目挨在一起便于连着看
+    return sorted(out, key=lambda x: (x["case_id"], x.get("chunk_index") or 0))
+
+
+def _rule_source(detector):
+    """取某条检测规则的源码与所在位置。
+
+    报告里带上当前实现，看报告的人（或模型）不必再去翻代码就能动手改；
+    也避免报告与实现脱节——源码是从运行中的模块直接取的，不会写错。
+    """
+    # 延迟导入，避免与模块级导入形成循环
+    import inspect
+    from . import detectors
+    # 检测器函数按 detect_<名字> 命名
+    fn = getattr(detectors, f"detect_{detector}", None)
+    # 找不到说明这不是已实现的规则（多半是人工提出的需求）
+    if fn is None:
+        return None
+    # 源码与行号一并取出，异常时不让报告生成失败
+    try:
+        src = inspect.getsource(fn)
+        _, line = inspect.getsourcelines(fn)
+    except (OSError, TypeError):
+        return None
+    # 规则常依赖模块级的正则常量，一并带出来——
+    # 只给函数体的话，看到 PATTERN.search() 仍然不知道匹配的是什么
+    consts = []
+    for name in dir(detectors):
+        # 只收大写命名的模块级常量，且名字与该规则相关
+        if not name.isupper():
+            continue
+        # 名字里含规则名的片段即认为相关，例如 MARKDOWN_RESIDUE_PATTERN
+        if any(part and part.upper() in name for part in detector.split("_")):
+            val = getattr(detectors, name)
+            # 正则对象打印出模式本身，其它类型直接转字符串
+            consts.append(f"{name} = {getattr(val, 'pattern', val)!r}")
+    # 返回位置、源码与相关常量
+    return {"file": "labkit/detectors.py", "line": line, "source": src, "consts": consts}
+
+
+def build_optimization_report(detector, only=None, parser_config=None):
+    """为某条规则生成优化报告。
+
+    报告要能直接拿去改代码，因此同时给出三样东西：规则的当前实现、
+    人工判定为误报的全部反例、以及这些反例此刻的真实命中证据。
+    只有摘要而没有证据的话，改规则时仍然要一条条去翻原文。
+    """
+    # 检测阈值取默认
+    cfg = DetectorConfig()
+    # 该规则的误报归纳
+    groups = analyze_false_positives(detector=detector, only=only)
+    # 没有反例时没什么可优化的
+    if not groups:
+        return {"ok": False, "message": f"规则 {detector} 没有被标为误报的切片，无从生成优化报告"}
+    # 取这一条规则的归纳
+    g = groups[0]
+
+    # 重跑一遍拿当前证据：标注里只存了正文摘要，
+    # 而改规则真正需要知道的是「这条规则在这块正文上匹配到了什么」
+    cases_needed = sorted({s["case_id"] for s in g["samples"]})
+    # 逐样本重切并取证据
+    evidences = {}
+    for case in load_cases(only=cases_needed):
+        # 样本标识
+        cid = case["case_id"]
+        # 用当前代码切分并检测
+        data = inspect_case(case, cfg=cfg, parser_config=parser_config)
+        # 切分失败时跳过该样本，其余样本照常
+        if data.get("error"):
+            continue
+        # 本样本内已认领的切片，避免多条标注落到同一个上
+        used = set()
+        # 逐条反例定位并取证据
+        for s in g["samples"]:
+            # 只处理本样本的
+            if s["case_id"] != cid:
+                continue
+            # 按摘要找回切片
+            found = _find_chunk(data.get("chunks") or [], s["excerpt"], used)
+            # 找不回来时如实留空
+            if found is None:
+                continue
+            # 认领
+            used.add(found.get("index"))
+            # 取该规则在这块上的命中证据
+            hits = [f for f in (found.get("findings") or []) if f.get("detector") == detector]
+            evidences[(cid, s["excerpt"][:30])] = {
+                "index": found.get("index"),
+                "content": found.get("content", ""),
+                "evidence": hits[0].get("evidence", "") if hits else "",
+                "still_hit": bool(hits),
+            }
+
+    # 把证据挂回反例
+    samples = []
+    for s in g["samples"]:
+        # 按样本与摘要前缀取回
+        ev = evidences.get((s["case_id"], s["excerpt"][:30]), {})
+        samples.append({**s, **ev})
+
+    # 规则的当前实现
+    rule = _rule_source(detector)
+
+    # 组装 Markdown 报告
+    lines = [
+        f"# 规则优化报告：{detector}",
+        "",
+        f"人工判定的误报 **{g['count']} 条**，文件类型分布 "
+        f"{'、'.join(f'{k} {v}' for k, v in g['by_ext'].items())}。",
+        "",
+    ]
+    # 人工写下的原因是最直接的线索，放在最前
+    if g["notes"]:
+        lines += ["## 人工判断的原因", ""]
+        # 去重后列出，重复的备注说明是同一类问题
+        seen = []
+        for n in g["notes"]:
+            if n not in seen:
+                seen.append(n)
+        lines += [f"- {n}" for n in seen] + [""]
+
+    # 当前实现，供直接动手改
+    if rule:
+        lines += [
+            "## 当前实现",
+            "",
+            f"`{rule['file']}` 第 {rule['line']} 行起：",
+            "",
+        ]
+        # 相关常量单独列出，正则模式往往才是问题所在
+        if rule["consts"]:
+            lines += ["```python"] + rule["consts"] + ["```", ""]
+        lines += ["```python", rule["source"].rstrip(), "```", ""]
+    else:
+        lines += [
+            "## 当前实现",
+            "",
+            f"未找到 `detect_{detector}` 函数——这条多半是人工提出、尚未实现的规则需求。",
+            "",
+        ]
+
+    # 逐条反例，带当前证据
+    lines += ["## 误报明细", ""]
+    for i, s in enumerate(samples, 1):
+        # 标题行给出定位信息
+        lines += [
+            f"### {i}. {s['case_id']} #{s.get('index', s.get('chunk_index'))}"
+            f"（{s.get('filename', '')}）",
+            "",
+        ]
+        # 当前是否仍在命中：改完规则后重新生成报告，这里应当变成「否」
+        lines.append(f"- 当前仍命中：{'是' if s.get('still_hit') else '否'}")
+        # 命中的具体内容是改规则的关键——知道匹配到了什么才知道怎么排除
+        if s.get("evidence"):
+            lines.append(f"- 命中证据：`{s['evidence']}`")
+        # 人工备注说明为什么判为误报
+        if s.get("note"):
+            lines.append(f"- 人工判断：{s['note']}")
+        # 批量判定的可信度低于逐条细看，如实标注
+        if s.get("batch"):
+            lines.append("- 来自批量判定（未逐条细看）")
+        lines += ["", "正文：", "", "```text", (s.get("content") or s["excerpt"])[:600], "```", ""]
+
+    # 收尾给出验证方式，避免改完不知道怎么确认
+    lines += [
+        "## 改完怎么验证",
+        "",
+        "```bash",
+        "./run.sh guard --todo        # 这些条目应从「待修正」变为「符合预期」",
+        "```",
+        "",
+        "出现「回归」说明改动碰坏了本来能检出的东西；"
+        "「待修正」条数减少而回归为 0，才算这次修改成立。",
+        "",
+    ]
+
+    # 返回报告与结构化数据，界面可两种方式使用
+    return {
+        "ok": True,
+        "detector": detector,
+        "markdown": "\n".join(lines),
+        "count": g["count"],
+        "samples": samples,
+        "rule": rule,
+    }
