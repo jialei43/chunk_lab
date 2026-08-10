@@ -8,6 +8,7 @@
 
 from collections import defaultdict  # 导入 defaultdict 按类型与样本归组
 
+from .evaluate import active_findings  # 导入有效问题过滤，跳过人工判定的误报
 from .paths import REPORT_DIR  # 导入报告目录常量
 
 # 检测器的中文名、严重度与可能相关的 ragflow 源码位置。
@@ -239,7 +240,7 @@ def build_markdown(report, chunks_by_case=None, max_full_cases=2):
     by_det = defaultdict(list)
     # 逐样本逐条收集，并把样本信息附到每条上
     for case in report.get("cases", []):
-        for f in case.get("findings", []):
+        for f in active_findings(case):  # 已判定为误报的条目不进报告
             by_det[f["detector"]].append({**f, "_case": case})
 
     # 按严重度与数量排序，最该先修的排前面

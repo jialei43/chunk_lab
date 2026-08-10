@@ -21,7 +21,8 @@ from datetime import datetime  # 导入 datetime 记录任务时间
 
 from pathlib import Path  # 导入 Path 处理文件路径
 
-from .paths import MINERU_OUT, UPLOAD_DIR, ensure_ragflow_importable  # 导入目录常量与路径注入
+from .paths import (MINERU_OUT, UPLOAD_DIR, ensure_ragflow_importable,  # 导入目录常量与路径注入
+                    resolve_local_backend)  # 导入本地解析 backend 的解析函数
 
 ensure_ragflow_importable()  # 在导入 ragflow 模块之前注入源码路径
 
@@ -31,7 +32,12 @@ from chunklab_bridge.parse import parse_document, resolve_mineru_config  # noqa:
 def mineru_defaults():
     """返回 MinerU 连接配置的当前默认值，供界面展示与表单预填。"""
     # 复用桥接层的解析逻辑，保证界面显示的与实际使用的一致
-    return resolve_mineru_config()
+    conf = resolve_mineru_config()
+    # 桥接层的内置默认是 pipeline（对齐 ragflow 生产取值），而实验室跑的是本机 VLM 部署，
+    # 这里统一覆盖为实验室自己的默认。环境变量 MINERU_BACKEND 仍然优先，语义不变。
+    conf["backend"] = resolve_local_backend()
+    # 返回覆盖后的配置
+    return conf
 
 # 需要放宽级别以便捕获日志的 logger。
 # 刻意不用 root：实测放宽 root 会让 ragflow 的数据库查询、定时任务诊断等
@@ -342,12 +348,16 @@ def start_cloud_parse(file_paths, auto_import=True, kind="", note="", lang="ch")
     return task_id
 
 
-def start_parse(file_path, filename, backend="pipeline", parse_method="auto",
+def start_parse(file_path, filename, backend="", parse_method="auto",
                 auto_import=True, kind="", note="", mineru_api="", output_dir=""):
     """把一次解析放入队列，立即返回任务标识。
 
     任务不会马上执行：前面还有排队任务时会等待，界面据 status 显示「排队中」。
+
+    backend 留空即取实验室默认（见 `resolve_local_backend`），不再硬编码 pipeline。
     """
+    # 调用方未指定时回落到实验室默认 backend，保证与界面显示的一致
+    backend = backend or resolve_local_backend()
     # 生成短任务标识，便于在界面与日志中引用
     task_id = uuid.uuid4().hex[:12]
     # 初始化任务状态

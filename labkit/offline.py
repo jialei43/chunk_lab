@@ -12,7 +12,9 @@ image_context_size 完全没传、middle.json 增强被漏掉。每修一处又�
 import re  # 导入 re 用于从文件名中剥离扩展名
 from pathlib import Path  # 导入 Path 统一处理路径
 
-from .paths import ensure_ragflow_importable  # 导入路径注入函数，必须在 import ragflow 模块之前调用
+from . import vlmcache  # 导入 VLM/LLM 结果缓存，避免重放语料时重复调用模型
+from .paths import (ensure_ragflow_importable, ensure_ragflow_llm_ready,
+                    resolve_tenant_id)  # 导入路径注入、模型环境准备与租户解析
 
 ensure_ragflow_importable()  # 在导入任何 ragflow 模块之前把仓库根注入 sys.path
 
@@ -32,6 +34,17 @@ DEFAULT_PARSER_CONFIG = {
     "overlapped_percent": 0,  # 重叠百分比
     "html4excel": False,  # Excel 转 HTML
     "layout_recognize": "mineru",  # 声明走 MinerU 路径
+    # 三个增强项开关，在实验室里**一律默认关闭**，需要时到顶栏「切分配置」里手动勾选。
+    #
+    # 与生产的取舍不同：生产是一次性入库，多花几分钟换更好的召回是划算的；
+    # 而实验室要反复重放同一批语料看切分边界的变化，每张图一次 VLM、每张表一次 LLM，
+    # 全语料合计约 3400 次调用——一轮评估的绝大部分时间和费用都耗在这上面，
+    # 可它们产出的是图片描述与表格摘要文本，对「段落怎么合并、边界切在哪里」毫无影响。
+    #
+    # 需要评估图片描述质量或表格摘要效果时再手动开，那是另一类实验。
+    "mineru_image_desc_enable": False,   # 图片 VLM 描述
+    "mineru_table_summary_enable": False,  # 表格 LLM 摘要
+    "mineru_ocr_fallback_enable": False,  # 艺术字兜底重识别
 }
 
 # 解析阶段参数：这些值在生成缓存产物时就已固化，离线重放改它们不会有任何效果。
@@ -87,13 +100,31 @@ def build_parser_config(overrides=None):
     return config
 
 
+def resolve_llm_tenant():
+    """解析本次切分要借用哪个租户的模型授权，不可用时返回空串。
+
+    返回空串表示以纯切分模式运行：表格摘要、图片描述、艺术字兜底全部降级为空，
+    这也是未配置 `tenant_id` 时的默认行为。
+    """
+    # 本机配置指定的租户
+    tenant_id = resolve_tenant_id()
+    # 未配置时直接按无模型处理，不去碰 ragflow 的 settings
+    if not tenant_id:
+        return ""
+    # 补齐模型厂商清单；补不上说明 ragflow 配置不完整，同样按无模型处理
+    return tenant_id if ensure_ragflow_llm_ready() else ""
+
+
 def run_offline_chunking(corpus_dir, filename, parser_config=None, slide_mode=False,
                          lang="Chinese", eng=False, backend="hybrid_auto", parser_id=None,
-                         pdf_path=None):
+                         pdf_path=None, tenant_id=None):
     """核心入口：用缓存产物驱动生产切分逻辑，返回 chunk 列表。
 
     slide_mode 不再由外部传入——它由生产的 presentation 模块依据文件类型自行决定，
     外部指定反而会与生产行为不一致，故该参数仅为兼容旧调用而保留。
+
+    tenant_id 决定能否加载 LLM/VLM；显式传空串可强制关闭模型调用，
+    传 None 表示按本机配置解析。
     """
     # 语料目录：允许传入目录或目录下的 content_list 文件路径
     corpus_dir = Path(corpus_dir)
@@ -102,6 +133,14 @@ def run_offline_chunking(corpus_dir, filename, parser_config=None, slide_mode=Fa
         corpus_dir = corpus_dir.parent
     # 组装最终切分配置
     config = build_parser_config(parser_config)
+    # 解析租户：调用方显式给值（含空串）时以其为准，否则按本机配置解析
+    tenant = resolve_llm_tenant() if tenant_id is None else tenant_id
+    # 装上 VLM/LLM 结果缓存：图片描述、艺术字兜底、表格摘要三类调用将复用历史结果。
+    # 幂等且失败自动降级，因此无条件调用即可；缓存不可用时行为与从前完全一致。
+    vlmcache.install()
+    # 标记当前样本，使本次写入的缓存键登记到该样本索引下，支持按样本清理与用量统计。
+    # 用语料目录名而非文件名：目录名是实验室里样本的唯一标识。
+    vlmcache.set_sample(corpus_dir.name)
     # 交给桥接层调用生产入口
     return chunk_from_corpus(
         corpus_dir,  # 语料目录，内含 MinerU 原始命名的产物
@@ -110,6 +149,8 @@ def run_offline_chunking(corpus_dir, filename, parser_config=None, slide_mode=Fa
         lang=lang,  # 文档语言
         backend=backend,  # 产物所用 backend，影响 _read_output 的查找
         parser_id=infer_parser_id(filename, parser_id),  # 切片方法，须与生产一致
+        # 借用该租户的模型授权，切分器据此加载 VLM/LLM；为空则三个增强项全部降级
+        tenant_id=tenant or None,
         # 关联了原始 PDF 时渲染页面图像，切分才有真实坐标与截图；
         # 渲染有成本，故仅预览传入，批量评估不传以保持速度
         pdf_path=pdf_path,

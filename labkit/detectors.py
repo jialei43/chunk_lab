@@ -9,7 +9,7 @@
 """
 
 import re  # 导入 re 用于各类文本模式匹配
-from dataclasses import dataclass, field  # 导入数据类简化结果结构定义
+from dataclasses import dataclass, field, replace  # 导入数据类简化结果结构定义，replace 用于按样本派生配置副本
 
 from .paths import ensure_ragflow_importable  # 导入路径注入函数
 
@@ -63,6 +63,10 @@ class DetectorConfig:
     truncation_min_chars: int = 50  # 短于此长度的块不做截断判定，避免标题类短块误报
     duplicate_ratio: float = 0.8  # 相邻块正文重叠达到该比例视为重复
     expect_position: bool = True  # 是否要求 chunk 带位置信息，无 bbox 的样本可关闭
+    # 当前样本的原始文件名。有些判据本身就是文件类型相关的——例如 PPTX 走整页成块，
+    # 没有标题层级是设计使然而非缺陷——离开文件类型就无法正确判定。
+    # 由 run_detectors 按样本注入，检测器只读不写。
+    filename: str = ""
 
 
 def strip_breadcrumb(record):
@@ -214,6 +218,72 @@ def detect_truncated_sentence(records, case_id, cfg):
     return findings
 
 
+# 切块器认定「够长可独立成块」的门槛比例，与生产 mineru_chunker.STANDALONE_PARAGRAPH_RATIO 对齐。
+# 两者必须同步：这是检测器判定「本该合并却没合并」的唯一依据，口径一旦分叉，
+# 检测器会把切块器的正常行为成片报成问题。
+#
+# 生产已由「固定 200 字」改为「token 数 ≥ chunk_token_num × 比例」——够不够独立，
+# 本就该相对于目标块大小衡量（256 预算下 205 token 已占八成，1024 预算下才占两成）。
+STANDALONE_RATIO = 0.8
+
+
+def standalone_threshold(cfg):
+    """当前配置下「够长可独立成块」的 token 门槛。"""
+    # 与生产同式：目标块大小乘以比例
+    return cfg.chunk_token_num * STANDALONE_RATIO
+
+
+def _is_standalone_body(body, cfg):
+    """正文是否已长到足以独立成块，与生产 _is_standalone_unit 同口径。"""
+    # 用 token 而非字符计数，才与生产的 unit.tokens 对得上
+    return num_tokens_from_string(body) >= standalone_threshold(cfg)
+
+
+def _same_section(a, b):
+    """两个 chunk 是否属于同一个标题小节（面包屑完全相同）。"""
+    # important_kwd 即标题路径，逐级相同才算同一小节
+    return list(a.get("important_kwd") or []) == list(b.get("important_kwd") or [])
+
+
+def _unmerged_short_neighbor(records, i, cfg):
+    """判断第 i 块是否属于「本该与相邻块合并却没合并」。
+
+    这是对生产切块契约的断言：同一标题路径下，相邻两个都短于独立成块阈值的段落
+    必然会被合并；因此产出里若还存在这样一对相邻块，只可能是切块器出了问题
+    （实测就靠这条抓到了表题吸附越界、把「概述」孤立成 2 字块的缺陷）。
+
+    子块（父子分块产物）不参与：它们由用户子分隔符切出，不走段落合并那条路径。
+    """
+    # 当前块
+    cur = records[i]
+    # 子块另有切分契约，不适用本判据
+    if cur.get("is_child"):
+        return False
+    # 只对正文块判定，表格与图片各有独立成块的理由
+    if not _is_text_chunk(cur):
+        return False
+    # 当前块正文；空块归标题孤块检测器管
+    body = strip_breadcrumb(cur).strip()
+    if not body or _is_standalone_body(body, cfg):
+        return False
+    # 检查紧邻的前后两块：中间若隔着表格或图片，它们本就被强制分开，不算未合并
+    for j in (i - 1, i + 1):
+        # 越界即无此邻居
+        if j < 0 or j >= len(records):
+            continue
+        nb = records[j]
+        # 邻居必须同样是正文块、非子块，且与当前块同属一个小节
+        if nb.get("is_child") or not _is_text_chunk(nb) or not _same_section(cur, nb):
+            continue
+        # 取邻居正文
+        nb_body = strip_breadcrumb(nb).strip()
+        # 邻居也未达独立成块门槛时，这两块本该合并
+        if nb_body and not _is_standalone_body(nb_body, cfg):
+            return True
+    # 没有可合并的邻居，短是文档结构使然
+    return False
+
+
 def detect_size_anomaly(records, case_id, cfg):
     """检测块长异常：超出 token 预算过多，或短到不成一个语义单元。"""
     # 收集命中
@@ -222,8 +292,12 @@ def detect_size_anomaly(records, case_id, cfg):
     fragments = []
     # 超长判定的 token 阈值
     over_budget = cfg.chunk_token_num * cfg.oversize_ratio
-    # 逐块检查
-    for r in records:
+    # PPTX 走 slide_mode 每页一块：同一幻灯片内的块早已合并成一块，跨幻灯片才是硬边界，
+    # 因此"本该合并却各自成块"对 pptx 全是误报（都是不同幻灯片的短块，本就不能合并）。
+    # 只豁免碎片合并判定，超长判据仍适用（单张幻灯片也可能超预算），故此处只置标志、不整体 return。
+    is_pptx = (cfg.filename or "").lower().endswith(".pptx")
+    # 逐块检查；碎片判定要看相邻块，因此带上下标
+    for i, r in enumerate(records):
         # 取剥离面包屑后的正文作为长度判据基础
         body = strip_breadcrumb(r)
         # 表格块允许显著超长（长表按行组切分本就可能较大），只对正文块判超长
@@ -240,11 +314,16 @@ def detect_size_anomaly(records, case_id, cfg):
                     message=f"正文 {tokens} token，超出预算 {cfg.chunk_token_num} 的 {cfg.oversize_ratio} 倍",
                     evidence=body[:60] + "…",  # 证据取开头片段用于定位
                 ))
-        # 过短判定：子块与父块采用不同阈值，这是阶段一确立的口径
-        floor = cfg.min_child_chars if r.get("is_child") else cfg.min_parent_chars
-        # 空正文单独由标题孤块检测器负责，这里只管非空但过短的情况
-        if 0 < len(body.strip()) < floor:
-            # 先收集碎片块，数量决定最终是逐条上报还是聚合上报
+        # 碎片判定改为**契约派生**，不再用固定字数下限。
+        #
+        # 生产切块器的契约是：同一标题路径下，两个相邻段落只要都短于独立成块阈值就合并，
+        # 直到 token 预算。因此一个短块合法与否，取决于它「本来能不能合并」：
+        #   - 它是所在小节的唯一一块  → 无邻居可合，短是文档结构使然，不是缺陷；
+        #   - 它与相邻块同属一个小节且两块都短 → 本该合并却没合并，这才是真缺陷。
+        # 固定字数下限表达不了这个区别：实测年报里 79%~85% 的短块属于前者，
+        # 按字数报出来全是无解的噪声，真正的合并失败反而淹没在里面。
+        if not is_pptx and _unmerged_short_neighbor(records, i, cfg):
+            # 先收集碎片块，数量决定最终是逐条上报还是聚合上报；pptx 跨片短块非缺陷，不收集。
             fragments.append((r["index"], body.strip()))
     # 碎片块数量超过聚合阈值时压缩成一条，避免上百条低价值条目淹没高severity问题
     if len(fragments) > cfg.fragment_aggregate_at:
@@ -256,7 +335,8 @@ def detect_size_anomaly(records, case_id, cfg):
             severity="medium",  # 大面积碎片说明切分粒度整体失当，比零星短块更值得关注
             case_id=case_id,
             chunk_index=fragments[0][0],  # 用首个碎片的序号作为锚点
-            message=f"存在 {len(fragments)} 个碎片块（正文短于 {cfg.min_parent_chars} 字），样例：{sample_idx}",
+            message=f"存在 {len(fragments)} 个本该合并却各自成块的短块"
+                    f"（同一小节内相邻、且都未达独立成块门槛 {standalone_threshold(cfg):.0f} token），样例：{sample_idx}",
             evidence=" | ".join(text for _, text in fragments[:3]),  # 证据给前三个碎片内容
         ))
     else:
@@ -267,7 +347,8 @@ def detect_size_anomaly(records, case_id, cfg):
                 severity="low",  # 零星短块通常是排版碎片，危害有限
                 case_id=case_id,
                 chunk_index=idx,
-                message=f"正文仅 {len(text)} 字，短于下限 {cfg.min_parent_chars}",
+                message=f"正文仅 {len(text)} 字，同一小节内相邻块也未达独立成块门槛"
+                        f"（{standalone_threshold(cfg):.0f} token），两者本该合并",
                 evidence=text,  # 过短块直接给全文作证据
             ))
     # 返回全部命中
@@ -341,9 +422,16 @@ def detect_broken_table(records, case_id, cfg):
 
 
 def detect_missing_breadcrumb(records, case_id, cfg):
-    """检测面包屑丢失：正文块没有标题路径，检索时失去层级上下文。"""
+    """检测面包屑丢失：正文块没有标题路径，检索时失去层级上下文。
+
+    PPTX 例外：它走 slide_mode，严格按幻灯片每页一块，标题只取本页首行短文本，
+    目录页与过渡页本来就没有标题——这是切分器的设计而非缺陷，报出来全是误报。
+    """
     # 收集命中
     findings = []
+    # PPTX 整页成块，无标题页天然没有面包屑，整份样本跳过该判据
+    if (cfg.filename or "").lower().endswith(".pptx"):
+        return findings
     # 定位第一个带面包屑的 chunk：在它之前的块属于文档标题出现前的封面区，天然没有层级
     first_titled = next((i for i, r in enumerate(records) if r.get("important_kwd")), len(records))
     # 逐块检查，跳过封面区
@@ -362,6 +450,34 @@ def detect_missing_breadcrumb(records, case_id, cfg):
             chunk_index=r["index"],
             message="正文块缺少标题面包屑，检索时无层级上下文",
             evidence=strip_breadcrumb(r)[:60] + "…",
+        ))
+    # 再检查相邻块之间的“父级被同级误判挤出”症状：路径非空但少了一层，原有空路径检测看不见。
+    for current_position, current in enumerate(records[1:], start=1):  # 从第二块开始逐对比较前后标题路径。
+        if current.get("doc_type_kwd") != "table":  # 当前已知高价值症状发生在标题分组下的表格块。
+            continue  # 其他类型缺少足够强的相邻归属证据，保守不报。
+        previous = records[current_position - 1]  # 读取紧邻的上一切片作为潜在父标题上下文来源。
+        if not _is_text_chunk(previous):  # 只有上一正文块能稳定携带该小节的完整标题路径与表题文本。
+            continue  # 上一块也是媒体时无法证明路径层级缺失。
+        previous_path = previous.get("important_kwd") or []  # 读取上一正文块的标题路径。
+        current_path = current.get("important_kwd") or []  # 读取当前表格块的标题路径。
+        if len(previous_path) < 2 or not current_path:  # 至少需要共同根标题和一个可能丢失的父标题。
+            continue  # 证据不足时沿用既有空路径检测结果。
+        if previous_path[0] != current_path[0]:  # 不同顶级区段的相邻块属于正常章节切换。
+            continue  # 顶级标题不同不能据此推断父级缺失。
+        missing_parent = previous_path[-1]  # 上一路径的末级标题是最可能被同级误判挤出的直接父级。
+        if missing_parent in current_path:  # 当前路径已经保留该父级时层级关系完整。
+            continue  # 不重复报告正常的父子面包屑。
+        nearby_lines = strip_breadcrumb(previous).splitlines() + strip_breadcrumb(current).splitlines()  # 合并相邻正文与表格正文寻找编号表题证据。
+        caption_evidence = next((line.strip() for line in nearby_lines if CAPTION_PATTERN.match(line.strip()) and missing_parent in line), "")  # 表题同时提及缺失父标题才证明两块仍属同一语义区段。
+        if not caption_evidence:  # 没有显式表题关联时可能只是普通同级章节切换。
+            continue  # 保守跳过以避免误判正常标题。
+        findings.append(Finding(  # 记录路径部分缺失而非整个面包屑为空的回归症状。
+            detector="missing_breadcrumb",  # 复用面包屑检测类别以保持报告和前端契约稳定。
+            severity="medium",  # 父级丢失会把表格挂到错误章节，影响检索准确性高于普通空路径。
+            case_id=case_id,  # 写入当前语料标识便于回归定位。
+            chunk_index=current["index"],  # 定位到实际缺父级的表格切片。
+            message=f"面包屑疑似缺少父标题“{missing_parent}”，MinerU 可能把父子标题误标为同级",  # 明确指出根因方向与缺失标题。
+            evidence=" > ".join(current_path) + " ｜ " + caption_evidence[:60],  # 同时展示错误路径和表题关联证据。
         ))
     # 返回全部命中
     return findings
@@ -486,7 +602,11 @@ def detect_empty_image(records, case_id, cfg):
 
 
 def detect_duplicate_content(records, case_id, cfg):
-    """检测相邻块内容重复：排除设计内的 overlap 之外的异常复制。"""
+    """检测相邻块内容重复：排除设计内的 overlap 之外的异常复制。
+
+    只在同一标题小节内判定。面包屑不同的两块正文雷同，是文档自身的格式，
+    不是切块器复制出来的（理由见下），报出来全是噪声。
+    """
     # 收集命中
     findings = []
     # 从第二块开始与前一块比较
@@ -495,6 +615,18 @@ def detect_duplicate_content(records, case_id, cfg):
         cur, prev = records[i], records[i - 1]
         # 只比较正文块，表格重复表头是设计行为
         if not _is_text_chunk(cur) or not _is_text_chunk(prev):
+            continue
+        # 面包屑不同一律不算重复。
+        #
+        # 这不是经验规则而是结构性结论：切块器的 overlap 只在同一标题路径、
+        # 同一原始段落的相邻分片之间生成（mineru_chunker._merge_text_units 里
+        # prev_chunk_last_path == current[0].path and prev_chunk_last_order == current[0].order），
+        # 跨标题根本产生不出重复内容。因此跨面包屑的正文雷同只可能来自文档本身——
+        # 年报里每个小节标题下都有一句「□适用 √不适用」，那是披露格式，不是缺陷。
+        #
+        # 实测该轮 18 条命中全部是这一类（如「应收利息 > (1) 应收利息分类」与
+        # 「应收利息 > (2) 重要逾期利息」各自的「□适用 √不适用」），排除后归零。
+        if not _same_section(cur, prev):
             continue
         # 取两块剥离面包屑后的正文
         a, b = strip_breadcrumb(prev).strip(), strip_breadcrumb(cur).strip()
@@ -519,6 +651,25 @@ def detect_duplicate_content(records, case_id, cfg):
     return findings
 
 
+# Python dunder 标识符：__name__ / __init__ / __main__ 这类，形式上与 markdown 粗体 __xx__ 无法区分
+DUNDER_PATTERN = re.compile(r"^__[a-z][a-z0-9_]*__$", re.IGNORECASE)
+# 代码块特征词：命中任意一个即认为该正文含源码，其中的 __xx__ 应按标识符而非 markdown 理解
+CODE_HINT_PATTERN = re.compile(r"\b(?:def|class|import|from|return|print|self)\b[\s(.]|=>|::")
+
+
+def _is_code_dunder(matched, body):
+    """判断一处 markdown 强调命中是否其实是源码里的 Python dunder 标识符。
+
+    两个条件满足其一即认定为代码：命中片段本身就是 __xxx__ 形式的标识符，
+    或所在正文含明显的源码特征。只要有一条成立就不该按 markdown 残留上报。
+    """
+    # 命中片段形如 __name__，是 dunder 而不是 markdown 粗体
+    if DUNDER_PATTERN.match(matched.strip()):
+        return True
+    # 正文含 def/class/import/print( 等源码特征，整块按代码理解
+    return bool(CODE_HINT_PATTERN.search(body))
+
+
 def detect_markdown_residue(records, case_id, cfg):
     """检测 Markdown 强调标记残留：** __ 与 strong/em 标签不应进入入库正文。
 
@@ -538,6 +689,10 @@ def detect_markdown_residue(records, case_id, cfg):
         match = MARKDOWN_RESIDUE_PATTERN.search(body)
         # 未命中则该块正常
         if not match:
+            continue
+        # Python 的 dunder（__name__ / __init__ / __main__）形如 __xx__，会被 __[^_\n]+__
+        # 当成 markdown 粗体。课件类 PPTX 里满屏都是代码，这条规则曾因此产出 17 条误报。
+        if _is_code_dunder(match.group(0), body):
             continue
         # 记录问题
         findings.append(Finding(
@@ -616,6 +771,24 @@ def detect_dangling_reference(records, case_id, cfg):
     """
     # 收集命中
     findings = []
+    # 预先算出每个块在其所属标题小节内的序号。
+    # 「指代词开头」是否真的读不懂，取决于被指代对象落在哪一侧的边界外，
+    # 而小节内序号正好把两种情形分开（判据见下面的豁免分支）。
+    #
+    # 计数**必须把表格与图片一起数进去**：指代对象常常正是同小节里的那张表
+    # （「上述投资额仅为主营业务长期资产购建投入…」指的就是紧邻的投资额表格）。
+    # 只数正文块会把这类块误算成小节首块，从而漏报真问题——实测漏了 3 条。
+    section_seq = {}
+    # 逐小节累计出现次数，序号即该块在本小节中的位次
+    seen = {}
+    # 按文档顺序遍历，保证序号反映真实先后
+    for r in records:
+        # 面包屑即标题路径，作为小节标识
+        key = tuple(r.get("important_kwd") or [])
+        # 该小节已出现的块数加一，表格与图片同样占位
+        seen[key] = seen.get(key, 0) + 1
+        # 记下本块在小节内的位次
+        section_seq[r["index"]] = seen[key]
     # 从第二块开始检查，首块没有前文可依赖
     for i, r in enumerate(records):
         # 只检查正文块
@@ -633,6 +806,17 @@ def detect_dangling_reference(records, case_id, cfg):
         m = ANAPHORA_PATTERN.match(body)
         # 未命中说明开头不依赖前文
         if not m:
+            continue
+        # 位于独立标题小节**首块**（含表格图片在内的第一个块）且带面包屑时不算缺失上下文。
+        #
+        # 首块的指代必然跨小节——同小节没有更靠前的块可指。而跨小节意味着标题已经
+        # 切换话题，面包屑本身就是新的上下文锚点：检索命中「上述与合同成本有关的资产…」
+        # 时，面包屑「… > 4.合同成本减值」已经说清这段在讲什么，读者不会不知所云。
+        # 反过来，小节第二块及以后的指代指向的是**同一小节里更靠前的那个块**，
+        # 那才是切分造成的断裂——它可能是被切走的前一段正文（「上图输入框中的输入信息
+        # 参见下表。」），也可能是同小节的一张表（「上述投资额…」指紧邻的投资额表格）。
+        # 无面包屑的块没有这个锚点，不适用本豁免。
+        if section_seq.get(r["index"]) == 1 and (r.get("important_kwd") or []):
             continue
         # 指代对象若在本切片内已出现（如「该公司」后文又写了公司全名），则不算缺失。
         # 用指代词后紧跟的名词做粗判：本块内该名词出现两次以上说明有先行词。
@@ -659,9 +843,17 @@ def detect_list_split(records, case_id, cfg):
     """检测列表被拆散：编号项跨切片断开。
 
     「一、二、三」被拆到两个切片时，任何一片单独看都是不完整的枚举。
+
+    但「同标题下没有合并到一起」本身不构成缺陷——切块器有两个合法的断开理由，
+    命中任一条时列表跨块都是契约使然而非缺陷，判据必须先把它们排除掉（见下）。
+
+    PPTX 例外：走 slide_mode 每页一块，跨幻灯片的相邻列表项是切分契约而非缺陷，整份样本跳过。
     """
     # 收集命中
     findings = []
+    # PPTX 整页成块，跨幻灯片列表跨块属 slide_mode 契约，直接跳过避免全是误报
+    if (cfg.filename or "").lower().endswith(".pptx"):
+        return findings
     # 从第二块开始，需要与前一块比较
     for i in range(1, len(records)):
         # 当前块与前一块
@@ -677,6 +869,26 @@ def detect_list_split(records, case_id, cfg):
         prev_body = strip_breadcrumb(prev).strip()
         # 任一为空则无从判断
         if not cur_body or not prev_body:
+            continue
+        # 可合并性前置判断：只有「本来能合并却没合并」才是缺陷。
+        #
+        # 生产 _merge_text_units 对同一标题下的相邻段落只有两个断开理由：
+        #   crossed = _is_standalone_unit(前) or _is_standalone_unit(本)   —— 任一侧达到独立成块门槛
+        #   current_tokens + unit.tokens > budget                        —— 合并后超 token 预算
+        # 两者都不成立时切块器必然合并，产出里还分着才说明它出了问题。
+        #
+        # 不加这道判断，长段落组成的编号列表会被成片误报：实测 76 条命中里 64 条属此类，
+        # 典型如「（2）存货减值的估计…」478 字接「（3）长期资产减值的估计…」——
+        # 两个都是完整的独立语义单元，切块器本来就该让它们各自成块。
+        #
+        # 两侧都判而不只判前一块：契约里是 or，「短块接长块」同样会断开，
+        # 只判前块的话这类仍会误报（实测 12 条）。
+        if _is_standalone_body(prev_body, cfg) or _is_standalone_body(cur_body, cfg):
+            continue
+        # 合并后超出 token 预算时，断开是预算所限而非缺陷。
+        # 门槛是预算的八成，因此两侧都未达门槛时 token 和最多约 1.6 倍预算，
+        # 这条确实可能单独触发，不能省。
+        if num_tokens_from_string(prev_body) + num_tokens_from_string(cur_body) > cfg.chunk_token_num:
             continue
         # 当前块首行与前一块末行都是列表项，说明列表被从中间切开
         cur_first = cur_body.split("\n")[0]
@@ -706,6 +918,11 @@ HEADING_TAIL_PATTERN = re.compile(
     r"\d+(?:\.\d+)+\s*\S)")
 # 标题不应含这些正文特征：出现即说明是句子而非标题
 HEADING_EXCLUDE = re.compile(r"[，,；;：:]|月，|年，|日，")
+# 目录项模式：正文 + 引导点（或多个空格）+ 页码收尾，如
+# 「第八节 财务报告....48」「第八节 财务报告 …… 41」「第八节 财务报告    30」。
+# 目录里每一行都长得像标题（「第八节 财务报告」确实是章节名），但它们是**目录项**，
+# 其正文本来就在几十页之后，不存在「标题与正文被切开」这回事。
+TOC_ENTRY_PATTERN = re.compile(r"(?:[.．·・…]{2,}\s*|\s{2,})\d{1,4}\s*$")
 
 
 def detect_heading_tail(records, case_id, cfg):
@@ -738,6 +955,12 @@ def detect_heading_tail(records, case_id, cfg):
             continue
         # 含逗号分号等句内标点的是正文，不是标题
         if HEADING_EXCLUDE.search(tail):
+            continue
+        # 末行是目录项（带引导点与页码）时不算标题。
+        # 目录页每一行都形似标题——「第八节 财务报告」本就是章节名——但它们指向的正文
+        # 在几十页之外，本来就不该跟在目录后面，谈不上「被切开」。
+        # 实测该检测器 10 条命中里有 9 条是目录页末行「第八节 财务报告....48」这一形态。
+        if TOC_ENTRY_PATTERN.search(tail):
             continue
         # 前一行也是同类编号项时，这是列表而非标题，交由 list_split 处理
         if LIST_PREFIX_PATTERN.match(lines[-2].strip()):
@@ -775,7 +998,7 @@ def detect_caption_orphan(records, case_id, cfg):
     # 收集命中
     findings = []
     # 逐块检查
-    for r in records:
+    for record_position, r in enumerate(records):  # 保留下标以检查表题是否残留在紧邻媒体块的上一正文块末尾。
         # 只检查正文块，图片块由 empty_image 负责
         if not _is_text_chunk(r):
             continue
@@ -784,6 +1007,27 @@ def detect_caption_orphan(records, case_id, cfg):
         # 空正文交由标题孤块检测器
         if not body:
             continue
+        # 检查更隐蔽的形态：表题不是独立短块，而是被短段落合并器粘在上一正文块末尾。
+        lines = [line.strip() for line in body.splitlines() if line.strip()]  # 去掉空行后读取正文最后一个语义行。
+        tail = lines[-1] if lines else ""  # 末行是潜在图表题，正文主体长度不再影响判断。
+        next_record = records[record_position + 1] if record_position + 1 < len(records) else None  # 读取紧邻后继块确认题注对象。
+        next_is_media = bool(next_record) and next_record.get("doc_type_kwd") in ("table", "image")  # 只有紧邻表格或图片才构成题注错位。
+        current_pages = set(r.get("page_num_int") or [])  # 读取正文块页码以排除目录页与后文媒体恰好相邻的情况。
+        next_pages = set((next_record or {}).get("page_num_int") or [])  # 读取后继媒体块页码并保持无页码路径可降级。
+        same_page = not current_pages or not next_pages or bool(current_pages & next_pages)  # 双方有页码时必须存在同页交集，无页码时不额外猜测。
+        compact_tail = re.sub(r"\s+", "", tail)  # 归一化 MinerU 可能插入的普通空格与全角空白。
+        compact_next = re.sub(r"\s+", "", (next_record or {}).get("content", ""))  # 以同一口径归一化媒体块正文。
+        caption_left_in_text = bool(CAPTION_PATTERN.match(tail)) and len(tail) <= 80 and next_is_media and same_page and compact_tail not in compact_next  # 表题只在同页正文末尾且未进入媒体块时判为错位。
+        if caption_left_in_text:  # 命中用户截图中的“正文 + 表题 / 下一块表格”症状。
+            findings.append(Finding(  # 把问题归入既有 caption_orphan 类别以保持报告兼容。
+                detector="caption_orphan",  # 检测器名沿用图表注脱离上下文类别。
+                severity="medium",  # 表格失去表题会降低独立召回结果的可解释性。
+                case_id=case_id,  # 写入当前语料标识。
+                chunk_index=r["index"],  # 定位到错误残留表题的上一正文切片。
+                message="图表题残留在上一正文块末尾，未合并到紧邻媒体块",  # 描述与 UI 中实际症状一致。
+                evidence=tail[:80] + " ⏎▸ " + (next_record or {}).get("content", "")[:30],  # 展示错位边界两侧的文本证据。
+            ))
+            continue  # 同一表题无需再按“整体短块”规则重复报告。
         # 目录条目形如「附表 1 xxx统计数据 81」，末尾的数字是页码而非内容。
         # 它们属于目录页残留，应由噪声治理处理，误判成孤立图注会掩盖真正的问题。
         if re.search(r"\s\d{1,4}$", body):
@@ -829,10 +1073,16 @@ ALL_DETECTORS = [
 ]
 
 
-def run_detectors(records, case_id, cfg=None):
-    """对一个样本的全部 chunk 跑所有检测器，返回合并后的命中列表。"""
+def run_detectors(records, case_id, cfg=None, filename=""):
+    """对一个样本的全部 chunk 跑所有检测器，返回合并后的命中列表。
+
+    filename 是该样本的原始文件名，按样本注入到配置副本里供文件类型相关的判据使用。
+    """
     # 未指定配置时使用默认阈值
     cfg = cfg or DetectorConfig()
+    # 按样本复制一份配置并写入文件名：cfg 由调用方跨样本复用，直接改会把上一个样本的文件名带到下一个
+    if filename:
+        cfg = replace(cfg, filename=filename)
     # 汇总所有检测器的命中
     findings = []
     # 逐个执行检测器

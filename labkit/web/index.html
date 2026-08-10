@@ -547,6 +547,44 @@ tr.is-baseline { background: var(--accent-soft); }
 .mini:disabled { opacity: 0.4; cursor: not-allowed; }
 .mini.danger:hover:not(:disabled) { border-color: var(--bad); color: var(--bad); }
 
+/* ========== 评估任务：进行中的行与进度页 ========== */
+/* 任务行用凹陷面着色，与已完成的正式轮次拉开区别——它还不是一轮可用的数据 */
+tr.is-job { background: var(--sunk); }
+tr.is-job td { color: var(--ink-soft); }
+/* tab 上的小圆点：有任务在跑时提示去看进度，不必盯着概览页 */
+.job-dot {
+  display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+  background: var(--accent); margin-left: 0.35rem; vertical-align: middle;
+  animation: job-pulse 1.4s ease-in-out infinite;
+}
+@keyframes job-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+/* 进度条：细长一条，够看清比例即可，不喧宾夺主 */
+.job-bar { height: 8px; border-radius: 4px; background: var(--line); overflow: hidden; }
+.job-bar > i { display: block; height: 100%; background: var(--accent); transition: width 0.3s; }
+/* 失败与中断状态下进度条改色，一眼能看出这轮没跑完 */
+.job-bar.bad > i { background: var(--bad); }
+.job-bar.warn > i { background: var(--warn); }
+/* 进度页顶部的概况区：进度条 + 几个关键数字 */
+.job-head { display: flex; align-items: center; gap: 0.8rem; flex-wrap: wrap; margin-bottom: 0.7rem; }
+.job-head .grow { flex: 1; min-width: 12rem; }
+/* 逐语料状态表里的状态徽标 */
+.job-st { font-size: 0.74rem; padding: 0.1rem 0.4rem; border-radius: 3px; white-space: nowrap; }
+.job-st.done { background: var(--good-soft); color: var(--good); }
+.job-st.running { background: var(--accent); color: #fff; }
+.job-st.failed { background: var(--bad-soft); color: var(--bad); }
+.job-st.pending { background: var(--line); color: var(--muted); }
+/* 样本级错误信息：等宽小字，长错误不撑破表格 */
+.job-err {
+  font-family: var(--mono); font-size: 0.74rem; color: var(--bad);
+  margin-top: 0.2rem; word-break: break-all;
+}
+/* 失败堆栈折叠区，默认收起，需要时再展开 */
+.job-trace {
+  font-family: var(--mono); font-size: 0.72rem; color: var(--ink-soft);
+  background: var(--sunk); border: 1px solid var(--line); border-radius: 4px;
+  padding: 0.6rem; margin-top: 0.5rem; max-height: 18rem; overflow: auto; white-space: pre;
+}
+
 /* ========== 趋势图 ========== */
 .trend-row {
   display: grid; grid-template-columns: 8rem 1fr 9rem; gap: 0.9rem;
@@ -643,7 +681,14 @@ tr.is-baseline { background: var(--accent-soft); }
 <!-- ========== 标签页导航 ========== -->
 <nav>
   <button class="tab active" data-view="overview">概览</button>
+  <!-- 评估进度：一轮评估要十几分钟，需要一个能长期停留、刷新后还回得来的地方看逐语料状态 -->
+  <button class="tab" data-view="evaljob">评估进度<span class="job-dot" id="jobDot" style="display:none"></span></button>
   <button class="tab" data-view="chunks">切片预览</button>
+  <!-- 试切独立成页签。它与「切片预览」看的根本不是一回事：预览看某一轮评估存下来的快照，
+       试切用顶栏当前参数对任意语料实时切分。此前它只是预览页里的一个按钮，进页面默认是
+       版本模式、左侧只列该轮评估过的样本，没评估过的文件必须先发现并点那个按钮才看得到，
+       等于把「看还没进评估的文件」藏在一次模式切换后面 -->
+  <button class="tab" data-view="live">试切</button>
   <button class="tab" data-view="rules">规则质量</button>
   <button class="tab" data-view="corpus">语料库</button>
   <button class="tab" data-view="crawl">网页抓取</button>
@@ -720,8 +765,40 @@ tr.is-baseline { background: var(--accent-soft); }
     </div>
   </div>
 
+  <!-- ---------- 评估进度 ---------- -->
+  <div class="view" id="view-evaljob">
+    <div class="card">
+      <h3 style="display:flex;align-items:center;gap:0.6rem">
+        <span>评估进度</span>
+        <span id="jobBadge"></span>
+      </h3>
+      <p class="hint" style="margin:0 0 0.9rem">
+        评估在后台逐个语料跑，<strong>每跑完一个就落盘一次</strong>。因此关掉页面、刷新，
+        甚至改代码触发热加载重启，都不会让已经跑完的部分白费——回到这里点
+        <strong>续跑</strong>，从断点接着跑剩下的语料。
+      </p>
+      <div class="src-bar" style="margin-bottom:0.9rem">
+        <label>任务 <select id="jobPick"></select></label>
+        <span class="spacer"></span>
+        <button class="btn" id="btnJobResume">续跑</button>
+        <button class="btn" id="btnJobCancel">取消</button>
+        <button class="btn" id="btnJobDelete">删除任务</button>
+      </div>
+      <div id="jobBody"><div class="empty">尚无评估任务。到「概览」页点右上角「运行评估」开始一轮。</div></div>
+    </div>
+  </div>
+
   <!-- ---------- 切片预览 ---------- -->
+  <!-- 这里同时是预览面板（#chunkTopBar + #chunkLayout）的初始挂载点，
+       进「试切」页签时整块面板会被搬到 #view-live 下，切回来时再搬回 -->
   <div class="view" id="view-chunks">
+    <!-- 模式指示条。两个页签共用同一块面板，光看内容分不出自己在哪一边，
+         这行字负责如实交代当前是在看评估快照还是在试切 -->
+    <div class="card" id="chunkTopBar" style="margin-bottom:0.7rem">
+      <div class="src-bar">
+        <span class="hint" id="chunkModeHint"></span>
+      </div>
+    </div>
     <div class="split" id="chunkLayout">
       <div class="card" style="margin:0">
         <h3>样本</h3>
@@ -756,20 +833,28 @@ tr.is-baseline { background: var(--accent-soft); }
     </div>
   </div>
 
+  <!-- ---------- 试切 ---------- -->
+  <!-- 空容器：试切与切片预览共用同一块预览面板，进入本页签时把那块 DOM 整体搬过来。
+       不复制一份 HTML，是因为面板绑死在一组固定 id 上、PDF 渲染器又是单例闭包——
+       复制会让 id 重复、渲染器只认第一份，标注、截图、滚动定位全部错位 -->
+  <div class="view" id="view-live"></div>
+
   <!-- ---------- 规则质量 ---------- -->
   <div class="view" id="view-rules">
     <div class="card">
       <h3>标注驱动的规则迭代</h3>
       <p class="hint" style="margin:0 0 0.9rem">
-        你在切片预览里做的每一次判定都记在这里。<strong>准确率</strong>说明哪条规则最该改，
-        <strong>回归护栏</strong>把这些判定变成可执行断言——改完规则跑一次就知道有没有碰坏别的。
-        <strong>优化任务书</strong>把全部待办连同规则源码、命中证据、验证方式打包成一份
-        Markdown，直接交给 Claude 就能动手改。<br>
-        所有数字都按<strong>选定版本</strong>重新核对过：修好的误报不再计入准确率、
-        也不会出现在任务书里——否则就是拿旧账压现在的成绩，还会让人去改一个已经不存在的问题。
+        你在切片预览里做的每一次判定都记在这里，<strong>按版本独立保存</strong>：
+        在哪一版评估上标的，就属于哪一版，换版本看到的是那一版自己的账。<br>
+        <strong>准确率</strong>说明哪条规则最该改，<strong>优化任务书</strong>把该版本全部待办
+        连同规则源码、命中证据、验证方式打包成一份 Markdown，直接交给 Claude 就能动手改。
+        <strong>回归护栏</strong>是唯一跨版本的动作：拿上一版的判定，在这一版的切分结果上
+        逐条核对，回答「这条误报改好了没有」「有没有把本来能检出的碰坏」。<br>
+        改完规则的正确顺序是：<strong>到概览跑一轮新评估</strong>——标注会自动继承到新版本并
+        按新结果重新判定，修好的误报会从「仍在误报」转到「已修复」。
       </p>
       <div class="cfg-row">
-        <label class="cfg-label">基于版本</label>
+        <label class="cfg-label">版本</label>
         <div class="cfg-input" style="grid-column:span 2">
           <select id="rulesRun" style="max-width:26rem"></select>
           <span class="hint" style="margin-left:0.5rem" id="rulesRunHint"></span>
@@ -781,7 +866,7 @@ tr.is-baseline { background: var(--accent-soft); }
           <button class="btn primary" id="btnFullReport">生成优化任务书</button>
           <button class="mini" id="btnGuard">跑回归护栏</button>
           <button class="mini" id="btnRefreshRules">刷新统计</button>
-          <span class="hint" id="guardHint" style="margin-left:0.5rem">护栏会用当前代码把已标注的样本重切一遍，样本多时要等一会儿。</span>
+          <span class="hint" id="guardHint" style="margin-left:0.5rem"></span>
         </div>
       </div>
     </div>
@@ -796,9 +881,30 @@ tr.is-baseline { background: var(--accent-soft); }
   <div class="view" id="view-corpus">
     <div class="card">
       <h3>当前语料</h3>
+      <p class="hint" style="margin:0 0 0.9rem">
+        <strong>启用</strong>决定该样本是否参与「运行评估」。停用不会删除任何东西——产物、历史轮次、
+        已有标注全都留着，只是本轮不跑它；重新勾上即恢复。<br>
+        停用期间，它的标注会在新版本里标为「本版本未评估」原样保留，不计入准确率、
+        也不会被误报成需要重做的失配标注。<br>
+        <strong>删除</strong>是另一回事，且不可撤销：语料本体、关联原文、以及它在<strong>全部版本</strong>下的
+        人工标注都会被删掉。历史轮次的切分快照不动——那一轮确实跑过它，改写会让趋势图与
+        已生成的报告对不上；删除后在历史版本里仍能看到它的切片，只是没有原文对照。
+      </p>
+      <div class="src-bar" style="margin-bottom:0.9rem">
+        <span class="hint" id="corpusCount"></span>
+        <span class="spacer"></span>
+        <button class="mini" id="btnCorpusAll">全部启用</button>
+        <button class="mini" id="btnCorpusNone">全部停用</button>
+        <button class="mini" id="btnCorpusInvert">反选</button>
+        <!-- 批量删除。默认禁用，选中行之后才可点，按钮上直接带出选中数量，
+             避免「以为选中了却什么都没删」或「不知道要删几个就点了确认」 -->
+        <button class="mini danger" id="btnCorpusDelete" disabled>删除选中</button>
+      </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>样本</th><th>文件名</th><th>类型</th><th class="num">原始块</th><th>备注</th></tr></thead>
+          <!-- 选择列与启用列刻意分开：一个决定「删哪些」，一个决定「评估跑哪些」，
+               复用同一个勾选框会让两种语义混在一起，误删的代价又不可撤销 -->
+          <thead><tr><th><input type="checkbox" id="corpusPickAll" title="全选/取消全选"></th><th>启用</th><th>样本</th><th>文件名</th><th>类型</th><th class="num">原始块</th><th>备注</th><th>操作</th></tr></thead>
           <tbody id="corpusRows"></tbody>
         </table>
       </div>
@@ -989,9 +1095,11 @@ tr.is-baseline { background: var(--accent-soft); }
         <div class="cfg-row local-only">
           <label class="cfg-label">处理后端类型</label>
           <div class="cfg-input">
+            <!-- vlm-engine 排首位：实验室跑的是本机 VLM 部署，它才是默认；
+                 select 在未被 /api/config 回填时会选中第一项，顺序即默认值 -->
             <select id="parseBackend">
-              <option value="pipeline">pipeline</option>
               <option value="vlm-engine">vlm-engine</option>
+              <option value="pipeline">pipeline</option>
               <option value="hybrid-engine">hybrid-engine</option>
               <option value="vlm-http-client">vlm-http-client</option>
               <option value="hybrid-http-client">hybrid-http-client</option>
@@ -1072,6 +1180,8 @@ tr.is-baseline { background: var(--accent-soft); }
     </div>
     <div class="modal-body">
       <div id="configPaths" class="paths-box"></div>
+      <!-- 增强项模型可用性：与数据目录同区展示，避免开关打开却没效果时无从判断 -->
+      <div id="configLlm" class="paths-box"></div>
       <div id="configFields"></div>
     </div>
   </div>
@@ -1112,7 +1222,7 @@ let shotCache = {};         // 截图缓存，避免同一切片重复渲染
 pdfjsLib.GlobalWorkerOptions.workerSrc = "/vendor/pdf.worker.min.js";
 let runsCache = [];         // 历史轮次摘要，按时间倒序
 let baselineId = "";        // 当前作为对比基准的轮次标识
-let viewingRun = "";        // 切片预览查看的历史轮次，空串表示用当前代码实时切分
+let viewingRun = "";        // 切片预览查看的版本，加载轮次列表后指向最新一轮
 
 // 检测器的中文短名与严重度。英文标识便于代码检索，但表格里必须给中文，
 // 否则一眼看不出是哪类问题，也就无从按类型着手修复。
@@ -1190,6 +1300,7 @@ let configDefaults = {}; // 服务端给的默认值
 let parserConfig = {};   // 当前生效的配置
 let configPaths = {};    // 数据目录位置，数据已移出仓库故需在界面上标明
 let configCloud = {};    // 云端解析可用性，未配 token 时禁用相关入口
+let configLlm = {};      // 增强项模型可用性，未配租户时三个开关都不会生效
 let currentCodeHash = ""; // 当前被测代码的指纹，用于标出哪一轮快照还对得上
 
 // 加载字段定义与默认值
@@ -1200,6 +1311,7 @@ async function loadConfig() {
     configDefaults = d.defaults || {};
     configPaths = d.paths || {};
     configCloud = d.cloud || {};
+    configLlm = d.llm || {};  // 增强项模型状态，随配置面板一并展示
     // 当前代码指纹，用于判断某一轮快照是否还对得上现在的代码
     currentCodeHash = d.code_hash || "";
     // 未配置 token 时把原因显示出来，而不是让按钮无声地不可点
@@ -1261,6 +1373,27 @@ function renderConfigForm() {
       数据刻意放在仓库之外，避免大量产物拖慢 IDE 索引。
       可通过 ${esc(configPaths.configurable_by || "")} 修改。
     </p>` : "";
+
+  // 增强项依赖的模型是否真的可用。三个开关（图片描述/表格摘要/艺术字兜底）都要按租户
+  // 去 ragflow 库里查模型配置，没配租户时开关打开也毫无效果——不标出来会被当成模型坏了
+  const L = configLlm || {};
+  $("configLlm").innerHTML = L.available
+    ? `<div class="cfg-group-title">增强项模型</div>
+       <div class="path-row"><span>借用租户</span><code>${esc(L.tenant_id || "")}</code></div>
+       <div class="path-row"><span>视觉模型（图片描述、艺术字兜底）</span>
+         <span class="pill ${L.vision ? "good" : "high"}">${L.vision ? "可用" : "不可用"}</span></div>
+       <div class="path-row"><span>对话模型（表格摘要）</span>
+         <span class="pill ${L.chat ? "good" : "high"}">${L.chat ? "可用" : "不可用"}</span></div>
+       ${L.hint ? `<p class="hint" style="margin:0.5rem 0 0;color:var(--warn)">${esc(L.hint)}</p>` : ""}
+       <p class="hint" style="margin:0.5rem 0 0">
+         每张图一次视觉调用、每张表一次对话调用。表格远多于图片，是耗时大头；
+         预览表格多的样本前建议先关掉表格摘要。开着增强项时切分结果每轮都不同，
+         图片/表格块上的标注无法跨版本继承。
+       </p>`
+    : `<div class="cfg-group-title">增强项模型</div>
+       <p class="hint" style="margin:0;color:var(--warn)">
+         不可用，三个增强项开关打开也不会生效：${esc(L.hint || "未配置租户")}
+       </p>`;
 
   $("configFields").innerHTML =
     group("chunk", "切分参数", "影响切分结果，调整后重新运行评估即可看到差异。") +
@@ -1353,7 +1486,19 @@ async function api(path, options = {}) {
     ...options,
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.message || `请求失败 (${res.status})`);
+  if (!res.ok) {
+    // 错误对象带上服务端返回的完整响应体。只留一句 message 是不够的：
+    // 像「续跑时代码指纹已变」这种拒绝，调用方要拿到两个指纹、已完成数量
+    // 才能弹出一个让人能据以决策的确认框
+    const err = new Error(data.message || `请求失败 (${res.status})`);
+    // 机器可判的原因码，调用方据此分支处理而不是去匹配文案
+    err.code = data.code || "";
+    // 完整响应体，细节字段都在里面
+    err.detail = data;
+    // HTTP 状态码，个别调用方需要区分 404 与 409
+    err.status = res.status;
+    throw err;
+  }
   return data;
 }
 
@@ -1364,22 +1509,152 @@ function sevClass(sev) {
 
 // ========== 标签页切换 ==========
 document.querySelectorAll(".tab").forEach(tab => {
-  tab.addEventListener("click", () => {
+  tab.addEventListener("click", async () => {
     // 切换按钮激活态
     document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
     tab.classList.add("active");
     // 切换视图显示
     document.querySelectorAll(".view").forEach(v => v.classList.remove("active"));
     $("view-" + tab.dataset.view).classList.add("active");
+    const view = tab.dataset.view;
+    // 切片预览与规则质量都以版本为准，进页面前先刷新轮次列表。
+    // 不刷新的话，两者的版本下拉停留在页面加载那一刻的快照——在概览跑完新评估后
+    // 回到这里，新版本根本选不到，而概览的历史列表里明明有，两边就对不上了
+    // 试切页签同样要刷新：从试切切回预览时要知道有哪些带快照的版本可退回去
+    if (view === "chunks" || view === "rules" || view === "live") await loadRuns();
     // 进入对应视图时按需加载数据
-    if (tab.dataset.view === "corpus") loadCorpus();
-    if (tab.dataset.view === "sources") loadSources();
-    if (tab.dataset.view === "chunks") loadChunkCaseList();
-    if (tab.dataset.view === "parse") loadParseTasks();
-    if (tab.dataset.view === "crawl") loadCrawl();
-    if (tab.dataset.view === "rules") loadRules();
+    if (view === "corpus") loadCorpus();
+    if (view === "sources") loadSources();
+    if (view === "chunks") await enterChunksView();
+    // 试切页签：与切片预览共用面板，进入时把面板搬过来并切到试切态
+    if (view === "live") await enterLiveView();
+    if (view === "parse") loadParseTasks();
+    if (view === "crawl") loadCrawl();
+    if (view === "rules") loadRules();
+    // 进入评估进度页时先拉一次任务列表再渲染，保证看到的是当下状态而非上次缓存
+    if (view === "evaljob") {
+      await pollJobs();
+      await renderJobView();
+    }
   });
 });
+
+// 从别处跳转到切片预览时置位：跳转方会自己加载目标样本，
+// 切页处理器不能同时再加载一次当前样本，否则两次加载互相覆盖、定位落空
+let chunkJumpPending = false;
+
+// 把预览面板挂到指定页签容器下。两个页签共用同一份 DOM：
+// appendChild 会把节点从原容器移走，并完整保留其子树、事件绑定与已渲染的 PDF 画布，
+// 所以两边看到的始终是同一套渲染结果，不存在两份实现要同步维护
+function mountChunkPanel(hostId) {
+  // 目标容器
+  const host = $(hostId);
+  // 容器不存在时直接返回，避免初始化顺序带来的空引用
+  if (!host) return;
+  // 已经挂在目标容器下就不必再搬：搬家会触发整块重排，PDF 画布重排代价不低
+  if ($("chunkTopBar").parentElement === host) return;
+  // 先搬模式指示条
+  host.appendChild($("chunkTopBar"));
+  // 再搬左右分栏主体，顺序决定了两者在页面上的先后
+  host.appendChild($("chunkLayout"));
+}
+
+// 进入试切页签之前停在哪一版。切回「切片预览」时原样退回去，
+// 而不是每次都粗暴地回落到最新一轮——那会把人正在核对的版本悄悄换掉
+let lastRealRun = "";
+
+// 进入切片预览：把面板搬回来，确保停在一个真实版本上，并让已打开的样本跟上该版本
+async function enterChunksView() {
+  // 面板可能正挂在试切页签下，先搬回本页签
+  mountChunkPanel("view-chunks");
+  // 从试切切回来时要落回一个真实版本：预览看的是快照，没有版本就无从谈起
+  if (viewingRun === LIVE_RUN) {
+    // 只有带切片快照的轮次才能预览
+    const usable = runsCache.filter(r => r.has_chunks);
+    // 优先回到进入试切之前看的那一版；它已被删或从来没有过版本时才回落到最新一轮
+    viewingRun = usable.some(r => r.run_id === lastRealRun)
+      ? lastRealRun
+      : (usable.length ? usable[0].run_id : "");
+    // 一个带快照的版本都没有：如实说明该做什么，而不是留一个空白页面
+    if (!viewingRun) {
+      currentCase = null;
+      currentCaseData = null;
+      syncModeHint();
+      await loadChunkCaseList();
+      $("chunkMeta").innerHTML = `<p class="hint" style="margin:0">还没有任何带快照的评估版本。`
+        + `先到「概览」页跑一轮评估；只想看某个文件当前的切分结果，用「试切」页签。</p>`;
+      return;
+    }
+  }
+  // 模式指示条要反映当前是在看评估快照
+  syncModeHint();
+  // 跳转流程自带加载，这里让路
+  if (chunkJumpPending) {
+    chunkJumpPending = false;
+    return;
+  }
+  // 左侧样本列表
+  await loadChunkCaseList();
+  // 没打开任何样本时无需处理
+  if (!currentCase) return;
+  // 打开着的样本不属于当前版本：清空右侧，否则列表里没有它、内容却还显示着。
+  // 最常见的落点是刚在试切里看的是 pptx 这类不参与评估的文件，评估版本里根本没有它，
+  // 所以要连去哪儿看一并说清
+  if (!currentCaseInRun()) {
+    const gone = currentCase;
+    currentCase = null;
+    currentCaseData = null;
+    $("chunkStream").innerHTML = `<div class="empty">当前版本没有评估过 ${esc(gone)}，请从左侧重新选择。</div>`;
+    $("chunkMeta").innerHTML = `<p class="hint" style="margin:0">${esc(gone)} 不在这一版的评估范围内`
+      + `（停用的样本、或 pptx 这类默认不参与评估的类型），要看它的切分结果请到「试切」页签。</p>`;
+    return;
+  }
+  // 已加载的切片属于哪一版；与当前版本不符说明版本在别处变过（例如刚跑完评估、或刚从试切切回来），
+  // 必须重新读那一版的快照，否则看到的正文是旧版的、标注也对不上
+  if (currentCaseData && currentCaseData._run !== viewingRun) {
+    await selectCase(currentCase);
+  } else if (currentCaseData) {
+    // 版本没变，只重绘元信息栏，让版本下拉带上新出现的轮次
+    renderChunkView();
+  }
+}
+
+// 进入试切页签：把面板搬过来，直接进入试切态，左侧列出全部语料。
+// 这里没有任何模式开关——页签本身就是模式，进来即可选未评估过的文件
+async function enterLiveView() {
+  // 面板可能正挂在切片预览页签下，先搬到本页签
+  mountChunkPanel("view-live");
+  // 本次进入是否发生了模式切换：没切换（在本页签里来回点）就不必重切，
+  // 试切一次可能要跑几分钟，重复触发纯属浪费
+  const switched = viewingRun !== LIVE_RUN;
+  // 记住来时停在哪一版，切回切片预览时原样退回去
+  if (switched) lastRealRun = viewingRun;
+  // 切到试切态
+  viewingRun = LIVE_RUN;
+  // 模式指示条要反映当前是在试切
+  syncModeHint();
+  // 左侧列出全部语料（含未评估、已停用、pptx 这类不参与评估的类型）
+  await loadChunkCaseList();
+  // 尚未选过样本：明确告诉人下一步做什么，否则进来一片空白
+  if (!currentCase) {
+    $("chunkMeta").innerHTML = `<p class="hint" style="margin:0">从左侧选一个样本，`
+      + `用顶栏当前参数实时切给你看。没评估过的文件也在列表里。</p>`;
+    return;
+  }
+  // 打开着的样本已从语料库移除：清空右侧，避免列表里没有、内容却还显示着
+  if (!currentCaseInRun()) {
+    const gone = currentCase;
+    currentCase = null;
+    currentCaseData = null;
+    $("chunkStream").innerHTML = `<div class="empty">${esc(gone)} 已不在语料库里，请从左侧重新选择。</div>`;
+    $("chunkMeta").innerHTML = "";
+    return;
+  }
+  // 之前看的是某一版的快照：必须用当前参数重切，否则页签写着试切、内容却是旧快照
+  if (currentCaseData && currentCaseData._run !== LIVE_RUN) {
+    await selectCase(currentCase);
+  }
+}
 
 // ========== 规则质量：标注驱动的迭代闭环 ==========
 // 标注本身只是记录，改规则时帮不上忙。这里把它接出来：准确率说明哪条规则
@@ -1389,47 +1664,69 @@ document.querySelectorAll(".tab").forEach(tab => {
 const OUTCOME_CN = {
   pass: "符合预期", regressed: "回归", open: "待修正",
   improved: "改进", still_missing: "仍未覆盖", stale: "标注已失配",
+  skipped: "本版本未评估",  // 样本被停用，该轮没跑它
 };
 // 结论对应的徽标类，取值必须是 .pill 已定义的：只有回归是真出事了
 const OUTCOME_PILL = {
   pass: "good", regressed: "high", open: "medium",
   improved: "good", still_missing: "low", stale: "low",
+  skipped: "low",  // 什么都不用做，弱化展示
 };
 
-// 规则质量页当前基于哪个版本；空串表示用当前代码实时切分
+// 规则质量页当前看的是哪个版本。标注按版本独立保存，因此这里必须始终
+// 指向一个真实存在的轮次——没有「当前代码」这种伪版本可选了
 let rulesRun = "";
 
 // 渲染版本选择器。轮次列表在概览页已经拉过，这里直接复用
 function renderRulesRunPicker() {
   const sel = $("rulesRun");
   if (!sel) return;
-  // 只列有切分文本快照的轮次，没有快照的核对不了
-  const opts = runsCache.filter(r => r.has_chunks).map(r => {
-    // 标出哪一轮就是当前代码跑的
+  // 只列有切分文本快照的轮次：标注要挂到具体切片上，没有快照就无从核对
+  const usable = runsCache.filter(r => r.has_chunks);
+  // 当前选中的版本已不存在（比如刚被删掉）时回落到最新一轮
+  if (!usable.some(r => r.run_id === rulesRun)) rulesRun = usable.length ? usable[0].run_id : "";
+  // 逐轮一项，标出哪一轮就是当前代码跑出来的
+  sel.innerHTML = usable.map(r => {
+    // 指纹一致说明这一轮的结果就代表当前代码
     const same = currentCodeHash && r.code_hash === currentCodeHash;
     return `<option value="${esc(r.run_id)}" ${rulesRun === r.run_id ? "selected" : ""}>`
       + `${esc(r.run_id)}${r.label ? " · " + esc(r.label) : ""}`
       + `${same ? "（= 当前代码）" : "（代码已变）"}</option>`;
-  }).join("");
-  sel.innerHTML = `<option value="" ${!rulesRun ? "selected" : ""}>当前代码（实时切分核对）</option>${opts}`;
-  // 提示说明两者的差别：实时核对每次都要重切，慢但反映最新代码
-  $("rulesRunHint").textContent = rulesRun
-    ? "读该轮快照核对，秒级完成。"
-    : "用当前代码重切一遍核对，样本多时要等一会儿。";
+  }).join("") || `<option value="">（尚无可用版本）</option>`;
+  // 该轮摘要，用于提示这一版与当前代码的关系
+  const cur = usable.find(r => r.run_id === rulesRun);
+  // 提示语要说清「这一版还代表不代表当前代码」，否则改完代码看着旧账会误判
+  $("rulesRunHint").textContent = !cur
+    ? "尚无评估版本，请先到概览页跑一轮评估。"
+    : (currentCodeHash && cur.code_hash === currentCodeHash
+        ? "这一版就是当前代码跑出来的，数字即当前状态。"
+        : "代码在这一版之后已改动。想看改动效果，请到概览页跑一轮新评估。");
+  // 护栏按钮的说明随版本变化：有上一轮才谈得上跨版本核对。
+  // cur 为空时 indexOf 返回 -1，会错取到第一项，故先确认当前版本存在
+  const prev = cur ? usable[usable.indexOf(cur) + 1] : null;
+  $("guardHint").textContent = !cur
+    ? ""
+    : (prev
+        ? `护栏会拿上一版（${prev.run_id}）的判定，在这一版的切分结果上逐条核对。`
+        : "只有这一个版本，护栏只能核对本版自己的判定成立情况。");
 }
 
 // 加载规则统计与误报归纳
 async function loadRules() {
   // 版本选择器要在拉数据前渲染好，否则看不出正在按哪个版本统计
   renderRulesRunPicker();
-  // 占位说明在等什么：实时核对要重切全部已标注样本，可能几分钟
-  $("rulesStats").innerHTML = `<div class="card"><div class="empty"><span class="spin"></span> `
-    + (rulesRun ? "正在按该轮快照核对…" : "正在用当前代码重切并核对（样本多时较慢）…")
-    + `</div></div>`;
+  // 一个版本都没有时说明该怎么开始，而不是发一堆注定为空的请求
+  if (!rulesRun) {
+    $("rulesStats").innerHTML = `<div class="card"><div class="empty">
+      还没有任何评估版本。标注必须归属于某一轮评估，请先到「概览」页点「运行评估」。</div></div>`;
+    return;
+  }
+  // 占位。读的是该版本已经算好的标注，通常是瞬时的
+  $("rulesStats").innerHTML = `<div class="card"><div class="empty"><span class="spin"></span> 正在读取该版本的标注…</div></div>`;
   // 统计与归纳互不依赖，一起发
   try {
-    // 版本与切分参数一并带上，统计才会按该版本重新核对
-    const q = new URLSearchParams({ run: rulesRun, parser_config: JSON.stringify(runParams()) });
+    // 只需带版本：每条标注在该版本下的成立状态已经算好，不必再传切分参数
+    const q = new URLSearchParams({ run: rulesRun });
     const [stats, fp] = await Promise.all([
       api(`/api/annotations?${q}`),
       api(`/api/guard/false-positives?${q}`),
@@ -1442,11 +1739,13 @@ async function loadRules() {
 
 // 渲染规则统计与误报归纳
 function renderRules(stats, groups) {
-  // 一条标注都没有时说明该怎么开始，而不是显示一堆零
+  // 该版本一条标注都没有时说明该怎么开始，而不是显示一堆零
   if (!stats.cases) {
     $("rulesStats").innerHTML = `<div class="card"><div class="empty">
-      还没有任何标注。到「切片预览」里对检测结果点「确认是问题」或「标为误报」，
-      这里就会有数据。</div></div>`;
+      版本 ${esc(rulesRun)} 下还没有任何标注。到「切片预览」里切到这个版本，
+      对检测结果点「确认是问题」或「标为误报」，这里就会有数据。<br>
+      如果这是刚跑出来的新版本，上一版的标注会自动继承过来——没有继承内容，
+      说明上一版也还没标过。</div></div>`;
     return;
   }
   // 百分比展示，无数据时用占位符而不是 0%
@@ -1477,23 +1776,28 @@ function renderRules(stats, groups) {
         <div class="stat"><div class="stat-label">召回率</div><div class="stat-value">${pct(stats.recall)}</div>
           <div class="hint">真问题有多少被抓到</div></div>
         <div class="stat"><div class="stat-label">已修复</div>
-          <div class="stat-value" style="color:var(--good)">${t.fixed}</div>
-          <div class="hint">曾标为误报，该版本已不再报</div></div>
+          <div class="stat-value" style="color:var(--good)">${t.fixed
+            ? `<a href="#" data-marks="fixed" data-det="">${t.fixed}</a>` : 0}</div>
+          <div class="hint">上一版标为误报，这一版已不再报</div></div>
         <div class="stat"><div class="stat-label">回归</div>
-          <div class="stat-value" style="color:${t.regressed ? "var(--bad)" : "inherit"}">${t.regressed}</div>
-          <div class="hint">曾能检出，该版本检不出了</div></div>
-        <div class="stat"><div class="stat-label">核对样本</div><div class="stat-value">${stats.cases}</div>
+          <div class="stat-value" style="color:${t.regressed ? "var(--bad)" : "inherit"}">${t.regressed
+            ? `<a href="#" data-marks="regressed" data-det="">${t.regressed}</a>` : 0}</div>
+          <div class="hint">上一版能检出，这一版检不出了</div></div>
+        <div class="stat"><div class="stat-label">有标注样本</div><div class="stat-value">${stats.cases}</div>
           <div class="hint">个</div></div>
       </div>
+      ${t.covered ? `<p class="hint" style="margin:0.8rem 0 0;color:var(--good)">
+        另有 ${t.covered} 条曾经的漏报在这一版已被规则抓到。</p>` : ""}
       ${t.stale ? `<p class="hint" style="margin:0.8rem 0 0;color:var(--warn)">
-        另有 ${t.stale} 条标注在该版本下按正文摘要找不回对应切片，已排除在统计外——
-        切分结果变化较大时会这样，这些标注需要重做。</p>` : ""}
+        另有 <a href="#" data-marks="stale" data-det="">${t.stale} 条标注</a>从上一版继承过来时，
+        按正文摘要在这一版里找不回对应切片，已排除在统计外——切分结果变化较大时会这样，
+        这些标注需要回到切片预览重做。</p>` : ""}
     </div>
     <div class="card">
       <h3>逐条规则</h3>
       <div style="overflow-x:auto">
       <table>
-        <thead><tr><th>规则</th><th>仍能检出</th><th>仍在误报</th><th>已修复</th>
+        <thead><tr><th>规则</th><th>仍能检出</th><th>仍在误报</th><th>已修复</th><th>回归</th>
           <th>准确率</th><th>误报共性</th><th></th></tr></thead>
         <tbody>${rows.map(([det, s]) => {
           // 该规则的准确率单独算，总体准确率看不出是谁拖累的
@@ -1513,7 +1817,12 @@ function renderRules(stats, groups) {
             <td class="num">${s.false_positive
               ? `<a href="#" data-marks="false_positive" data-det="${esc(det)}">${s.false_positive}</a>`
               : 0}</td>
-            <td class="num" style="color:${s.fixed ? "var(--good)" : "inherit"}">${s.fixed || 0}</td>
+            <td class="num" style="color:${s.fixed ? "var(--good)" : "inherit"}">${s.fixed
+              ? `<a href="#" data-marks="fixed" data-det="${esc(det)}">${s.fixed}</a>`
+              : 0}</td>
+            <td class="num" style="color:${s.regressed ? "var(--bad)" : "inherit"}">${s.regressed
+              ? `<a href="#" data-marks="regressed" data-det="${esc(det)}">${s.regressed}</a>`
+              : 0}</td>
             <td class="num">${pct(p)}</td>
             <td>${why}</td>
             <td>${s.false_positive
@@ -1524,9 +1833,10 @@ function renderRules(stats, groups) {
       </table>
       </div>
       <p class="hint" style="margin:0.8rem 0 0">
-        「仍在误报」是该版本下还没修好的，排在前面——那是最该改的规则；「已修复」是
-        曾标为误报、该版本已不再报的，不计入准确率。「误报共性」里的文件类型分布常常
-        直接点出问题：某类格式集中出错，说明规则没考虑那种文档的写法。
+        「仍在误报」是这一版还没修好的，排在前面——那是最该改的规则；「已修复」是
+        上一版标为误报、这一版已不再报的，不计入准确率；「回归」是上一版能检出、
+        这一版检不出的，出现就必须处理。「误报共性」里的文件类型分布常常直接点出问题：
+        某类格式集中出错，说明规则没考虑那种文档的写法。
       </p>
     </div>
     ${wanted.length ? `<div class="card">
@@ -1554,8 +1864,9 @@ function renderRules(stats, groups) {
       <p class="hint" style="margin:0 0 0.9rem">
         在切片预览的原文视图里框出来的地方——切分器压根没在那儿切出块，
         所以它不属于任何切片，也不会出现在上面的规则统计里。点一条即可跳回原文看那块区域。<br>
-        <strong>这一块不随版本过滤</strong>：切分器没在那儿产出块，也就没有「该规则是否仍命中」
-        可判，无法自动核对。只能标出它<strong>发现于哪个代码版本</strong>，是否已解决由人自己看。
+        这里只列<strong>本版本</strong>圈出的区域。它和切片标注一样按版本保存、跑新一轮时
+        继承过去，但<strong>无法自动核对</strong>：没有切片就没有「该规则是否仍命中」可判，
+        是否已解决只能由人自己看。
       </p>
       <div id="regionList"><div class="empty">加载中…</div></div>
     </div>`;
@@ -1570,11 +1881,12 @@ async function loadRegions() {
   if (!box) return;
   // 拉取失败不影响页面其余部分
   try {
-    const d = await api("/api/guard/regions");
+    // 带上版本：区域标注同样按版本保存，不带会看到别版的框
+    const d = await api(`/api/guard/regions?run=${encodeURIComponent(rulesRun)}`);
     const items = d.items || [];
     // 一条都没有时说明该怎么产生这类数据
     if (!items.length) {
-      box.innerHTML = `<div class="empty">还没有框选记录。在「切片预览」里打开一个 PDF 样本，
+      box.innerHTML = `<div class="empty">这个版本下还没有框选记录。在「切片预览」里打开一个 PDF 样本，
         点原文视图上的「框选标记」，拖出一块区域即可。</div>`;
       return;
     }
@@ -1585,11 +1897,9 @@ async function loadRegions() {
         <div class="guard-head">
           <span class="pill medium">${esc(detCn(it.detector) || "未指定类型")}</span>
           <span class="mono">${esc(it.case_id)}　第 ${it.region[0]} 页</span>
-          ${it.code_hash
-            ? (it.code_hash === currentCodeHash
-                ? `<span class="pill low" title="圈定时的代码与当前一致">当前版本发现</span>`
-                : `<span class="pill low" title="圈定于 ${esc(it.code_hash)}，之后代码已改动">发现于旧版本</span>`)
-            : `<span class="pill low" title="早期记录未存代码版本">版本未知</span>`}
+          ${(it.origin || "").startsWith("inherit")
+            ? `<span class="pill low" title="从 ${esc((it.origin || "").slice(8))} 继承过来，未在本版本复核">继承自上一版</span>`
+            : `<span class="pill low" title="在这个版本上直接圈的">本版本圈出</span>`}
           <span class="spacer"></span>
           <button class="mini" data-region-del="${esc(it.id)}" data-case="${esc(it.case_id)}">删除</button>
         </div>
@@ -1618,7 +1928,9 @@ $("view-rules").addEventListener("click", async (e) => {
   if (del) {
     // 阻止冒泡到整行的跳转
     e.stopPropagation();
-    await fetch(`/api/annotations/${encodeURIComponent(del.dataset.case)}/regions/${del.dataset.regionDel}`,
+    // 带上版本：区域按版本存，不带会删到别版的记录
+    await fetch(`/api/annotations/${encodeURIComponent(del.dataset.case)}/regions/`
+      + `${del.dataset.regionDel}?run=${encodeURIComponent(rulesRun)}`,
       { method: "DELETE" });
     toast("已删除");
     return loadRegions();
@@ -1639,25 +1951,30 @@ $("view-rules").addEventListener("click", async (e) => {
   }
 });
 
-// 展示某一类标注的全部明细
-async function showMarks(verdict, detector) {
-  // 结论的中文说法，用于标题
-  const vc = { confirmed: "确认是问题", false_positive: "误报", missed: "漏报/需求" }[verdict] || verdict;
+// 各类成立状态的中文说法，与后端 annotations.STATUSES 对齐
+const STATUS_CN = {
+  confirmed: "仍能检出", false_positive: "仍在误报", missed: "仍未覆盖",
+  fixed: "已修复", regressed: "回归", covered: "已覆盖", stale: "标注已失配",
+  skipped: "本版本未评估",  // 样本被停用，判定原样保留、不计入统计
+};
+
+// 展示某一类标注的全部明细。status 是「在本版本下的成立情况」而非人工判定，
+// 这样点开「仍在误报 17」正好是 17 条，与上面的数字一致
+async function showMarks(status, detector) {
+  // 状态的中文说法，用于标题
+  const vc = STATUS_CN[status] || status;
   // 占位
   $("markDetail").innerHTML = `<div class="card"><div class="empty"><span class="spin"></span> 加载中…</div></div>`;
   // 拉取失败如实回报
   try {
-    // 带上版本：点开「仍在误报 17」应当正好看到 17 条，
-    // 不带的话会掺进已经修好的，与上面的数字对不上
-    const q = new URLSearchParams({
-      verdict, detector, run: rulesRun,
-      parser_config: JSON.stringify(runParams()),
-    });
+    // 只需带版本与状态；detector 为空表示不限规则
+    const q = new URLSearchParams({ status, detector: detector || "", run: rulesRun });
     const d = await api(`/api/guard/marks?${q}`);
     const items = d.items || [];
     // 渲染明细，每条可点击跳回原切片
     $("markDetail").innerHTML = `<div class="card">
-      <h3>${esc(detCn(detector) || detector)}　·　${vc} ${items.length} 条</h3>
+      <h3>${esc(detector ? (detCn(detector) || detector) + "　·　" : "")}${vc} ${items.length} 条
+        <span class="hint mono" style="font-weight:400">${esc(rulesRun)}</span></h3>
       <p class="hint" style="margin:0 0 0.9rem">点任意一条跳回切片预览，定位到那一块正文。</p>
       <div class="guard-list">${items.map(it => `
         <div class="guard-item" style="cursor:pointer"
@@ -1666,7 +1983,10 @@ async function showMarks(verdict, detector) {
           <div class="guard-head">
             <span class="mono">${esc(it.case_id)} #${it.chunk_index}</span>
             <span class="hint">${esc(it.filename)}</span>
+            ${detector ? "" : `<span class="pill low">${esc(detCn(it.detector) || it.detector)}</span>`}
             ${it.batch ? `<span class="pill low">批量判定</span>` : ""}
+            ${(it.origin || "").startsWith("inherit")
+              ? `<span class="pill low" title="从上一版继承，未在本版本复核">继承</span>` : ""}
           </div>
           ${it.note ? `<div class="hint">人工备注：${esc(it.note)}</div>` : ""}
           <div class="ev">${esc((it.excerpt || "").slice(0, 100).replace(/\n/g, " "))}</div>
@@ -1686,21 +2006,21 @@ $("btnFullReport").addEventListener("click", async () => {
   btn.disabled = true;
   btn.innerHTML = '<span class="spin"></span> 生成中…';
   try {
-    // 切分参数与预览页一致，否则报告里的证据与页面上看到的对不上
-    const q = new URLSearchParams({ run: rulesRun, parser_config: JSON.stringify(runParams()) });
+    // 只需带版本：任务书的每一条都取自该版本的标注与快照证据
+    const q = new URLSearchParams({ run: rulesRun });
     const d = await api(`/api/guard/report?${q}`);
     const c = d.counts;
     // 概要放在前面，让人一眼看出这份任务书有多少活
     $("ruleReport").innerHTML = `<div class="card">
-      <h3>优化任务书</h3>
+      <h3>优化任务书　<span class="hint mono" style="font-weight:400">${esc(rulesRun)}</span></h3>
       <p style="margin:0 0 0.5rem">
         误报 ${c.false_positive} 条（涉及 ${c.false_positive_rules} 条规则）、
         已有规则漏报 ${c.missed_known} 条、新需求 ${c.missed_new} 条、
-        框选区域 ${c.regions} 块
+        框选区域 ${c.regions} 块${c.stale ? `、需重做的标注 ${c.stale} 条` : ""}
       </p>
       <p class="hint" style="margin:0 0 0.7rem">
-        含每条规则的当前源码、每条反例此刻的真实命中证据、代码位置与验证命令。
-        整份交给 Claude 即可动手改，改完跑 <code>./run.sh guard --todo</code> 验证。
+        含每条规则的当前源码、每条反例在这一版的真实命中证据、代码位置与验证命令。
+        整份交给 Claude 即可动手改，改完到概览跑一轮新评估，再回来看「已修复」与「回归」。
       </p>
       <div style="display:flex;gap:0.4rem;margin-bottom:0.7rem">
         <button class="mini" id="btnCopyFull">复制全文</button>
@@ -1728,20 +2048,20 @@ $("btnFullReport").addEventListener("click", async () => {
 
 // 生成并展示某条规则的优化报告
 async function showRuleReport(detector) {
-  // 报告要重跑切分取当前证据，可能要等几秒
-  $("ruleReport").innerHTML = `<div class="card"><div class="empty"><span class="spin"></span> 正在重跑切分、收集命中证据…</div></div>`;
+  // 报告要回快照里收集证据，通常是瞬时的
+  $("ruleReport").innerHTML = `<div class="card"><div class="empty"><span class="spin"></span> 正在收集该版本的命中证据…</div></div>`;
   // 失败时如实回报
   try {
-    // 切分参数与预览页一致，否则证据对不上
     // 带上版本：报告里的证据必须与统计出自同一版本
-    const q = new URLSearchParams({ run: rulesRun, parser_config: JSON.stringify(runParams()) });
+    const q = new URLSearchParams({ run: rulesRun });
     const d = await api(`/api/guard/report/${encodeURIComponent(detector)}?${q}`);
     // 报告以纯文本呈现：它的用途是整段复制给模型改代码，渲染成 HTML 反而不好取
     $("ruleReport").innerHTML = `<div class="card">
-      <h3>优化报告　·　${esc(detCn(detector) || detector)}</h3>
+      <h3>优化报告　·　${esc(detCn(detector) || detector)}
+        <span class="hint mono" style="font-weight:400">${esc(rulesRun)}</span></h3>
       <p class="hint" style="margin:0 0 0.7rem">
-        含规则当前实现与每条反例此刻的命中证据。整段复制给模型即可动手改，
-        改完跑 <code>./run.sh guard --todo</code> 验证。
+        含规则当前实现与每条反例在这一版的命中证据。整段复制给模型即可动手改，
+        改完到概览跑一轮新评估验证。
       </p>
       <div style="display:flex;gap:0.4rem;margin-bottom:0.7rem">
         <button class="mini" id="btnCopyReport">复制全文</button>
@@ -1763,7 +2083,7 @@ async function showRuleReport(detector) {
       const url = URL.createObjectURL(new Blob([d.markdown], { type: "text/markdown" }));
       const a = document.createElement("a");
       a.href = url;
-      a.download = `优化报告_${detector}.md`;
+      a.download = `优化报告_${detector}_${rulesRun}.md`;
       a.click();
       // 及时释放，避免长时间占着内存
       URL.revokeObjectURL(url);
@@ -1777,7 +2097,9 @@ async function showRuleReport(detector) {
 // 跳回原文并定位到框选出来的区域
 function gotoRegion(caseId, filename, region) {
   // 跟随规则质量页选定的版本，与那边看到的是同一份切分结果
-  viewingRun = rulesRun || "";
+  viewingRun = rulesRun;
+  // 告知切页处理器：目标样本由本函数负责加载，它不要再加载一次
+  chunkJumpPending = true;
   // 切到切片预览
   document.querySelector('.tab[data-view="chunks"]').click();
   // 样本列表就绪后加载该样本，原文完全就绪后再定位。
@@ -1798,15 +2120,15 @@ function gotoRegion(caseId, filename, region) {
     });
 }
 
-// 跑一次回归护栏
+// 跑一次回归护栏：拿上一版的判定，在当前所选版本的切分结果上逐条核对
 $("btnGuard").addEventListener("click", async () => {
   const btn = $("btnGuard");
-  // 置为运行中：护栏要把已标注样本全部重切一遍，重复点会白白争抢 CPU
+  // 置为运行中，避免重复点击
   btn.disabled = true;
   btn.innerHTML = '<span class="spin"></span> 核对中…';
   try {
-    // 切分参数与预览页一致，否则切片边界不同、标注对不上
-    const q = new URLSearchParams({ run: rulesRun, parser_config: JSON.stringify(runParams()) });
+    // 只需带目标版本；来源版本不传，由后端取它的上一轮
+    const q = new URLSearchParams({ run: rulesRun });
     renderGuard(await api(`/api/guard?${q}`));
   } catch (e) {
     $("guardResult").innerHTML = `<div class="card"><div class="empty" style="color:var(--bad)">核对失败：${esc(e.message)}</div></div>`;
@@ -1818,7 +2140,7 @@ $("btnGuard").addEventListener("click", async () => {
 
 // 刷新统计
 $("btnRefreshRules").addEventListener("click", loadRules);
-// 切换版本后重新核对：所有数字都随版本变化，不重算就对不上了
+// 切换版本后重新拉取：所有数字都属于某一版，不重拉就看串了
 $("rulesRun").addEventListener("change", () => {
   rulesRun = $("rulesRun").value;
   // 上一版本的明细与报告已经失效，先清掉免得看串
@@ -1836,7 +2158,7 @@ function renderGuard(r) {
     return;
   }
   // 汇总徽标，按严重度排序展示
-  const order = ["regressed", "open", "still_missing", "stale", "improved", "pass"];
+  const order = ["regressed", "open", "still_missing", "stale", "improved", "pass", "skipped"];
   const chips = order.filter(k => r.summary[k]).map(k =>
     `<span class="pill ${OUTCOME_PILL[k]}">${OUTCOME_CN[k]} ${r.summary[k]}</span>`
   ).join(" ");
@@ -1851,6 +2173,13 @@ function renderGuard(r) {
   $("guardResult").innerHTML = `
     <div class="card">
       <h3>回归护栏</h3>
+      <p class="hint" style="margin:0 0 0.5rem">
+        ${r.base_run
+          ? `判定来自版本 <span class="mono">${esc(r.base_run)}</span>，
+             在版本 <span class="mono">${esc(r.run_id)}</span> 的切分结果上逐条核对。`
+          : `只有这一个版本可比，下面是版本 <span class="mono">${esc(r.run_id)}</span>
+             自己的判定成立情况。`}
+      </p>
       <p style="margin:0 0 0.6rem">核对 ${r.checked} 个样本　${chips}</p>
       <p class="hint" style="margin:0 0 0.9rem">结论：${verdict}
         只有「回归」算失败——那是改动碰坏了本来能检出的东西。</p>
@@ -1874,32 +2203,397 @@ function renderGuard(r) {
 }
 
 // ========== 运行评估 ==========
+// 评估是后台任务，点击只负责把任务发出去，随后由轮询驱动进度与收尾。
+// 不再同步等待：一轮十几分钟，请求挂着期间看不到任何进度，
+// 进程一重启（改 labkit 下的代码就会触发热加载）跑完的样本还全丢
 $("btnEval").addEventListener("click", async () => {
   const btn = $("btnEval");
-  // 置为运行中，避免重复点击造成 CPU 争抢
+  // 先置灰，避免连点发出两轮任务
   btn.disabled = true;
-  btn.innerHTML = '<span class="spin"></span> 评估中…';
-  $("evalHint").textContent = "正在离线重放切分逻辑，全量约需十余秒…";
+  btn.innerHTML = '<span class="spin"></span> 启动中…';
+  // 明确说清本轮会跑几个样本：语料库里停用的不参与，不写出来会以为是漏跑了
+  const enabledCount = corpusCache.filter(c => c.enabled !== false).length;
+  $("evalHint").textContent = `正在启动评估，本轮 ${enabledCount} 个已启用样本`
+    + (enabledCount < corpusCache.length ? `（语料库共 ${corpusCache.length} 个，其余已停用）` : "")
+    + "…";
   try {
-    // 请求评估，并要求同时与基线对比
+    // 创建任务，并要求完成后与基线对比
     const data = await api("/api/eval", {
       method: "POST",
-      body: JSON.stringify({ parser_config: runParams(), compare: true }),
+      body: JSON.stringify({ parser_config: runParams(), compare: "baseline" }),
     });
-    lastReport = data.report;
-    // 先刷新历史列表，使新轮次出现在选择器中，随后渲染才能正确选中它
+    // 记下任务标识，进度页默认展示它
+    activeJobId = data.job_id;
+    // 刷新历史列表，让「进行中」那一行立刻出现在表格顶部
     await loadRuns();
-    // 显式标记为本轮数据，使标题与提示切换回「本轮结果」
-    renderOverview(data.report, data.comparison, "current");
-    toast(`评估完成：${data.report.finding_total} 条问题`);
+    // 开始轮询进度
+    startJobPolling();
+    // 明确提示去哪里看细节
+    toast(`评估已启动：${data.job_id}，可在「评估进度」页查看逐语料状态`);
   } catch (e) {
-    toast("评估失败：" + e.message);
-    $("evalHint").textContent = "评估失败：" + e.message;
-  } finally {
+    // 已有任务在跑属于正常拒绝，不当成错误刷屏，直接把人带到那个任务上
+    toast("评估未能启动：" + e.message);
+    $("evalHint").textContent = "评估未能启动：" + e.message;
+    // 恢复按钮，让人可以在处理完占用后重试
     btn.disabled = false;
     btn.textContent = "运行评估";
+    // 无论如何刷新一次，占用中的任务会以「进行中」行显示出来
+    await loadRuns();
   }
 });
+
+// ========== 评估任务：轮询、进度页、断点续跑 ==========
+// 当前关注的任务标识。进度页默认展示它，跑完后用于取回结果
+let activeJobId = "";
+// 轮询定时器句柄，同一时刻只允许一个
+let jobTimer = null;
+// 已经收过尾的任务，避免完成瞬间的多次轮询重复弹提示、重复切版本
+const jobFinalized = new Set();
+
+// 任务状态的中文说法与徽标样式，各处显示保持一致
+const JOB_ST = {
+  running: { cn: "进行中", pill: "kind" },
+  done: { cn: "已完成", pill: "low" },
+  failed: { cn: "失败", pill: "high" },
+  interrupted: { cn: "已中断", pill: "medium" },
+  cancelled: { cn: "已取消", pill: "low" },
+};
+
+// 单个语料的状态说法
+const CASE_ST = { pending: "待处理", running: "进行中", done: "已完成", failed: "失败" };
+
+// 启动轮询。间隔 1.5 秒：评估一个语料通常要几秒到几十秒，
+// 再快只是徒增请求，再慢则进度看着发木
+function startJobPolling() {
+  // 已在轮询时不重复启动
+  if (jobTimer) return;
+  // 立刻拉一次，不必等第一个间隔过去
+  pollJobs();
+  // 定时拉取
+  jobTimer = setInterval(pollJobs, 1500);
+}
+
+// 停止轮询
+function stopJobPolling() {
+  // 有句柄才清
+  if (jobTimer) {
+    clearInterval(jobTimer);
+    jobTimer = null;
+  }
+}
+
+// 拉一次任务列表，据此更新历史表格顶部的进行中行、tab 上的提示点与进度页
+async function pollJobs() {
+  try {
+    // 只取未产出轮次的任务，已完成的在历史表格里已有自己的一行
+    const data = await api("/api/eval/jobs");
+    // 缓存供渲染使用
+    jobsCache = data.jobs || [];
+    // 没有关注的任务时，默认关注最新一个
+    if (!activeJobId && jobsCache.length) activeJobId = jobsCache[0].job_id;
+    // 顶栏按钮状态：有任务在跑就保持置灰，避免发出第二轮
+    syncEvalButton(data.busy);
+    // tab 上的提示点
+    $("jobDot").style.display = data.busy ? "inline-block" : "none";
+    // 重画历史轮次表格顶部的任务行
+    renderRuns();
+    // 进度页可见时同步刷新
+    if ($("view-evaljob").classList.contains("active")) await renderJobView();
+    // 检查是否有任务刚刚跑完，需要收尾
+    await finalizeFinishedJobs();
+    // 全部任务都不在运行中时停止轮询，不必空转
+    if (!data.busy) stopJobPolling();
+  } catch (e) {
+    // 轮询失败不弹提示刷屏，停下来即可，下次进页面或点按钮会重新开始
+    stopJobPolling();
+  }
+}
+
+// 任务列表缓存，历史表格与进度页共用
+let jobsCache = [];
+
+// 同步顶栏「运行评估」按钮：有任务在跑时置灰并说明原因
+function syncEvalButton(busyJobId) {
+  const btn = $("btnEval");
+  // 有任务占用时置灰
+  if (busyJobId) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spin"></span> 评估中…';
+    btn.title = `任务 ${busyJobId} 正在运行`;
+  } else {
+    // 空闲时恢复可用
+    btn.disabled = false;
+    btn.textContent = "运行评估";
+    btn.title = "";
+  }
+}
+
+// 任务跑完后的收尾：切到新版本、刷新概览、提示结果。
+// 放在轮询里而不是点击处理里，是因为评估可能在页面关掉之后才跑完——
+// 重新打开页面时同样需要认领这个结果
+async function finalizeFinishedJobs() {
+  // 逐个检查任务
+  for (const job of jobsCache) {
+    // 只处理失败与中断，成功的任务已产出轮次、不在这个列表里
+    if (job.status === "failed" || job.status === "interrupted") {
+      // 同一个任务只提示一次
+      if (jobFinalized.has(job.job_id)) continue;
+      jobFinalized.add(job.job_id);
+      // 如实说明发生了什么，并指出可以续跑
+      $("evalHint").innerHTML = `评估${JOB_ST[job.status].cn}（${esc(job.job_id)}）：`
+        + `已完成 ${job.done_count}/${job.total_count} 个语料。`
+        + `${esc(job.error || "")}　到「评估进度」页可从断点续跑。`;
+      toast(`评估${JOB_ST[job.status].cn}，已完成 ${job.done_count}/${job.total_count}，可续跑`);
+    }
+  }
+  // 成功产出的轮次通过历史列表认领：列表里出现了比当前更新的一轮即为刚跑完
+  await claimNewRun();
+}
+
+// 已知的最新轮次标识，用于识别「有新一轮产出了」。
+// 由 init 在页面打开时初始化成当时的最新一轮，此后只有后台任务真的
+// 产出了新快照才会变——这样既不会把打开页面当成刚跑完，
+// 也不会漏掉「语料库本来是空的、跑出第一轮」这种情况
+let knownLatestRun = "";
+
+// 认领新产出的轮次：切到它并渲染概览
+async function claimNewRun() {
+  // 刷新历史列表
+  await loadRuns();
+  // 列表为空时无从认领
+  if (!runsCache.length) return;
+  // 最新一轮
+  const latest = runsCache[0].run_id;
+  // 没有变化说明还没跑完
+  if (latest === knownLatestRun) return;
+  // 记下新的最新轮次
+  knownLatestRun = latest;
+  // 新版本产生后，预览与规则质量都跟到这一版：标注刚继承过来，
+  // 停在旧版本会让人对着旧账以为改动没生效
+  viewingRun = latest;
+  rulesRun = latest;
+  // 取回完整结果与对比
+  try {
+    // 读取新一轮的完整报告
+    const report = await api(`/api/runs/${encodeURIComponent(latest)}`);
+    // 缓存供其它视图复用
+    lastReport = report;
+    // 与当前基准对比，没有基准时不做对比
+    let comparison = null;
+    // 基准存在且不是自己时才有意义
+    if (baselineId && baselineId !== latest) {
+      const cmp = await api(`/api/compare?a=${encodeURIComponent(baselineId)}&b=${encodeURIComponent(latest)}`);
+      comparison = cmp.comparison;
+    }
+    // 刷新选择器再渲染，否则新轮次选不中
+    renderRunPickers();
+    // 显式标记为本轮数据，使标题与提示切换回「本轮结果」
+    renderOverview(report, comparison, "current");
+    // 如实回报本轮问题总数
+    toast(`评估完成：${report.finding_total} 条问题（${latest}）`);
+  } catch (e) {
+    // 取回失败不影响任务本身已经完成的事实
+    toast("评估已完成，但读取结果失败：" + e.message);
+  }
+}
+
+// 渲染进度页
+async function renderJobView() {
+  // 任务下拉：未完成的任务 + 当前关注的那个
+  const opts = jobsCache.map(j =>
+    `<option value="${esc(j.job_id)}">${esc(j.job_id)} · ${JOB_ST[j.status]?.cn || j.status}`
+    + `（${j.done_count}/${j.total_count}）</option>`).join("");
+  // 填充下拉，无任务时给出空提示
+  $("jobPick").innerHTML = opts || `<option value="">（无进行中的任务）</option>`;
+  // 保持选中当前关注的任务
+  if (activeJobId) $("jobPick").value = activeJobId;
+  // 没有任务时清空正文
+  if (!activeJobId || !jobsCache.length) {
+    $("jobBadge").innerHTML = "";
+    $("jobBody").innerHTML = `<div class="empty">尚无进行中的评估任务。到「概览」页点右上角「运行评估」开始一轮。</div>`;
+    // 无任务时三个操作按钮一律置灰
+    ["btnJobResume", "btnJobCancel", "btnJobDelete"].forEach(id => { $(id).disabled = true; });
+    return;
+  }
+  // 读取该任务的完整状态，含逐语料明细
+  let job;
+  try {
+    job = await api(`/api/eval/jobs/${encodeURIComponent(activeJobId)}`);
+  } catch (e) {
+    // 任务被删除时回落到空态
+    $("jobBody").innerHTML = `<div class="empty">任务已不存在：${esc(activeJobId)}</div>`;
+    activeJobId = "";
+    return;
+  }
+  // 按状态决定三个操作按钮是否可用
+  const running = job.status === "running";
+  // 续跑只对没跑完的任务有意义
+  $("btnJobResume").disabled = running || !!job.run_id;
+  // 取消只对正在跑的有意义
+  $("btnJobCancel").disabled = !running;
+  // 运行中不允许删除，避免后台线程对着不存在的目录写文件
+  $("btnJobDelete").disabled = running;
+  // 状态徽标
+  const st = JOB_ST[job.status] || { cn: job.status, pill: "low" };
+  $("jobBadge").innerHTML = `<span class="pill ${st.pill}">${st.cn}</span>`;
+  // 进度百分比，样本数为零时按零处理避免除零
+  const total = job.total_count || 0;
+  const pct = total ? Math.round((job.done_count / total) * 100) : 0;
+  // 进度条配色：失败与中断用警示色，一眼看出这轮没跑完
+  const barCls = job.status === "failed" ? "bad" : (job.status === "interrupted" || job.status === "cancelled") ? "warn" : "";
+  // 代码指纹是否已经变了，续跑会混合两套代码
+  const codeChanged = job.current_code_hash && job.code_hash && job.current_code_hash !== job.code_hash;
+  // 逐语料明细表
+  const rows = (job.cases || []).map(c => {
+    // 该语料的状态说法
+    const cn = CASE_ST[c.status] || c.status;
+    // 切分自身报的错：结果是有的，只是内容为空，要与「没跑」区分开
+    const caseErr = c.case_error
+      ? `<div class="job-err">切分失败：${esc(c.case_error)}</div>` : "";
+    // 评估崩溃的错误
+    const err = c.error ? `<div class="job-err">${esc(c.error)}</div>` : "";
+    // 失败的语料给一个单独重试入口，不必把几十个语料全部重来
+    const retry = c.status === "failed" && job.status !== "running"
+      ? `<button class="mini" data-jobcase="${esc(c.case_id)}">重试该语料</button>` : "";
+    return `<tr>
+      <td><span class="mono" style="font-size:0.78rem">${esc(c.case_id)}</span>
+        <div class="case-cn" title="${esc(c.filename)}">${esc(c.filename)}</div></td>
+      <td><span class="job-st ${c.status}">${cn}</span>${err}${caseErr}</td>
+      <td class="num">${c.elapsed ? c.elapsed + "s" : "—"}</td>
+      <td class="num">${c.status === "done" ? c.chunk_count : "—"}</td>
+      <td class="num">${c.status === "done" ? c.finding_count : "—"}</td>
+      <td>${retry}</td>
+    </tr>`;
+  }).join("");
+  // 组装正文
+  $("jobBody").innerHTML = `
+    <div class="job-head">
+      <div class="grow">
+        <div class="job-bar ${barCls}"><i style="width:${pct}%"></i></div>
+      </div>
+      <span class="mono" style="font-size:0.85rem"><strong>${job.done_count}</strong> / ${total}</span>
+      ${job.failed_count ? `<span class="pill high">${job.failed_count} 个失败</span>` : ""}
+      ${job.current_case ? `<span class="hint">正在评估 ${esc(job.current_case)}</span>` : ""}
+    </div>
+    <p class="hint" style="margin:0 0 0.9rem">
+      创建于 ${esc((job.created_at || "").replace("T", " "))}　·
+      参数 token=${esc(String((job.parser_config || {}).chunk_token_num ?? "?"))}　·
+      代码指纹 <span class="mono">${esc(job.code_hash || "?")}</span>
+      ${codeChanged ? `<span class="pill medium" style="margin-left:0.4rem">代码已变更为 ${esc(job.current_code_hash)}</span>` : ""}
+      ${job.code_mixed ? `<span class="pill high" style="margin-left:0.4rem">已跨代码版本续跑</span>` : ""}
+      ${job.resumed ? `　·　续跑 ${job.resumed} 次` : ""}
+    </p>
+    ${job.error ? `<p class="hint" style="color:var(--bad);margin:0 0 0.6rem">
+      ${esc(job.stage ? `[${job.stage}] ` : "")}${esc(job.error)}</p>` : ""}
+    ${job.traceback ? `<details><summary class="hint">查看完整堆栈</summary>
+      <div class="job-trace">${esc(job.traceback)}</div></details>` : ""}
+    ${codeChanged && job.status !== "running" ? `<p class="hint" style="color:var(--warn);margin:0 0 0.9rem">
+      被测代码在任务创建后已改动。续跑会让这一轮的前 ${job.done_count} 个语料用旧代码、
+      其余用新代码，问题总数与任何一轮都不可比——通常应该重新跑一轮而不是续跑。</p>` : ""}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>语料</th><th>状态</th><th class="num">耗时</th>
+          <th class="num">切片</th><th class="num">问题</th><th>操作</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+  // 绑定单语料重试
+  $("jobBody").querySelectorAll("button[data-jobcase]").forEach(btn => {
+    btn.addEventListener("click", () => retryJobCase(btn.dataset.jobcase));
+  });
+}
+
+// 切换关注的任务
+$("jobPick").addEventListener("change", async () => {
+  activeJobId = $("jobPick").value;
+  await renderJobView();
+});
+
+// 续跑：代码指纹变了时先要一次明确确认
+$("btnJobResume").addEventListener("click", async () => {
+  // 没有关注的任务时无从续跑
+  if (!activeJobId) return;
+  // force 为真表示已确认「代码变了也要接着跑」
+  await resumeJob(activeJobId, false);
+});
+
+// 执行续跑，必要时弹确认后重试
+async function resumeJob(jobId, force) {
+  try {
+    // 请求续跑
+    await api(`/api/eval/jobs/${encodeURIComponent(jobId)}/resume`, {
+      method: "POST",
+      body: JSON.stringify({ force: !!force }),
+    });
+    // 关注该任务并开始轮询
+    activeJobId = jobId;
+    startJobPolling();
+    toast("已从断点继续评估");
+  } catch (e) {
+    // 服务端在代码指纹不一致时会拒绝并要求确认。
+    // 这个确认不能省：中断往往正是因为改代码触发了重启，
+    // 直接续跑就会悄悄产出一轮前后半段代码不同的快照
+    if (e.code === "code_changed") {
+      // 把两个指纹与已完成数量摆出来，让人在知情的前提下决定
+      const ok = confirm(
+        `被测代码在中断后已改动。\n\n`
+        + `中断时代码指纹：${e.detail.job_code_hash}\n`
+        + `当前代码指纹：　${e.detail.current_code_hash}\n\n`
+        + `继续续跑，这一轮的 ${e.detail.total_count} 个语料里将有 `
+        + `${e.detail.done_count} 个是用旧代码跑的，问题总数与任何一轮都不可比。\n\n`
+        + `确定仍要续跑吗？（取消则建议重新跑一轮）`);
+      // 用户确认后带 force 重来一次
+      if (ok) await resumeJob(jobId, true);
+      return;
+    }
+    // 其余失败如实回报
+    toast("续跑失败：" + e.message);
+  }
+}
+
+// 取消当前任务
+$("btnJobCancel").addEventListener("click", async () => {
+  // 没有关注的任务时无从取消
+  if (!activeJobId) return;
+  // 说清取消的粒度：正在跑的那个语料会跑完
+  if (!confirm("取消这轮评估？当前语料会跑完后停止，已完成的结果保留，之后仍可续跑。")) return;
+  try {
+    await api(`/api/eval/jobs/${encodeURIComponent(activeJobId)}/cancel`, { method: "POST" });
+    toast("已请求取消，当前语料跑完后停止");
+  } catch (e) {
+    toast("取消失败：" + e.message);
+  }
+});
+
+// 删除当前任务
+$("btnJobDelete").addEventListener("click", async () => {
+  // 没有关注的任务时无从删除
+  if (!activeJobId) return;
+  // 删除会丢掉已跑完的中间结果，必须显式确认
+  if (!confirm(`删除任务 ${activeJobId}？已完成语料的中间结果会一并删除，无法再续跑。`)) return;
+  try {
+    await api(`/api/eval/jobs/${encodeURIComponent(activeJobId)}`, { method: "DELETE" });
+    toast("已删除任务");
+    // 清掉关注并刷新
+    activeJobId = "";
+    await pollJobs();
+    await renderJobView();
+  } catch (e) {
+    toast("删除失败：" + e.message);
+  }
+});
+
+// 重试单个语料：只把它置回待处理，实际重跑由续跑触发
+async function retryJobCase(caseId) {
+  try {
+    await api(`/api/eval/jobs/${encodeURIComponent(activeJobId)}/cases/${encodeURIComponent(caseId)}/retry`,
+      { method: "POST" });
+    toast("已标记为待处理，点「续跑」重新评估该语料");
+    await renderJobView();
+  } catch (e) {
+    toast("操作失败：" + e.message);
+  }
+}
 
 // ========== 设为基线 ==========
 $("btnBaseline").addEventListener("click", async () => {
@@ -2035,6 +2729,30 @@ async function loadRuns() {
     const data = await api("/api/runs");
     runsCache = data.runs || [];
     baselineId = data.baseline_id || "";
+    // 未完成的评估任务随轮次列表一并返回，历史表格顶部要把它们插成进行中行。
+    // 同一次请求取回，两者才不会各自过期——分两次拉，表格里就可能出现
+    // 「任务还在跑」与「它产出的轮次已经在列表里」并存的错乱
+    jobsCache = data.jobs || [];
+    // 顺带刷新当前代码指纹：它决定各版本标"= 当前代码"还是"代码已变"。
+    // 只在页面加载时取一次的话，改完代码不刷新页面就会一直标错
+    if (data.code_hash) currentCodeHash = data.code_hash;
+    // 有任务在跑时保证轮询是开着的：页面刚打开、或从别的标签页切回来时，
+    // 靠这里把进度重新接上，不必等人再点一次「运行评估」
+    if (data.busy) startJobPolling();
+    // 同步顶栏按钮状态，避免在已有任务时还能点出第二轮
+    syncEvalButton(data.busy);
+    // 有快照的版本，切片预览与规则质量都只能在这些里选
+    const usable = runsCache.filter(r => r.has_chunks);
+    // 当前查看的版本不存在（首次进入，或它刚被删掉）时回落到最新一轮。
+    // 预览与标注都必须挂在一个真实版本上，不能停在「没有版本」的状态
+    // 试切不是轮次，校正时必须放过它，否则选中试切后一切页就被踢回某个版本
+    if (viewingRun !== LIVE_RUN && !usable.some(r => r.run_id === viewingRun)) {
+      viewingRun = usable.length ? usable[0].run_id : "";
+    }
+    // 规则质量页同理
+    if (!usable.some(r => r.run_id === rulesRun)) {
+      rulesRun = usable.length ? usable[0].run_id : "";
+    }
     renderRunPickers();
     renderRuns();
     renderTrend();
@@ -2074,15 +2792,61 @@ function renderRunPickers() {
     : "任选两轮进行对比，不必总以基线为准";
 }
 
+// 把一个未完成的评估任务渲染成历史表格顶部的一行。
+// 放在这张表里而不是另起一处：一轮评估从「在跑」到「跑完成为一轮」是同一件事的
+// 两个阶段，分两个地方显示，就得先在别处发现它跑完了、再回来这里找它
+function renderJobRow(job) {
+  // 状态说法与徽标
+  const st = JOB_ST[job.status] || { cn: job.status, pill: "low" };
+  // 进度百分比，样本数为零时按零处理避免除零
+  const total = job.total_count || 0;
+  const pct = total ? Math.round((job.done_count / total) * 100) : 0;
+  // 进度条配色：失败与中断用警示色
+  const barCls = job.status === "failed" ? "bad"
+    : (job.status === "interrupted" || job.status === "cancelled") ? "warn" : "";
+  // 参数摘要，与正式轮次的那一列同口径
+  const cfg = job.config || {};
+  const param = `token=${cfg.chunk_token_num ?? "?"}${cfg.children_delimiter ? " deli=" + esc(JSON.stringify(cfg.children_delimiter)) : ""}`;
+  // 未跑完的任务没有问题总数与切片总数，那两列改放进度，
+  // 空着的话这一行看上去就像一轮出了问题的评估
+  return `<tr class="is-job">
+    <td><span class="mono">${esc(job.job_id)}</span>
+      <span class="pill ${st.pill}" style="margin-left:0.3rem">${st.cn}</span></td>
+    <td class="mono" style="font-size:0.78rem">${esc((job.created_at || "").replace("T", " ").slice(0, 19))}</td>
+    <td colspan="2">
+      <div class="job-bar ${barCls}" style="margin-bottom:0.25rem"><i style="width:${pct}%"></i></div>
+      <span class="hint" style="font-size:0.74rem">已完成 ${job.done_count}/${total}${job.failed_count ? `，${job.failed_count} 个失败` : ""}</span>
+    </td>
+    <td class="mono" style="font-size:0.76rem">${esc(job.code_hash || "?")}${job.code_mixed ? '<span class="dirty" title="跨代码版本续跑">!</span>' : ""}</td>
+    <td class="mono" style="font-size:0.74rem;color:var(--muted)">${param}</td>
+    <td class="run-label" style="font-size:0.8rem">${esc(job.current_case ? "正在跑 " + job.current_case : (job.error || job.label || ""))}</td>
+    <td class="run-ops">
+      <button class="mini primary" data-jobact="detail" data-job="${esc(job.job_id)}">详情</button>
+      ${job.status === "running"
+        ? `<button class="mini" data-jobact="cancel" data-job="${esc(job.job_id)}">取消</button>`
+        : `<button class="mini" data-jobact="resume" data-job="${esc(job.job_id)}">续跑</button>
+           <button class="mini danger" data-jobact="del" data-job="${esc(job.job_id)}">删除</button>`}
+    </td>
+  </tr>`;
+}
+
 // 渲染历史轮次表格
 function renderRuns() {
-  if (!runsCache.length) {
+  // 未完成的评估任务排在最前：正在跑的、被打断的、失败的都在这里，
+  // 它们还不是一轮可用的数据，但正是此刻最需要被看见的东西
+  const jobRows = (jobsCache || []).map(renderJobRow).join("");
+  // 既无历史也无任务时才是真正的空态
+  if (!runsCache.length && !jobRows) {
     $("runsRows").innerHTML = `<tr><td colspan="8" class="empty">尚无历史轮次，点右上角「运行评估」开始</td></tr>`;
     return;
   }
-  $("runsRows").innerHTML = runsCache.map(r => {
+  $("runsRows").innerHTML = jobRows + runsCache.map(r => {
     // 代码指纹：含未提交改动时加标记，提醒该轮对应的代码未固化
     const dirty = r.git_dirty ? '<span class="dirty" title="含未提交改动">*</span>' : "";
+    // 跨代码版本续跑而成的轮次要标出来：它的代码指纹只代表汇总那一刻的代码，
+    // 部分语料实际是用更早的代码跑的，这一轮与任何一轮都不能直接比较
+    const mixed = r.code_mixed
+      ? '<span class="dirty" title="跨代码版本续跑，问题总数不可与其它轮次比较">!</span>' : "";
     // 参数摘要，参数不同的轮次不可直接比较
     const cfg = r.config || {};
     const param = `token=${cfg.chunk_token_num ?? "?"}${cfg.children_delimiter ? " deli=" + esc(JSON.stringify(cfg.children_delimiter)) : ""}`;
@@ -2091,7 +2855,7 @@ function renderRuns() {
       <td class="mono" style="font-size:0.78rem">${esc((r.generated_at || "").replace("T", " ").slice(0, 19))}</td>
       <td class="num"><strong>${r.finding_total}</strong></td>
       <td class="num">${r.chunk_total}</td>
-      <td class="mono" style="font-size:0.76rem" title="${esc(r.git_commit || "")}">${esc(r.code_hash || "?")}${dirty}</td>
+      <td class="mono" style="font-size:0.76rem" title="${esc(r.git_commit || "")}">${esc(r.code_hash || "?")}${dirty}${mixed}</td>
       <td class="mono" style="font-size:0.74rem;color:var(--muted)">${param}</td>
       <td class="run-label" style="font-size:0.8rem">${esc(r.label || "")}</td>
       <td class="run-ops">
@@ -2104,10 +2868,57 @@ function renderRuns() {
       </td>
     </tr>`;
   }).join("");
-  // 绑定行内操作
-  $("runsRows").querySelectorAll("button.mini").forEach(btn => {
+  // 绑定正式轮次的行内操作
+  $("runsRows").querySelectorAll("button.mini[data-act]").forEach(btn => {
     btn.addEventListener("click", () => runAction(btn.dataset.act, btn.dataset.run));
   });
+  // 绑定任务行的行内操作
+  $("runsRows").querySelectorAll("button.mini[data-jobact]").forEach(btn => {
+    btn.addEventListener("click", () => jobAction(btn.dataset.jobact, btn.dataset.job));
+  });
+}
+
+// 任务行的行内操作。详情跳到「评估进度」页，其余复用进度页那套逻辑
+async function jobAction(act, jobId) {
+  // 无论做什么，都先把关注点切到这个任务上
+  activeJobId = jobId;
+  // 详情：切到进度页看逐语料状态
+  if (act === "detail") {
+    // 切换到评估进度页
+    document.querySelector('.tab[data-view="evaljob"]').click();
+    return;
+  }
+  // 续跑：代码指纹变了时会先弹确认
+  if (act === "resume") {
+    await resumeJob(jobId, false);
+    return;
+  }
+  // 取消：当前语料跑完后停止
+  if (act === "cancel") {
+    // 说清取消的粒度
+    if (!confirm("取消这轮评估？当前语料会跑完后停止，已完成的结果保留，之后仍可续跑。")) return;
+    try {
+      await api(`/api/eval/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" });
+      toast("已请求取消，当前语料跑完后停止");
+    } catch (e) {
+      toast("取消失败：" + e.message);
+    }
+    return;
+  }
+  // 删除：中间结果一并丢弃
+  if (act === "del") {
+    // 删除不可逆，必须显式确认
+    if (!confirm(`删除任务 ${jobId}？已完成语料的中间结果会一并删除，无法再续跑。`)) return;
+    try {
+      await api(`/api/eval/jobs/${encodeURIComponent(jobId)}`, { method: "DELETE" });
+      toast("已删除任务");
+      // 清掉关注并刷新表格
+      if (activeJobId === jobId) activeJobId = "";
+      await pollJobs();
+    } catch (e) {
+      toast("删除失败：" + e.message);
+    }
+  }
 }
 
 // 历史轮次的行内操作
@@ -2555,33 +3366,275 @@ async function loadCorpus() {
   try {
     corpusCache = await api("/api/corpus");
     if (!corpusCache.length) {
-      $("corpusRows").innerHTML = `<tr><td colspan="5" class="empty">语料库为空，去「添加语料」导入产物</td></tr>`;
+      $("corpusRows").innerHTML = `<tr><td colspan="8" class="empty">语料库为空，去「添加语料」导入产物</td></tr>`;
+      // 语料清空后选择状态必须一起清掉，否则按钮上还挂着已不存在的样本数
+      corpusPicked.clear();
+      syncCorpusPick();
       return;
     }
-    $("corpusRows").innerHTML = corpusCache.map(c => `<tr>
+    // 重绘会丢掉 DOM 上的勾选状态，因此选择集独立保存在 corpusPicked 里；
+    // 顺带剔除已经不在语料库里的项（刚被删掉的那些）
+    corpusPicked.forEach(id => {
+      if (!corpusCache.some(c => c.case_id === id)) corpusPicked.delete(id);
+    });
+    // 停用的整行调淡，一眼看出哪些不参与评估
+    $("corpusRows").innerHTML = corpusCache.map(c => `<tr style="${c.enabled ? "" : "opacity:0.45"}">
+      <td><input type="checkbox" data-corpus-pick="${esc(c.case_id)}" ${corpusPicked.has(c.case_id) ? "checked" : ""}></td>
+      <td><input type="checkbox" data-corpus-toggle="${esc(c.case_id)}" ${c.enabled ? "checked" : ""}></td>
       <td>${esc(c.case_id)}</td>
       <td>${esc(c.filename)}</td>
       <td><span class="pill kind">${esc(c.kind)}</span>${c.slide_mode ? ' <span class="pill low">slide</span>' : ""}</td>
       <td class="num">${c.block_count}</td>
       <td class="hint">${esc(c.note)}</td>
+      <td><button class="mini danger" data-corpus-del="${esc(c.case_id)}">删除</button></td>
     </tr>`).join("");
+    // 计数放在批量按钮旁，改完立刻能确认改对了没有
+    renderCorpusCount();
+    // 同步全选框与批量删除按钮的状态
+    syncCorpusPick();
   } catch (e) {
     toast("加载语料失败：" + e.message);
   }
 }
 
+// 展示「启用 N / 共 M」，评估实际会跑几个样本以此为准
+function renderCorpusCount() {
+  const box = $("corpusCount");
+  if (!box) return;
+  const on = corpusCache.filter(c => c.enabled).length;
+  box.innerHTML = `启用 <strong>${on}</strong> / 共 ${corpusCache.length} 个样本`
+    + (on ? "" : `　<span style="color:var(--warn)">一个都没启用，评估会跑不出任何结果</span>`);
+}
+
+// 切换单个样本的启用状态
+async function setCorpusEnabled(caseIds, enabled) {
+  try {
+    const r = await api("/api/corpus/enabled", {
+      method: "POST",
+      body: JSON.stringify({ case_ids: caseIds, enabled }),
+    });
+    // 本地同步，避免整页重新拉取
+    const target = new Set(caseIds);
+    corpusCache.forEach(c => { if (target.has(c.case_id)) c.enabled = enabled; });
+    // 失败项如实回报，而不是笼统说一句成功
+    if (r.failed && r.failed.length) toast(`${r.changed} 个已更新，${r.failed.length} 个失败`);
+    return true;
+  } catch (e) {
+    toast("更新失败：" + e.message);
+    return false;
+  }
+}
+
+// 当前勾选待删除的样本。放在 DOM 之外单独存，是因为每次操作后都会整表重绘，
+// 只靠 checkbox 的 DOM 状态会在重绘时丢失
+const corpusPicked = new Set();
+
+// 同步全选框与「删除选中」按钮：按钮上直接带出选中数量，
+// 一眼能看出这一下会删掉几个，而不是点了确认才知道
+function syncCorpusPick() {
+  const btn = $("btnCorpusDelete");
+  const all = $("corpusPickAll");
+  // 页面结构尚未就绪时直接返回
+  if (!btn || !all) return;
+  // 选中数量
+  const n = corpusPicked.size;
+  // 没选中就禁用，避免点出一个空确认框
+  btn.disabled = n === 0;
+  btn.textContent = n ? `删除选中 ${n} 项` : "删除选中";
+  // 全选框三态：全选中打勾，部分选中显示中间态，一个没选则不打勾
+  all.checked = n > 0 && n === corpusCache.length;
+  all.indeterminate = n > 0 && n < corpusCache.length;
+}
+
+// 执行删除。集中在一处，单行删除与批量删除共用同一段确认与善后逻辑
+async function deleteCorpusCases(caseIds) {
+  // 没有目标时不做任何事
+  if (!caseIds.length) return;
+  // 删除不可撤销，必须显式确认；样本多时只列前几个，避免确认框长到看不完
+  const preview = caseIds.slice(0, 8).join("\n");
+  const more = caseIds.length > 8 ? `\n…等共 ${caseIds.length} 个样本` : "";
+  if (!confirm(`删除以下语料？\n\n${preview}${more}\n\n`
+    + `会一并删掉它们的关联原文与**全部版本下的人工标注**，不可撤销。\n`
+    + `历史轮次的切分快照保留，那几轮的统计数字不变。`)) return;
+  try {
+    const r = await api("/api/corpus/delete", {
+      method: "POST",
+      body: JSON.stringify({ case_ids: caseIds }),
+    });
+    // 如实回报删了什么，包括顺带删掉的标注份数
+    let msg = `已删除 ${r.deleted} 个样本`;
+    if (r.annotation_files) msg += `，连同 ${r.annotation_files} 份标注`;
+    if (r.failed && r.failed.length) msg += `；${r.failed.length} 个失败`;
+    toast(msg);
+    // 删掉的样本从选择集中移除
+    caseIds.forEach(id => corpusPicked.delete(id));
+    // 切片预览/试切正开着被删掉的样本时清空右侧，否则会停在一份已不存在的语料上
+    if (currentCase && caseIds.includes(currentCase)) {
+      currentCase = null;
+      currentCaseData = null;
+      $("chunkStream").innerHTML = `<div class="empty">该样本已从语料库删除，请重新选择。</div>`;
+      $("chunkMeta").innerHTML = "";
+    }
+    // 重新拉取语料清单。必须等它跑完再返回：不等的话，紧接着的下一次操作
+    // 会与这次重绘交叠，选择集和按钮状态就可能读到中间态
+    await loadCorpus();
+  } catch (e) {
+    toast("删除失败：" + e.message);
+  }
+}
+
+// 语料库页的勾选：启用开关与删除选择框都走事件委托，行是动态渲染的
+$("view-corpus").addEventListener("change", async (e) => {
+  // 删除选择框：只改本地选择集，不落库
+  const pick = e.target.closest("[data-corpus-pick]");
+  if (pick) {
+    // 勾上加入、取消移除
+    if (pick.checked) corpusPicked.add(pick.dataset.corpusPick);
+    else corpusPicked.delete(pick.dataset.corpusPick);
+    syncCorpusPick();
+    return;
+  }
+  // 表头全选框：一次性选中或清空全部
+  if (e.target.id === "corpusPickAll") {
+    corpusPicked.clear();
+    // 勾上时把当前语料全部纳入选择
+    if (e.target.checked) corpusCache.forEach(c => corpusPicked.add(c.case_id));
+    // 重绘以同步每行的勾选状态；等它完成再返回，避免与后续操作交叠
+    await loadCorpus();
+    return;
+  }
+  const box = e.target.closest("[data-corpus-toggle]");
+  if (!box) return;
+  const caseId = box.dataset.corpusToggle;
+  // 先按用户操作落库，成功后再重绘（失败时下面的重绘会把勾选状态还原回来）
+  await setCorpusEnabled([caseId], box.checked);
+  loadCorpus();
+});
+
+// 单行删除：事件委托到视图上，行按钮是动态渲染的
+$("view-corpus").addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-corpus-del]");
+  if (!btn) return;
+  deleteCorpusCases([btn.dataset.corpusDel]);
+});
+
+// 批量删除：以当前选择集为准
+$("btnCorpusDelete").addEventListener("click", () => {
+  deleteCorpusCases([...corpusPicked]);
+});
+
+// 批量操作：全部启用 / 全部停用 / 反选
+$("btnCorpusAll").addEventListener("click", async () => {
+  await setCorpusEnabled(corpusCache.map(c => c.case_id), true);
+  loadCorpus();
+});
+$("btnCorpusNone").addEventListener("click", async () => {
+  // 全部停用会让评估跑不出任何结果，先明确确认
+  if (!confirm("停用全部样本？之后「运行评估」不会产出任何切片。")) return;
+  await setCorpusEnabled(corpusCache.map(c => c.case_id), false);
+  loadCorpus();
+});
+$("btnCorpusInvert").addEventListener("click", async () => {
+  // 反选要分两批提交，两个方向的目标状态不同
+  const on = corpusCache.filter(c => c.enabled).map(c => c.case_id);
+  const off = corpusCache.filter(c => !c.enabled).map(c => c.case_id);
+  if (off.length) await setCorpusEnabled(off, true);
+  if (on.length) await setCorpusEnabled(on, false);
+  loadCorpus();
+});
+
 // ========== 切片预览：样本列表 ==========
+// 试切模式的哨兵值。它不是一个真实轮次——选中时用顶栏参数对单个样本实时切分，
+// 结果不落盘、不产生版本、不计入任何指标，也因此**不支持标注**：
+// 标注必须挂在版本上才说得清「这条判定属于哪一版」，试切没有版本可挂。
+const LIVE_RUN = "__live__";
+
+// 当前版本实际评估过的样本清单，切片预览左侧列表以它为准
+let runCases = [];
+
+// 同步顶部的模式指示条。两个页签共用同一块面板，光看内容分不出自己在哪一边，
+// 这行字就是唯一的模式指示；试切一侧还要如实交代它的取舍，
+// 免得有人拿不落盘、不计指标的试切结果当评估结论
+function syncModeHint() {
+  const el = $("chunkModeHint");
+  // 页面结构尚未就绪时直接返回，避免初始化顺序带来的空引用
+  if (!el) return;
+  // 当前是否处于试切模式
+  const live = viewingRun === LIVE_RUN;
+  // 文案随模式切换，两侧都指明另一边在哪，避免走进死胡同
+  el.innerHTML = live
+    ? `<span class="pill medium">试切</span>　用顶栏当前参数对<strong>任意语料</strong>实时切分`
+      + `（含未评估、已停用、pptx 这类默认不参与评估的类型）。结果不落盘、不产生版本、不计入指标，`
+      + `也不支持标注。改完顶栏参数重新点左侧样本即可看到差异。`
+    : `<span class="pill low">评估版本</span>　看某一轮评估存下来的切分快照，标注挂在选定版本上。`
+      + `要用当前参数实时切分、或看还没评估过的文件，请切到「试切」页签。`;
+}
+
+// 保留一个内部的模式切换过程，供「版本」下拉等页面内入口复用：
+// 切模式必须同时重建左侧清单（两种模式的样本集不同：试切列全部语料，版本列该轮评估过的），
+// 并让右侧跟上，否则会出现列表与内容各说各话
+async function applyRunChange() {
+  // 刷新模式指示条
+  syncModeHint();
+  // 重建左侧样本列表
+  await loadChunkCaseList();
+  // 已经打开着样本时按新模式重切/重读；该样本不在新模式的清单里则清空右侧
+  if (currentCase && currentCaseInRun()) {
+    await selectCase(currentCase);
+  } else if (currentCase) {
+    // 换版本后最常见的落点：这一版没评估过刚才那个样本（停用的、或 pptx 这类不参评类型）。
+    // 说清是哪个样本、为什么没有、去哪儿看，比一句泛泛的提示有用
+    const gone = currentCase;
+    currentCase = null;
+    currentCaseData = null;
+    $("chunkStream").innerHTML = `<div class="empty">当前版本没有评估过 ${esc(gone)}，请从左侧重新选择。</div>`;
+    $("chunkMeta").innerHTML = `<p class="hint" style="margin:0">`
+      + `${esc(gone)} 不在这一版的评估范围内（停用的样本、或 pptx 这类默认不参与评估的类型），`
+      + `要看它的切分结果请到「试切」页签。</p>`;
+  }
+}
+
 async function loadChunkCaseList() {
   try {
-    if (!corpusCache.length) corpusCache = await api("/api/corpus");
-    if (!corpusCache.length) {
-      $("chunkCaseList").innerHTML = `<div class="empty">语料库为空</div>`;
+    // 试切模式：列语料库全部样本（含停用的）。试切本来就是给「还没进评估的文件」
+    // 看一眼用的，按评估范围过滤会把它要解决的场景过滤掉
+    if (viewingRun === LIVE_RUN) {
+      corpusCache = await api("/api/corpus");
+      runCases = corpusCache.map(c => ({ ...c, chunk_count: c.block_count, finding_count: 0 }));
+      if (!corpusCache.length) {
+        $("chunkCaseList").innerHTML = `<div class="empty">语料库为空，去「添加语料」导入产物</div>`;
+        return;
+      }
+      $("chunkCaseList").innerHTML = corpusCache.map(c => `
+        <button class="case-item" data-case="${esc(c.case_id)}">
+          <span class="n">${esc(c.case_id)}${c.enabled === false ? "　<span class='pill low'>未参与评估</span>" : ""}</span>
+          <span class="m">${esc(c.kind || "")} · ${c.block_count} 块</span>
+        </button>`).join("");
+      $("chunkCaseList").querySelectorAll(".case-item").forEach(btn => {
+        btn.addEventListener("click", () => selectCase(btn.dataset.case));
+      });
       return;
     }
-    $("chunkCaseList").innerHTML = corpusCache.map(c => `
+    // 一个版本都没有时无从展示：预览看的是某一轮评估的结果
+    if (!viewingRun) {
+      runCases = [];
+      $("chunkCaseList").innerHTML = `<div class="empty">还没有任何评估版本，先到「概览」页运行评估</div>`;
+      return;
+    }
+    // 列表来自**该版本实际评估过的样本**，不是语料库的启用状态。
+    // 启用状态说的是「下次评估跑哪些」，而这里要回答「这一版跑了哪些」——
+    // 停用后还没跑新评估时，当前版本里明明有它；新导入还没评估的样本则根本没有切片可看
+    const d = await api(`/api/runs/${encodeURIComponent(viewingRun)}/cases`);
+    runCases = d.cases || [];
+    if (!runCases.length) {
+      $("chunkCaseList").innerHTML = `<div class="empty">该版本没有评估任何样本</div>`;
+      return;
+    }
+    // 列表直接给出该轮的切片数与问题数，比语料库的原始块数更贴合"看这一轮结果"的用途
+    $("chunkCaseList").innerHTML = runCases.map(c => `
       <button class="case-item" data-case="${esc(c.case_id)}">
-        <span class="n">${esc(c.case_id)}</span>
-        <span class="m">${esc(c.kind)} · ${c.block_count} 块</span>
+        <span class="n">${esc(c.case_id)}${c.error ? "　<span class='pill high'>切分失败</span>" : ""}</span>
+        <span class="m">${esc(c.kind || "")} · ${c.chunk_count} 片${c.finding_count ? ` · ${c.finding_count} 问题` : ""}</span>
       </button>`).join("");
     $("chunkCaseList").querySelectorAll(".case-item").forEach(btn => {
       btn.addEventListener("click", () => selectCase(btn.dataset.case));
@@ -2591,6 +3644,15 @@ async function loadChunkCaseList() {
   }
 }
 
+// 当前打开的样本是否属于当前版本。切换版本后两版的样本集可能不同，
+// 不属于就该清空右侧，否则列表里没有、内容却还显示着
+function currentCaseInRun() {
+  // 没打开任何样本时无需处理
+  if (!currentCase) return true;
+  // 以该版本实际评估过的清单为准
+  return runCases.some(c => c.case_id === currentCase);
+}
+
 // ========== 从概览跳到切片预览，并按需带上筛选与定位 ==========
 // detector 为空表示看全部切片；target 指定要定位到的切片；
 // cfg 指定用哪套参数切分——差异条目的序号只在其所属轮次的参数下成立，
@@ -2598,9 +3660,11 @@ async function loadChunkCaseList() {
 function gotoChunks(caseId, detector, target, runId) {
   // 记录筛选条件，供渲染时使用
   chunkFilter = detector || "";
-  // 跟随来源页选定的版本。从规则质量页点进来时，那边按某一轮统计，
-  // 预览却用当前代码实时切分的话，看到的切片与刚才的数字根本对不上
-  if (runId !== undefined) viewingRun = runId || "";
+  // 跟随来源页选定的版本。从规则质量页点进来时，那边按某一版统计，
+  // 预览若停在别的版本，看到的切片与刚才的数字根本对不上
+  if (runId) viewingRun = runId;
+  // 告知切页处理器：目标样本由本函数负责加载，它不要再加载一次
+  chunkJumpPending = true;
   // 切到切片预览标签页
   document.querySelector('.tab[data-view="chunks"]').click();
   // 样本列表就绪后再加载目标样本，加载完成再执行定位
@@ -3224,68 +4288,96 @@ async function selectCase(caseId, target) {
   $("chunkCaseList").querySelectorAll(".case-item").forEach(b => {
     b.classList.toggle("active", b.dataset.case === caseId);
   });
-  // 读历史快照是读文件，与实时切分是两回事，文案如实区分
-  const loadingText = viewingRun ? "正在读取该轮快照…" : "正在切分…";
+  // 一个版本都没有时无从展示：切片预览只看评估快照，没有评估就没有切片
+  if (!viewingRun) {
+    const tip = `<div class="empty">还没有任何评估版本。切片预览看的是某一轮评估存下来的
+      切分结果，请先到「概览」页点「运行评估」。</div>`;
+    $("chunkStream").innerHTML = tip;
+    $("chunkMeta").innerHTML = "";
+    return;
+  }
+  // 试切是实时跑切分器，快照是读文件，耗时差一个量级，文案如实区分
+  const live = viewingRun === LIVE_RUN;
+  // 增强项开着时每张图一次 VLM、每张表一次 LLM，图表多的文件要等几分钟，
+  // 不预先说明会让人以为卡死了
+  const heavy = live && (parserConfig.mineru_image_desc_enable || parserConfig.mineru_table_summary_enable);
+  const loadingText = live
+    ? ("正在用当前代码实时切分…" + (heavy ? "（已开启图片描述/表格摘要，每张图表都要调一次模型，图表多的文件需要数分钟）" : ""))
+    : "正在读取该版本的切分结果…";
   $("chunkStream").innerHTML = `<div class="empty"><span class="spin"></span> ${loadingText}</div>`;
   $("chunkMeta").innerHTML = `<p class="hint" style="margin:0">${esc(caseId)}　${loadingText}</p>`;
 
-  // 原文与切分互不依赖，同时开始加载：切分要跑一遍切分器，
-  // 等它结束再拉原文会让左栏白等好几秒
-  const caseInfo = corpusCache.find(c => c.case_id === caseId) || {};
-  // 原文就绪后把已有的人工标记画回去，否则刷新一次页面标记就看不见了
-  pdfView.load(caseId, caseInfo.filename || "").then(() => restoreRegions(caseId));
+  // 原文与切片互不依赖，同时开始加载。
+  // 文件名优先取该版本评估记录里的，语料库只作兜底——样本可能已从语料库移除，
+  // 但历史版本的评估结果仍然存在、仍该能看
+  const caseInfo = runCases.find(c => c.case_id === caseId)
+    || corpusCache.find(c => c.case_id === caseId) || {};
+  // 原文就绪后把该版本已有的人工标记画回去；试切没有版本可挂，不画也不允许新增
+  pdfView.load(caseId, caseInfo.filename || "").then(() => {
+    if (live) pdfView.clearManual(); else restoreRegions(caseId);
+  });
 
-  try {
-    // 选了历史轮次时读取那一轮存下来的切分文本，而非用当前代码重新切分。
-    // 代码改动后两者结果不同，历史快照才是那一轮的真实结果。
-    if (viewingRun) {
-      const h = await api(`/api/runs/${viewingRun}/chunks/${encodeURIComponent(caseId)}`);
-      // 快照里已经带上了坐标与那一轮的检测命中，直接用即可——
-      // 与实时切分走的是同一套渲染，问题标注、原文定位、截图都能正常工作。
-      // 旧轮次的快照没有这些字段，补默认值以免渲染时报错
-      const chunks = h.chunks.map(c => ({
-        ...c,
-        content_len: (c.content || "").length,  // 正文长度，快照里不存冗余字段
-        findings: c.findings || [],             // 那一轮检出的问题
-        position_int: c.position_int || [],      // 版面坐标，用于定位与截图
-        has_image: !!c.has_image,               // 是否含图
-      }));
-      currentCaseData = {
-        case_id: caseId,
-        filename: (corpusCache.find(c => c.case_id === caseId) || {}).filename || caseId,
-        chunk_count: chunks.length,
-        // 命中数从快照现算，而不是写死 0——写死会让历史版本看起来一个问题都没有
-        finding_count: chunks.reduce((n, c) => n + c.findings.length, 0),
-        chunks,
-        _usedConfig: h.config || {},
-        _isHistory: true,
-      };
-      // 从别处跳进来时先记下基准，渲染时才能回填输入框，翻页也接着这一片继续
+  // 试切分支：用顶栏参数实时切分单个样本，不读快照、不产生任何持久数据
+  if (live) {
+    try {
+      // 请求真实坐标，否则截图与原文定位都用不了；代价是要渲染页面图像
+      const q = new URLSearchParams({ parser_config: JSON.stringify(runParams()), positions: "1" });
+      const data = await api(`/api/case/${encodeURIComponent(caseId)}?${q}`);
+      // 切分失败时把原因如实展示，而不是给一个空列表
+      if (data.error) {
+        $("chunkStream").innerHTML = `<div class="empty" style="color:var(--bad)">切分失败：${esc(data.error)}</div>`;
+        $("chunkMeta").innerHTML = "";
+        return;
+      }
+      currentCaseData = { ...data, _usedConfig: runParams(), _run: LIVE_RUN };
+      // 试切不支持标注：清空标注缓存，避免把别的版本的判定画到这份结果上
+      caseAnnotations = {};
+      shotCache = {};
+      autoShotOff = false;
       if (target) chunkJumpIndex = target.index;
       renderChunkView();
       if (target) scrollToChunk(target);
-      return;
+    } catch (e) {
+      $("chunkStream").innerHTML = `<div class="empty" style="color:var(--bad)">试切失败：${esc(e.message)}</div>`;
+      $("chunkMeta").innerHTML = "";
     }
-    // 有定位目标时优先用该条目所属轮次的参数，保证序号可比；否则用顶栏当前参数
-    // 有定位目标时用该条目所属轮次的配置，保证序号可比；否则用当前配置
-    const p = (target && target.config) ? target.config : runParams();
-    // 请求真实坐标：渲染页面图像会慢一些，但没有坐标就无法截图与定位
-    const q = new URLSearchParams({ parser_config: JSON.stringify(p), positions: "1" });
-    const data = await api(`/api/case/${encodeURIComponent(caseId)}?${q}`);
-    if (data.error) {
-      $("chunkStream").innerHTML = `<div class="empty" style="color:var(--bad)">切分失败：${esc(data.error)}</div>`;
-      return;
-    }
-    // 缓存本样本数据，切换筛选时直接重渲染，无需重新切分
-    currentCaseData = data;
-    // 缓存人工标注与截图状态
-    caseAnnotations = data.annotations || {};
+    return;
+  }
+
+  try {
+    // 读该版本存下来的切分文本。代码改动后重新切分得到的是别的结果，
+    // 而标注挂在这一版的切片上，只有读快照两者才对得上
+    const h = await api(`/api/runs/${viewingRun}/chunks/${encodeURIComponent(caseId)}`);
+    // 快照里已经带上了坐标与那一轮的检测命中，直接用即可——
+    // 问题标注、原文定位、截图都能正常工作。
+    // 旧轮次的快照没有这些字段，补默认值以免渲染时报错
+    const chunks = h.chunks.map(c => ({
+      ...c,
+      content_len: (c.content || "").length,  // 正文长度，快照里不存冗余字段
+      // 那一轮检出的问题；人工判定为误报的条目已在评估时打上 ignored 标记，
+      // 这里直接滤掉——判定过一次就不该继续在界面上标红、也不该计入问题数
+      findings: (c.findings || []).filter(f => !f.ignored),
+      position_int: c.position_int || [],      // 版面坐标，用于定位与截图
+      has_image: !!c.has_image,               // 是否含图
+    }));
+    currentCaseData = {
+      case_id: caseId,
+      filename: h.filename || caseInfo.filename || caseId,
+      chunk_count: chunks.length,
+      // 命中数从快照现算，而不是写死 0——写死会让这一版看起来一个问题都没有
+      finding_count: chunks.reduce((n, c) => n + c.findings.length, 0),
+      chunks,
+      source_file: h.source_file || null,
+      _usedConfig: h.config || {},
+      _run: viewingRun,  // 记下这份切片出自哪一版，切回本页时据此判断要不要重新加载
+    };
+    // 缓存该版本下这个样本的人工标注，切片底部据此显示已有判定
+    caseAnnotations = h.annotations || {};
+    // 换样本时清掉上一份的截图缓存
     shotCache = {};
     // 换样本就重新给自动缩略图一次机会：上一个样本取不到，
     // 不代表这一个也取不到
     autoShotOff = false;
-    // 记录本次切分实际使用的参数，供界面标注
-    currentCaseData._usedConfig = p;
     // 从别处跳进来时先记下基准，渲染时才能回填输入框，翻页也接着这一片继续
     if (target) chunkJumpIndex = target.index;
     // 渲染元信息、筛选工具栏与切片流
@@ -3293,7 +4385,13 @@ async function selectCase(caseId, target) {
     // 渲染完成后再定位，此时 DOM 已就绪
     if (target) scrollToChunk(target);
   } catch (e) {
-    $("chunkStream").innerHTML = `<div class="empty" style="color:var(--bad)">加载失败：${esc(e.message)}</div>`;
+    // 该版本的快照里没有这个样本是常见情况：语料是在那一轮之后才导入的，
+    // 要如实说清而不是笼统报个加载失败
+    $("chunkStream").innerHTML = `<div class="empty" style="color:var(--bad)">
+      加载失败：${esc(e.message)}<br>
+      <span class="hint">如果这个样本是在该版本之后才导入的，请到概览页跑一轮新评估，
+      它才会出现在快照里。</span></div>`;
+    $("chunkMeta").innerHTML = "";
   }
 }
 
@@ -3328,20 +4426,24 @@ function renderChunkView() {
     ? data.chunks.filter(c => c.findings.some(f => f.detector === chunkFilter))
     : data.chunks;
 
-  // 若本次切分用的参数与顶栏不同（从差异面板跳转时会发生），必须显式说明，
-  // 否则用户会困惑于为什么切片数和顶栏参数对不上。
-  const used = data._usedConfig || {};
-  const cur = runParams();
-  // 关键切分参数任一不同都会改变序号，必须提示，否则会困惑于切片数对不上
-  const keys = ["chunk_token_num", "delimiter", "children_delimiter", "overlapped_percent"];
-  const mismatch = used.chunk_token_num !== undefined &&
-    keys.some(k => String(used[k] ?? "") !== String(cur[k] ?? ""));
-  const paramNote = mismatch
-    ? `<p class="hint" style="margin:0.7rem 0 0;color:var(--warn)">本次按该问题所属轮次的配置切分（token=${esc(used.chunk_token_num)}，分段=${esc(JSON.stringify(used.delimiter || ""))}，子分隔符=${esc(JSON.stringify(used.children_delimiter || ""))}），与当前配置不同，以保证序号能对上。</p>`
-    : "";
+  // 当前是否为试切模式，多处展示据此切换措辞
+  const isLive = viewingRun === LIVE_RUN;
 
-  // 数据来源选择：实时切分用的是当前代码，历史轮次是那一轮当时的真实结果。
-  // 代码改动后两者会不同，这正是需要保留文本快照的原因。
+  // 这一版评估当时用的切分参数。快照读的是既成结果，顶栏参数只作用于「运行评估」；
+  // 试切正相反——它就是拿顶栏参数现切的，改完参数重选样本即可看到差异
+  const used = data._usedConfig || {};
+  const paramNote = used.chunk_token_num === undefined ? ""
+    : isLive
+      ? `<p class="hint" style="margin:0.7rem 0 0">本次试切用的是<strong>顶栏当前参数</strong>：token=${esc(used.chunk_token_num)}，
+         分段=${esc(JSON.stringify(used.delimiter || ""))}，
+         子分隔符=${esc(JSON.stringify(used.children_delimiter || ""))}。
+         改完参数重新点一下左侧样本，就能看到新参数的切分结果。</p>`
+      : `<p class="hint" style="margin:0.7rem 0 0">该版本的切分参数：token=${esc(used.chunk_token_num)}，
+         分段=${esc(JSON.stringify(used.delimiter || ""))}，
+         子分隔符=${esc(JSON.stringify(used.children_delimiter || ""))}。
+         顶栏参数只作用于「运行评估」，改了要跑一轮新评估才会产生新版本。</p>`;
+
+  // 版本选择：切片预览只看评估存下来的快照，标注也挂在这一版上。
   // 每一轮都记了自己的代码指纹，与当前代码不同的显式标出——
   // 改完代码没跑评估时，看着旧快照会误以为改动没生效
   const srcOpts = runsCache.filter(r => r.has_chunks).map(r => {
@@ -3352,22 +4454,24 @@ function renderChunkView() {
     return `<option value="${esc(r.run_id)}" ${viewingRun === r.run_id ? "selected" : ""}>`
       + `${esc(r.run_id)}${r.label ? " · " + esc(r.label) : ""} ${mark}</option>`;
   }).join("");
+  // 版本下拉只列真实轮次。试切已经独立成页签，不再混进这个下拉——
+  // 它本来就不是一个版本，混在版本里既讲不通，还会出现「页签在切片预览、
+  // 下拉却选着试切」这种两处状态互相矛盾的情况
   const sourceBar = `
     <div class="src-bar">
-      <label>查看：
-        <select id="chunkSource">
-          <option value="" ${!viewingRun ? "selected" : ""}>实时切分（当前代码）</option>
-          ${srcOpts}
-        </select>
-      </label>
-      ${viewingRun ? (() => {
+      ${isLive
+        ? `<span class="pill medium" title="结果不落盘，不产生版本、不计入准确率与趋势">试切结果 · 不计入指标</span>
+           <span class="pill low" title="标注必须挂在版本上才说得清属于哪一版；试切没有版本可挂">不支持标注</span>`
+        : `<label>版本：
+        <select id="chunkSource">${srcOpts}</select>
+      </label>` + (() => {
         // 取该轮的摘要以比对代码指纹
         const r = runsCache.find(x => x.run_id === viewingRun) || {};
         // 一致时说明这份快照就是当前代码的结果，可放心当作最新
         return (currentCodeHash && r.code_hash === currentCodeHash)
-          ? `<span class="pill good" title="这一轮就是用当前代码跑的">该轮 = 当前代码</span>`
-          : `<span class="pill medium" title="代码已改动，这一轮的结果不代表当前代码">代码已变，非当前结果</span>`;
-      })() : `<span class="pill low">用当前代码实时切分</span>`}
+          ? `<span class="pill good" title="这一轮就是用当前代码跑的">该版本 = 当前代码</span>`
+          : `<span class="pill medium" title="代码已改动，这一版的结果不代表当前代码；想看改动效果请跑一轮新评估">代码已变，非当前结果</span>`;
+      })() + `<span class="pill low" title="在这里做的判定都归属于该版本">标注归属该版本</span>`}
       <span class="spacer"></span>
       <div class="jump-box">
         <button class="mini step" id="chunkPrev" title="上一片">‹</button>
@@ -3390,7 +4494,8 @@ function renderChunkView() {
   // 整类批量判定条：仅在选中了具体问题类型时出现。
   // 「全部切片」下绝大多数切片没有命中任何规则，整批判定无从谈起。
   let batchBar = "";
-  if (chunkFilter) {
+  // 试切不支持标注，整类批量判定自然也不提供
+  if (chunkFilter && !isLive) {
     // 该筛选下尚未标注的切片，是批量写入的实际目标
     const pending = shown.filter(c => !caseAnnotations[String(c.index)]).length;
     // 已标注的数量；批量写入会跳过它们，批量撤销则正好以它们为目标
@@ -3436,9 +4541,13 @@ function renderChunkView() {
   // 绑定数据来源切换
   const srcSel = $("chunkSource");
   if (srcSel) {
-    srcSel.addEventListener("change", () => {
+    srcSel.addEventListener("change", async () => {
+      // 这个下拉现在只列真实轮次，选中即换版本
       viewingRun = srcSel.value;
-      selectCase(currentCase);
+      // 换版本要记进「上次看的版本」，从试切页签切回来时才能原样退回这一版
+      lastRealRun = viewingRun;
+      // 统一走模式/版本切换流程：刷新指示条、重建样本列表、让右侧跟上
+      await applyRunChange();
     });
   }
   // 绑定按编号跳转：点按钮或在输入框里回车都能触发
@@ -3468,15 +4577,33 @@ function renderChunkView() {
 
 // 渲染切片底部的标注条
 function renderAnnotation(c) {
+  // 试切没有版本可挂标注，只保留截图入口。
+  // 强行允许标注的话，这条判定属于哪一版说不清——而版本正是整套统计与继承的地基
+  if (viewingRun === LIVE_RUN) {
+    return `<div class="chunk-anno">
+      <span class="hint">试切结果不支持标注。要记录判定，请把该样本加入评估后在对应版本上标。</span>
+      <span class="spacer"></span>
+      <button class="mini" data-shot="${c.index}">看原文截图</button>
+    </div>`;
+  }
   // 该切片已有的标注
   const a = caseAnnotations[String(c.index)];
   // 已标注时展示结论与备注，并提供撤销
   if (a) {
     const cls = a.verdict === "confirmed" ? "bad" : a.verdict === "false_positive" ? "good" : "medium";
     const txt = { confirmed: "已确认是问题", false_positive: "已标为误报", missed: "人工标记的问题" }[a.verdict] || a.verdict;
+    // 继承来的判定未经本版本复核，明确标出：这一版是否还成立由 status 说了算，
+    // 但判断本身是上一版做的，人可以在这里直接改
+    const inherited = (a.origin || "").startsWith("inherit");
+    // 该判定在本版本下的成立情况；与人工判定不一致时（已修复、回归）最值得看见
+    const st = a.status && a.status !== a.verdict
+      ? `<span class="pill ${a.status === "regressed" ? "high" : "good"}">${esc(STATUS_CN[a.status] || a.status)}</span>`
+      : "";
     return `<div class="chunk-anno">
       <span class="pill ${cls}">${esc(txt)}</span>
+      ${st}
       ${a.detector ? `<span class="hint">${esc(detCn(a.detector))}</span>` : ""}
+      ${inherited ? `<span class="pill low" title="从上一版继承，未在本版本复核">继承</span>` : ""}
       ${a.note ? `<span class="hint">· ${esc(a.note)}</span>` : ""}
       <span class="spacer"></span>
       <button class="mini" data-anno-del="${c.index}">撤销标注</button>
@@ -3539,6 +4666,8 @@ $("pdfFitPage").addEventListener("click", () => pdfView.fitPage());
 // 框选标记模式开关
 let pdfMarking = false;
 $("pdfMarkMode").addEventListener("click", () => {
+  // 框选写入的是区域标注，与切片标注一样必须挂在版本上，试切没有版本可挂
+  if (viewingRun === LIVE_RUN) return toast("试切结果不支持标注，请切到某个评估版本再框选");
   // 原文没加载时无从框选
   if (!pdfView.ready) return toast("先选一个 PDF 样本");
   // 取反并应用
@@ -3558,7 +4687,9 @@ async function onPdfMarked(pos, cancel) {
   if (!det) return cancel();
   // 失败时同样撤框，避免界面显示的与已保存的不一致
   try {
-    await api(`/api/annotations/${encodeURIComponent(currentCase)}/regions`, {
+    // 带上当前查看的版本：区域标注同样按版本保存，在哪一版圈的就属于哪一版
+    await api(`/api/annotations/${encodeURIComponent(currentCase)}/regions`
+      + `?run=${encodeURIComponent(viewingRun)}`, {
       method: "POST",
       body: JSON.stringify({
         region: pos,    // 区域坐标，与切片坐标同为 PDF 点
@@ -3593,7 +4724,9 @@ async function restoreRegions(caseId) {
   if (!pdfView.ready) return;
   // 拉取失败不应影响预览主流程
   try {
-    const items = await api(`/api/annotations/${encodeURIComponent(caseId)}/regions`);
+    // 带上版本：只画这一版圈出来的框，否则别版的框会混进来
+    const items = await api(`/api/annotations/${encodeURIComponent(caseId)}/regions`
+      + `?run=${encodeURIComponent(viewingRun)}`);
     // 切样本时先清掉上一份的框
     pdfView.clearManual();
     // 画出全部区域
@@ -3612,18 +4745,21 @@ async function doAnnotate(verdict, idx, detector) {
   }
   // 备注可留空
   const note = prompt("补充说明（可留空）：", "") ?? "";
-  // 取正文摘要，供日后校验序号是否因参数变化而错位
+  // 取正文摘要，供跨版本继承时重新定位这个切片
   const rec = (currentCaseData.chunks || []).find(c => c.index === idx) || {};
   try {
-    await api(`/api/annotations/${encodeURIComponent(currentCase)}`, {
+    // 带上当前查看的版本：判定归属于这一版的切分结果
+    const r = await api(`/api/annotations/${encodeURIComponent(currentCase)}`
+      + `?run=${encodeURIComponent(viewingRun)}`, {
       method: "POST",
       body: JSON.stringify({
         chunk_index: idx, verdict, detector: det, note,
         excerpt: (rec.content || "").slice(0, 60),
       }),
     });
-    // 本地同步后重绘，避免整页刷新
-    caseAnnotations[String(idx)] = { chunk_index: idx, verdict, detector: det, note };
+    // 用服务端返回的条目回填，其中的 status 是后端按本版本命中情况算出来的
+    caseAnnotations[String(idx)] = r.annotation
+      || { chunk_index: idx, verdict, detector: det, note };
     renderChunkView();
     toast("已记录");
   } catch (err) {
@@ -3634,7 +4770,9 @@ async function doAnnotate(verdict, idx, detector) {
 // 撤销标注
 async function undoAnnotate(idx) {
   try {
-    await fetch(`/api/annotations/${encodeURIComponent(currentCase)}/${idx}`, { method: "DELETE" });
+    // 带上版本：只撤销这一版的判定，别版的原样保留
+    await fetch(`/api/annotations/${encodeURIComponent(currentCase)}/${idx}`
+      + `?run=${encodeURIComponent(viewingRun)}`, { method: "DELETE" });
     delete caseAnnotations[String(idx)];
     renderChunkView();
     toast("已撤销");
@@ -3667,8 +4805,9 @@ async function doBatchAnnotate(verdict) {
   // 备注整批只填一次，避免逐条弹窗
   const note = prompt("补充说明（可留空，整批共用）：", "") ?? "";
   try {
-    // 整批一次请求，服务端只读写一次标注文件
-    const r = await api(`/api/annotations/${encodeURIComponent(currentCase)}/batch`, {
+    // 整批一次请求，服务端只读写一次标注文件；带上版本，整批都归属这一版
+    const r = await api(`/api/annotations/${encodeURIComponent(currentCase)}/batch`
+      + `?run=${encodeURIComponent(viewingRun)}`, {
       method: "POST",
       body: JSON.stringify({
         verdict,  // 整批统一的结论
@@ -3704,8 +4843,9 @@ async function doBatchUndo() {
   // 撤销同样影响面大，先明确确认
   if (!confirm(`撤销「${detCn(chunkFilter)}」下这 ${targets.length} 条标注？`)) return;
   try {
-    // 整批一次请求删除
-    const r = await api(`/api/annotations/${encodeURIComponent(currentCase)}/batch/delete`, {
+    // 整批一次请求删除；带上版本，只撤销这一版的判定
+    const r = await api(`/api/annotations/${encodeURIComponent(currentCase)}/batch/delete`
+      + `?run=${encodeURIComponent(viewingRun)}`, {
       method: "POST",
       body: JSON.stringify({ chunk_indexes: targets.map(c => c.index) }),
     });
@@ -4471,8 +5611,18 @@ $("btnImport").addEventListener("click", async () => {
   try { corpusCache = await api("/api/corpus"); } catch (e) { /* 预取失败不阻塞，进入对应页面时会重试 */ }
   // 先加载切分配置定义，顶栏摘要与配置面板都依赖它
   await loadConfig();
-  // 再加载历史轮次，它同时驱动查看选择器、对比选择器、趋势图与历史表格
+  // 再加载历史轮次，它同时驱动查看选择器、对比选择器、趋势图与历史表格；
+  // 未完成的评估任务也随它一并取回，进行中那一行会直接出现在表格顶部
   await loadRuns();
+  // 记下打开页面时的最新一轮。有了这个基准，后台任务跑完时才认得出
+  // 「列表里多了一轮」，进而自动切过去——否则每次打开页面都会当成刚跑完
+  knownLatestRun = runsCache.length ? runsCache[0].run_id : "";
+  // 认领遗留的任务：上次进程被打断留下的中断任务、或此刻仍在跑的任务，
+  // 都要在打开页面时就显示出来，而不是等人再点一次「运行评估」才发现
+  if (jobsCache.length) {
+    // 默认关注最新的那个任务
+    activeJobId = jobsCache[0].job_id;
+  }
   try {
     // 默认展示最新一轮。此前默认展示基准轮，而基准可能是很旧的一次，
     // 打开页面看到旧数据却以为是最新结果，是个隐蔽但要命的误导。
@@ -4480,13 +5630,24 @@ $("btnImport").addEventListener("click", async () => {
       const latest = runsCache[0];
       const r = await api(`/api/runs/${latest.run_id}`);
       renderOverview(r, null, r.run_id === baselineId ? "baseline" : "history");
-    } else {
-      // 尚无任何历史时给出明确的下一步指引
+    } else if (!jobsCache.length) {
+      // 尚无任何历史、也没有在跑的任务时才给出「跑第一轮」的指引
       $("evalHint").textContent = "尚无历史轮次。点右上角「运行评估」跑第一轮。";
     }
   } catch (e) {
     // 接口异常不应让页面停在“加载中”，明确提示失败原因
     $("evalHint").textContent = "加载失败：" + e.message;
+  }
+  // 中断提示必须放在 renderOverview 之后：它也会写 evalHint，
+  // 放在前面会被它原样覆盖，界面上就完全看不出上一轮是被打断的
+  const stuck = jobsCache.find(j => j.status === "interrupted" || j.status === "failed");
+  // 如实回报进度，避免让人以为那一轮白跑了
+  if (stuck) {
+    $("evalHint").innerHTML = `上一轮评估${JOB_ST[stuck.status].cn}（${esc(stuck.job_id)}）：`
+      + `已完成 ${stuck.done_count}/${stuck.total_count} 个语料，`
+      + `到「评估进度」页可从断点续跑。`;
+    // 已提示过就不必在轮询里重复弹一次
+    jobFinalized.add(stuck.job_id);
   }
 })();
 </script>

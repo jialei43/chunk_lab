@@ -5,9 +5,25 @@
 
   "_优先级": "环境变量 CHUNKLAB_DATA_DIR > 本文件 > 默认值。临时切换用环境变量即可，不必改文件。",
 
+  "_tenant_id": "借用哪个 ragflow 租户的模型授权。切分器的表格摘要、图片描述、艺术字兜底都要按租户去库里查模型配置，留空则这三项一律降级为空结果。要求该租户的 img2txt_id/llm_id 在 tenant_llm 里有对应且 api_key 非空的授权行。也可用环境变量 CHUNKLAB_TENANT_ID。",
+  "tenant_id": "",
+
   "_mineru_token": "MinerU 官方云端 API 的 token，用于把解析放到云端跑（本地十几分钟一份的 PDF，云端通常快得多）。也可用环境变量 MINERU_API_TOKEN。本文件不进版本管理，token 不会被提交。",
   "mineru_token": "sk-在此填入你的 token",
 
   "_mineru_cloud_backend": "云端解析使用的 backend，默认 vlm-engine。",
-  "mineru_cloud_backend": "vlm-engine"
+  "mineru_cloud_backend": "vlm-engine",
+
+  "_mineru_local_backend": "本地 MinerU 解析使用的 backend，默认 vlm-engine（实验室跑的是本机 VLM 部署）。桥接层 chunklab_bridge 的内置默认是 pipeline，那是对齐 ragflow 生产的取值，实验室这边统一覆盖。也可用环境变量 MINERU_BACKEND，它优先于本文件。可选值：vlm-engine / pipeline / hybrid-engine / vlm-http-client / hybrid-http-client。",
+  "mineru_local_backend": "vlm-engine",
+
+  "_vlm_cache": "图片描述、艺术字兜底、表格摘要的模型调用结果缓存。默认开启，整块可省略。连接参数默认复用 ragflow 的 conf/service_conf.yaml 里的 redis 配置，但逻辑库另开 db=3，不与生产消息队列混放。缓存条目**永久保留不设 TTL**，因此改了切分器里的提示词常量后旧条目不会自动消失，需要 ./run.sh cache clear 手动清。临时跑一轮不吃缓存的对照实验用环境变量 CHUNKLAB_VLM_CACHE=0。",
+  "vlm_cache": {
+    "enable": true,
+    "host": "127.0.0.1",
+    "port": 6379,
+    "db": 3,
+    "username": "",
+    "password": "infini_rag_flow"
+  }
 }

@@ -19,10 +19,46 @@ from .offline import build_parser_config, normalize_chunks, run_offline_chunking
 from .paths import BASELINE_DIR, CORPUS_DIR, REPORT_DIR  # 导入语料、基线与报告目录常量
 
 
-def load_cases(only=None):
+# 默认不参与评估的文件类型。
+# PPTX 走 slide_mode，切块契约是「严格按幻灯片每页一块」，与流式文档的
+# 「长段落独立、短段落合并到 token 预算」完全是两回事；用同一套检测规则去衡量它，
+# 报出来的多半是契约差异而不是缺陷（此前 missing_breadcrumb 对 pptx 的 13 条误报即是）。
+EVAL_EXCLUDED_EXTS = {".pptx", ".ppt"}
+
+
+def case_enabled(meta):
+    """判断一个样本是否参与评估。
+
+    缺少 `enabled` 字段一律视为启用：该字段是后加的，存量样本的 case.yaml 里没有，
+    默认成停用会让语料库突然变空。
+    """
+    # 显式写了才按其取值，其余情况都是启用
+    return bool((meta or {}).get("enabled", True))
+
+
+def case_evaluable(meta):
+    """判断一个样本是否属于「评估口径」内：既处于启用状态，文件类型也参与评估。"""
+    # 语料库里被停用的不参与
+    if not case_enabled(meta):
+        return False
+    # 文件类型被排除的不参与（当前为 pptx/ppt）
+    filename = str((meta or {}).get("filename") or "").lower()
+    return not any(filename.endswith(ext) for ext in EVAL_EXCLUDED_EXTS)
+
+
+def load_cases(only=None, for_eval=False):
     """扫描语料库，返回全部样本描述。
 
     only 给定时只加载指定的 case_id，便于针对单个样本快速迭代。
+
+    for_eval 表示「按评估口径取样」，只有全量评估该传真。此时会同时排除
+    语料库里停用的样本和默认不参与评估的文件类型（见 EVAL_EXCLUDED_EXTS）。
+
+    默认返回全部——按 id 取单样本、查文件名、给标注补文件名这些调用都必须
+    能看到被排除的样本，否则排除一个样本会连带让它的历史标注失去文件名。
+
+    only 与 for_eval 同时给出时以 only 为准：显式点名的样本就该被处理，
+    这两个开关管的是「默认取哪些」，不是「禁止访问」。
     """
     # 收集样本描述
     cases = []
@@ -48,6 +84,12 @@ def load_cases(only=None):
         # 指定了筛选条件且当前样本不在其中时跳过
         if only and meta.get("case_id") not in only:
             continue
+        # 未点名且按评估口径取样时，跳过停用的与默认不参与评估的文件类型
+        if not only and for_eval and not case_evaluable(meta):
+            continue
+        # 把启用状态与评估资格补成显式值，界面与调用方无需再处理字段缺失
+        meta["enabled"] = case_enabled(meta)
+        meta["evaluable"] = case_evaluable(meta)
         # 把产物路径补进描述，供后续切分使用
         meta["content_list"] = candidates[0]
         # 样本目录本身即桥接层需要的语料目录
@@ -91,7 +133,8 @@ def evaluate_case(case, cfg=None, parser_config=None):
     # 规范化为可序列化记录
     records = normalize_chunks(chunks)
     # 跑全部检测器
-    findings = run_detectors(records, case["case_id"], cfg)
+    # 带上原始文件名：文件类型相关的判据（如 PPTX 整页成块不判面包屑）需要据此决定是否适用
+    findings = run_detectors(records, case["case_id"], cfg, filename=case.get("filename", ""))
     # 补充归因：把问题对照原始块，判断该改切分代码还是解析/噪声治理。
     # 不做这个区分，报告里每条都指向 mineru_chunker，而其中不少改那里修不好。
     finding_dicts = [asdict(f) for f in findings]
@@ -198,21 +241,19 @@ def inspect_case(case, cfg=None, parser_config=None, with_positions=False):
     # 规范化为可序列化记录
     records = normalize_chunks(chunks)
     # 跑全部检测器
-    findings = run_detectors(records, case["case_id"], cfg)
+    # 带上原始文件名：文件类型相关的判据（如 PPTX 整页成块不判面包屑）需要据此决定是否适用
+    findings = run_detectors(records, case["case_id"], cfg, filename=case.get("filename", ""))
     # 组装预览格式；与评估共用同一处实现，保证快照里存的与预览要的一致
     return build_preview(case, records, [asdict(f) for f in findings])
 
 
-def evaluate_all(only=None, cfg=None, parser_config=None):
-    """评估全部语料，返回完整报告字典。"""
-    # 未指定配置时使用默认阈值
-    cfg = cfg or DetectorConfig()
-    # 解析本轮实际生效的完整配置，供报告记录与可比性校验
-    effective_config = build_parser_config(parser_config)
-    # 加载语料
-    cases = load_cases(only=only)
-    # 逐个评估
-    results = [evaluate_case(c, cfg=cfg, parser_config=parser_config) for c in cases]
+def build_report(results, cfg, effective_config):
+    """把逐样本评估结果汇总成一份完整报告。
+
+    单独抽出来是因为有两条路径要产出同一种报告：一次跑完的 `evaluate_all`，
+    以及分样本落盘、支持断点续跑的后台评估任务。两边各拼一遍统计，
+    早晚会在某个字段上分叉，让「同一轮评估」在两条路径下得出不同的数字。
+    """
     # 把切分文本从逐样本结果中抽出，集中交给 save_run 压缩存储，
     # 避免它随报告 JSON 一起落盘把文件撑大
     chunks_by_case = {}
@@ -247,6 +288,20 @@ def evaluate_all(only=None, cfg=None, parser_config=None):
         "cases": results,  # 逐样本明细
         "_chunks": chunks_by_case,  # 切分文本，save_run 会取走并单独压缩存储
     }
+
+
+def evaluate_all(only=None, cfg=None, parser_config=None):
+    """评估全部语料，返回完整报告字典。"""
+    # 未指定配置时使用默认阈值
+    cfg = cfg or DetectorConfig()
+    # 解析本轮实际生效的完整配置，供报告记录与可比性校验
+    effective_config = build_parser_config(parser_config)
+    # 加载语料：未点名样本时按评估口径取样（排除停用样本与 pptx 这类契约不同的文件类型）
+    cases = load_cases(only=only, for_eval=True)
+    # 逐个评估
+    results = [evaluate_case(c, cfg=cfg, parser_config=parser_config) for c in cases]
+    # 汇总成报告，与后台评估任务共用同一处实现
+    return build_report(results, cfg, effective_config)
 
 
 def save_report(report, name=None):
@@ -391,6 +446,47 @@ def compare_reports(baseline, current):
         "by_detector": by_detector,  # 逐检测器变化
         "by_case": by_case,  # 逐样本变化
     }
+
+
+def apply_false_positive_marks(report, marks):
+    """按人工「误报」判定把对应问题标记为忽略，并重算各级统计，返回被忽略的条数。
+
+    问题明细**保留**（只多一个 `ignored` 标记），不是删掉：判定本身也可能是错的，
+    留着才能回溯当初为什么忽略它。但所有对外的计数——样本的 `finding_count`、
+    `by_detector`，以及全局的 `finding_total`、`totals_by_detector`——都不再算它们，
+    这样问题总数反映的就是「还没甄别过的问题」，回归对比也不会被同一批老噪声干扰。
+    """
+    ignored_total = 0  # 累计被忽略的问题条数
+    for case in report.get("cases", []):  # 逐个样本处理
+        case_marks = marks.get(case.get("case_id")) or {}  # 取该样本的误报判定
+        by_detector = {}  # 重新统计该样本各检测器的有效命中数
+        effective = 0  # 该样本的有效问题数
+        for finding in case.get("findings", []):  # 逐条问题判断是否被判过误报
+            marked = case_marks.get(finding.get("chunk_index"))  # 该切片是否有误报判定
+            # 判定存在，且未指明规则（整片忽略）或正好指明了这条规则时，本条问题作废
+            if marked is not None and (not marked or marked == finding.get("detector")):
+                finding["ignored"] = True  # 打上忽略标记，明细仍然保留
+                ignored_total += 1  # 累加忽略条数
+                continue  # 不计入任何统计
+            finding.pop("ignored", None)  # 不再被判误报的条目要清掉历史标记
+            by_detector[finding.get("detector")] = by_detector.get(finding.get("detector"), 0) + 1  # 累加有效命中
+            effective += 1  # 累加有效问题数
+        case["by_detector"] = by_detector  # 覆盖为排除忽略后的统计
+        case["finding_count"] = effective  # 覆盖为排除忽略后的问题数
+        case["ignored_count"] = len(case.get("findings", [])) - effective  # 记录该样本被忽略的条数
+    totals = {}  # 重算全局各检测器命中
+    for case in report.get("cases", []):  # 逐样本累加
+        for name, count in (case.get("by_detector") or {}).items():  # 逐检测器累加
+            totals[name] = totals.get(name, 0) + count  # 归入全局计数
+    report["totals_by_detector"] = totals  # 覆盖全局检测器统计
+    report["finding_total"] = sum(c.get("finding_count", 0) for c in report.get("cases", []))  # 覆盖问题总数
+    report["ignored_total"] = ignored_total  # 记录全局忽略条数，供报告如实说明
+    return ignored_total  # 返回忽略条数供调用方提示
+
+
+def active_findings(case):
+    """取某样本中未被判定为误报的问题明细，供展示层使用。"""
+    return [f for f in (case.get("findings") or []) if not f.get("ignored")]  # 过滤掉已忽略条目
 
 
 def _finding_identity(case_id, finding):
@@ -656,7 +752,7 @@ def format_report(report, top_findings=0):
         # 遍历所有样本的命中
         for r in report["cases"]:
             # 逐条归入对应检测器
-            for f in r.get("findings", []):
+            for f in active_findings(r):  # 已判定为误报的条目不再列出
                 # 建组并追加
                 grouped.setdefault(f["detector"], []).append(f)
         # 按组输出

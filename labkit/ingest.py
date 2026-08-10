@@ -145,6 +145,129 @@ def _middle_json_path(content_list_path):
     return candidate if candidate.is_file() else None
 
 
+def link_case_images(dest_dir, source, force=False):
+    """把样本目录里的 images 指向 MinerU 产物的 images 目录，返回是否建立成功。
+
+    为什么必须有：生产的 `MinerUParser._read_output` 会把 content_list 里的相对
+    `img_path`（形如 `images/xxx.png`）绝对化为「content_list 所在目录 / img_path」。
+    离线重放时那个目录就是语料目录——里面没有 images，图片一律加载不到，
+    图片 VLM 描述、表格截图、艺术字兜底就全部静默降级为空。
+
+    用软链而不是复制：整套语料的图片合计约 600MB，而产物目录与语料目录同在数据根下、
+    生命周期一致，复制一份纯属浪费。产物目录被清理时软链失效，行为退回「无图片」，
+    与配置本就没开增强项时一致，不会报错。
+    """
+    # MinerU 产物的 images 与 content_list 同级
+    src_images = Path(source).parent / "images"
+    # 源目录没有 images 说明该产物本就不含配图（纯文本 docx 等），无需处理
+    if not src_images.is_dir():
+        return False
+    # 语料目录中的目标位置，名字必须是 images，与 content_list 里的相对路径一致
+    dest_images = Path(dest_dir) / "images"
+    # 已存在时按 force 决定是否重建：重复导入应保持幂等
+    if dest_images.exists() or dest_images.is_symlink():
+        # 不强制重建就直接认为已就绪
+        if not force:
+            return True
+        # 强制重建前先移除旧的软链或目录
+        if dest_images.is_symlink() or dest_images.is_file():
+            dest_images.unlink()
+        else:
+            shutil.rmtree(dest_images)
+    # 建立软链；跨设备或权限问题时降级为不建立，不中断导入
+    try:
+        dest_images.symlink_to(src_images, target_is_directory=True)
+        return True
+    except OSError:
+        return False
+
+
+def set_case_enabled(case_id, enabled):
+    """切换单个样本是否参与评估，返回 (是否成功, 说明)。
+
+    只改 case.yaml 里的 `enabled` 字段，不动产物、标注与历史轮次——停用是「本轮不跑它」，
+    不是删除语料。停用期间它的历史标注会在新版本里标为「本版本未评估」原样保留，
+    重新启用后自动恢复生效。
+    """
+    # 样本目录
+    case_dir = CORPUS_DIR / case_id
+    # 描述文件
+    meta_path = case_dir / "case.yaml"
+    # 样本不存在时如实回报，不静默创建
+    if not meta_path.is_file():
+        return False, f"样本不存在：{case_id}"
+    # 读取现有描述，保留其余字段不动
+    with meta_path.open("r", encoding="utf-8") as fh:
+        meta = yaml.safe_load(fh) or {}
+    # 写入新的启用状态
+    meta["enabled"] = bool(enabled)
+    # 写回，保持中文与字段顺序
+    with meta_path.open("w", encoding="utf-8") as fh:
+        yaml.safe_dump(meta, fh, allow_unicode=True, sort_keys=False)
+    # 返回结果说明
+    return True, ("已启用" if enabled else "已停用")
+
+
+def delete_case(case_id):
+    """把一个样本从语料库彻底移除，返回 (是否成功, 说明, 明细)。
+
+    删三样东西，都是**该样本专属**的：
+      - `corpus/<case_id>/`：产物副本、middle.json、case.yaml 与 images 软链；
+      - `sources/<case_id>/`：为原文对照与截图关联上来的原始文件；
+      - 全部版本下它的人工标注（切片标注与区域标注）。
+
+    **不动历史轮次快照**（`runs/*.chunks.gz` 与 `runs/*.json`）。那是「那一轮
+    确实跑出了这些结果」的事实记录，重写它会让趋势图、轮次对比与已经生成的
+    Markdown 报告数字全部对不上。预览侧对此已有兜底：样本从语料库消失后，
+    历史版本里它的切片照样能看，只是没有文件名、因而失去原文截图。
+
+    **不动 `sources/converted/` 的转换缓存**：那里按「文件名 + 源文件修改时间」
+    命名，可能被同源不同 backend 的另一个样本共用，且随时可重新生成。
+
+    删除 corpus 目录时必须**不跟随符号链接**——`images` 是指向 mineru_out 里
+    真实产物的软链，跟随删除会把 MinerU 的解析产物一起毁掉。`shutil.rmtree`
+    本身只会删掉软链条目而不进入其指向的目录，这里额外断言目录本身不是软链，
+    避免有人手工把整个样本目录做成软链后被整体误删。
+    """
+    # 延迟导入：标注模块会连带载入历史轮次，纯导入语料的场景不必承担这份开销
+    from . import annotations
+    # 原文归档目录与预览模块共用同一个约定，从那里取以免路径两处各写一遍
+    from .preview import SOURCE_DIR
+    # 样本目录
+    case_dir = CORPUS_DIR / case_id
+    # 样本不存在时如实回报，不静默当作成功——批量删除时要能指出是哪一个没删掉
+    if not case_dir.is_dir():
+        return False, f"样本不存在：{case_id}", {}
+    # 样本目录本身是软链时拒绝删除：删它等于删掉软链指向的真实数据
+    if case_dir.is_symlink():
+        return False, f"样本目录是符号链接，拒绝删除：{case_id}", {}
+    # 记录实际删掉了什么，供界面如实回报
+    detail = {}
+    # 删语料本体；rmtree 遇到目录内的软链只解除链接，不会进入其指向的目录
+    shutil.rmtree(case_dir)
+    # 记下语料目录已删
+    detail["corpus"] = True
+    # 关联的原文目录，只有关联过原文的样本才有
+    src_dir = SOURCE_DIR / case_id
+    # 存在且不是软链才删，判断口径与语料目录一致
+    if src_dir.is_dir() and not src_dir.is_symlink():
+        shutil.rmtree(src_dir)
+        detail["source"] = True
+    # 删掉它在全部版本下的人工标注
+    detail["annotations"] = annotations.delete_case(case_id)
+    # 组装一句能直接显示给人看的说明
+    parts = ["语料"]
+    # 有关联原文时一并说明
+    if detail.get("source"):
+        parts.append("关联原文")
+    # 有标注时说清删了多少条、涉及几版
+    ann = detail["annotations"]
+    if ann["files"]:
+        parts.append(f"{ann['runs']} 个版本下的 {ann['files']} 份标注")
+    # 返回结果
+    return True, "已删除" + "、".join(parts), detail
+
+
 def ingest_case(case, overwrite=False):
     """把单个样本复制进语料库并生成 case.yaml，返回该样本目录。"""
     # 源产物路径
@@ -176,6 +299,9 @@ def ingest_case(case, overwrite=False):
     if middle_src is not None:
         # 保持原文件名复制到样本目录
         shutil.copy2(middle_src, dest_dir / middle_src.name)
+    # 把产物的 images 目录软链进来：生产的 _read_output 按「content_list 所在目录 / img_path」
+    # 定位配图，语料目录里没有 images 的话，图片描述与截图会全部静默降级为空
+    link_case_images(dest_dir, source)
     # 读取块数写进描述文件，便于在不打开产物的情况下了解样本规模
     with dest_json.open("r", encoding="utf-8") as fh:
         # 解析后取长度即为 MinerU 原始块数量
@@ -194,6 +320,9 @@ def ingest_case(case, overwrite=False):
         "backend": source.parent.name,
         "source": str(source),  # 产物原始路径，仅作追溯用途
         "note": case["note"],  # 该样本的关注点
+        # 是否参与全量评估。新导入的样本默认启用；停用后仍留在语料库里可随时启用，
+        # 只是不进评估轮次——这与「删除语料」是两回事
+        "enabled": True,
     }
     # 写出 YAML 描述文件，allow_unicode 保证中文不被转义成 \uXXXX
     with (dest_dir / "case.yaml").open("w", encoding="utf-8") as fh:

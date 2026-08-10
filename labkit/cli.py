@@ -4,6 +4,7 @@
     ingest    把本机 MinerU 产物导入语料库
     eval      对语料库跑离线切分与全部检测器，产出报告
     smoke     单个产物的连通性验证（阶段一遗留的调试入口）
+    cache     查看或清理 VLM/LLM 结果缓存
 """
 
 import argparse  # 导入 argparse 构建子命令
@@ -30,11 +31,17 @@ def cmd_ingest(args):
 def cmd_eval(args):
     """执行全量评估并输出报告。"""
     # 延迟导入
-    from . import runs
+    from . import annotations, runs
     from .detectors import DetectorConfig
     from .evaluate import compare_reports, evaluate_all, format_comparison, format_report
     # 启动时确保旧版基线已收编为历史轮次
     runs.migrate_legacy_baseline()
+    # 同时把旧版不带版本的平铺标注收编进最新版本
+    annotations.migrate_flat()
+    # 记下评估前的最新一轮：它就是新版本要继承标注的来源。
+    # 历史轮次被清理过时索引会是空的，此时回退到最近一个存有标注的版本——
+    # 否则那些人工判定会因为找不到继承源而全部失效。
+    prev_run = runs.latest_run_id() or annotations.latest_annotated_run()
     # 组装完整切分配置，与 Web 端同一口径；未指定项由默认值补齐
     from .offline import build_parser_config
     overrides = {"chunk_token_num": args.chunk_token_num}
@@ -51,16 +58,34 @@ def cmd_eval(args):
         cfg=cfg,  # 检测阈值
         parser_config=config,  # 完整切分配置
     )
-    # 语料为空时明确提示，避免使用者误以为是零缺陷
+    # 没有样本参与时明确提示，避免使用者误以为是零缺陷。
+    # 语料库非空却评估了 0 个，说明样本全被停用了——这两种情况的处置完全不同
     if report["case_count"] == 0:
-        print("语料库为空，请先执行：./run.sh ingest")
+        from .evaluate import load_cases
+        total = len(load_cases())
+        if total:
+            print(f"语料库有 {total} 个样本，但全部处于停用状态，本轮没有可评估的内容。")
+            print("到 Web 控制台的「语料库」页勾选要参与评估的样本，或改 case.yaml 的 enabled 字段。")
+        else:
+            print("语料库为空，请先执行：./run.sh ingest")
         return 1
     # 存为不可变的历史轮次，全量评估才入历史以免局部评估污染趋势
     run_id = None
+    # 本轮从上一版继承过来的标注概况，供结束时提示
+    inherited = None
     if not args.case:
         # 落盘并取回带代码指纹的完整快照
         run_id = runs.save_run(report, label=args.label or "")
+        # 把上一版的人工判定继承到新版本，并按新快照逐条重判
+        inherited = annotations.inherit(prev_run, run_id)
         report = runs.load_run(run_id)
+        # 人工已判定为误报的问题不再计入统计：判定过一次就不该每轮重新甄别同一批噪声，
+        # 否则真正的回归会被它们淹没。必须放在继承之后——判定要先按本轮快照重新定位到切片。
+        from .evaluate import apply_false_positive_marks
+        ignored = apply_false_positive_marks(report, annotations.false_positive_marks(run_id))
+        # 确有忽略时把新统计回写到本轮快照，界面与后续对比都以此为准
+        if ignored:
+            report = runs.update_run(run_id, report)
     # 渲染并打印终端报告
     print(format_report(report, top_findings=args.top))
     # 提示本轮的历史标识与代码指纹，便于日后回溯
@@ -68,6 +93,13 @@ def cmd_eval(args):
         code = report.get("code", {})
         print(f"\n本轮已存为历史：{run_id}　代码指纹 {code.get('hash', '?')}"
               f"{'（含未提交改动）' if code.get('git_dirty') else ''}")
+        # 继承概况：让人知道这一版的标注是从哪来的、有没有真的搬过来
+        if inherited and inherited["marks"]:
+            print(f"已从 {prev_run} 继承 {inherited['marks']} 条标注、"
+                  f"{inherited['regions']} 条区域标注，并按本轮结果重新判定")
+        # 如实说明有多少问题因人工判定为误报而未计入，避免总数下降被误读为改善
+        if report.get("ignored_total"):
+            print(f"已忽略 {report['ignored_total']} 条人工判定为误报的问题（不计入上面的问题总数）")
         # 生成 Markdown 评估报告：逐条列出问题、证据、可能相关代码与复现命令，
         # 可直接交给编码助手作为修复依据
         from .report import save_markdown
@@ -178,18 +210,29 @@ def cmd_runs(args):
 
 
 def cmd_guard(args):
-    """核对人工标注在当前代码下是否仍然成立。
+    """拿来源版本的人工判定，去目标版本的切分结果上逐条核对。
 
-    改检测规则的正确顺序是：先跑一次记下基准，改完再跑一次比对。
+    改检测规则的正确顺序是：改完跑一轮评估产生新版本，标注会自动继承并重判，
+    再跑这条命令，用新版本核对上一版的判定。
     出现「回归」说明这次改动碰坏了本来能检出的东西。
     """
     # 延迟导入，其它子命令不承担切分依赖的加载开销
+    from . import annotations, runs
     from .guard import OUTCOMES, analyze_false_positives, build_full_report, check
+
+    # 先把旧版平铺标注收编进版本目录，否则这条命令看到的是空的
+    annotations.migrate_flat()
+    # 目标版本：未指定时取最新一轮
+    run_id = args.run or runs.latest_run_id()
+    # 一轮评估都没有时无从核对，明确提示下一步
+    if not run_id:
+        print("尚无任何评估版本。先跑一轮：./run.sh eval")
+        return 1
 
     # 生成优化任务书：这是独立用途，出完就结束，不再跑核对
     if args.report:
-        # 生成报告，内容取自全部人工标注
-        rep = build_full_report()
+        # 生成报告，内容取自该版本的人工标注
+        rep = build_full_report(run_id)
         # 未指定路径时打印到标准输出，便于直接管道给别的命令
         if args.report == "-":
             print(rep["markdown"])
@@ -206,11 +249,14 @@ def cmd_guard(args):
                   f"框选区域 {c['regions']} 块")
         return
 
-    # 执行核对
-    r = check(only=[args.case] if args.case else None)
+    # 执行核对；base 未指定时取目标版本的上一轮
+    r = check(run_id, base_run=args.base, only=[args.case] if args.case else None)
+    # 说清这次是拿哪一版的判定、在哪一版上核对的
+    origin = r.get("base_run") or run_id
+    print(f"\n判定来自版本 {origin}，在版本 {run_id} 的切分结果上核对")
     # 汇总一行说清结果
     parts = [f"{OUTCOMES[k]} {v}" for k, v in r["summary"].items() if v]
-    print(f"\n核对 {r['checked']} 个样本：{'、'.join(parts) or '没有可核对的标注'}")
+    print(f"核对 {r['checked']} 个样本：{'、'.join(parts) or '没有可核对的标注'}")
     # 有回归时明确指出，这是唯一算失败的情况
     print("结论：" + ("通过，无回归" if r["ok"] else "不通过，出现回归"))
 
@@ -238,7 +284,7 @@ def cmd_guard(args):
 
     # 附带误报归纳，指出规则该往哪儿改
     if args.why:
-        groups = analyze_false_positives(only=[args.case] if args.case else None)
+        groups = analyze_false_positives(run_id, only=[args.case] if args.case else None)
         # 没有误报时说明这一点，避免以为是功能没跑
         if not groups:
             print("\n暂无标为误报的切片，无从归纳")
@@ -371,6 +417,43 @@ def cmd_serve(args):
     return 0
 
 
+def cmd_cache(args):
+    """查看或清理 VLM/LLM 结果缓存。"""
+    # 延迟导入，其余子命令不必承担缓存模块的加载开销
+    from . import vlmcache
+
+    # 清理动作：按样本或全清
+    if args.action == "clear":
+        # 执行清理，未指定 --sample 即全清
+        result = vlmcache.cache_clear(args.sample)
+        # 缓存不可用时如实说明并以非零退出，便于脚本判断
+        if not result.get("available"):
+            print(f"缓存不可用：{result.get('reason')}")
+            return 1
+        # 打印删除结果
+        print(f"已清理 {result['deleted']} 条缓存（范围：{result['scope']}）")
+        return 0
+
+    # 统计动作：打印条目数、占用与样本分布
+    result = vlmcache.cache_stats()
+    # 缓存不可用时如实说明
+    if not result.get("available"):
+        print(f"缓存不可用：{result.get('reason')}")
+        return 1
+    # 条目总数与占用，字节转成 MB 便于阅读
+    print(f"缓存条目：{result['entries']} 条，占用 {result['bytes'] / 1024 / 1024:.2f} MB")
+    # 样本分布为空说明还没跑过带模型的切分
+    if not result["per_sample"]:
+        print("（暂无样本索引；开启图片描述或表格摘要跑一轮后才会产生）")
+        return 0
+    # 按用量倒序打印各样本的条目数
+    print("\n各样本用量：")
+    # 逐行输出，样本名左对齐便于扫读
+    for name, count in result["per_sample"].items():
+        print(f"  {name:<50} {count} 条")
+    return 0
+
+
 def build_parser():
     """构建命令行解析器。"""
     # 顶层解析器
@@ -468,7 +551,12 @@ def build_parser():
     p_serve.set_defaults(func=cmd_serve)
 
     # smoke 子命令
-    p_guard = sub.add_parser("guard", help="回归护栏：核对人工标注是否仍然成立")
+    p_guard = sub.add_parser("guard", help="回归护栏：用目标版本核对来源版本的人工判定")
+    # 目标版本：用哪一轮的切分结果来核对，默认最新一轮
+    p_guard.add_argument("--run", default="", help="目标版本（默认最新一轮）")
+    # 来源版本：判定出自哪一轮，默认取目标版本的上一轮；传空串表示只看目标版本自己
+    p_guard.add_argument("--base", default=None,
+                         help="来源版本（默认目标版本的上一轮；传空串只看目标版本自己）")
     # 可只核对一个样本，便于针对某个文档快速迭代
     p_guard.add_argument("--case", default="", help="只核对指定样本")
     # 只列出仍需处理的条目，改规则时更省事
@@ -494,6 +582,16 @@ def build_parser():
     p_smoke.add_argument("--show", type=int, default=3, help="打印前 N 个 chunk")
     # 绑定处理函数
     p_smoke.set_defaults(func=cmd_smoke)
+
+    p_cache = sub.add_parser("cache", help="查看或清理 VLM/LLM 结果缓存")
+    # 动作：默认查看统计，clear 执行清理
+    p_cache.add_argument("action", nargs="?", default="stats", choices=["stats", "clear"],
+                         help="stats 查看用量（默认），clear 清理缓存")
+    # 清理范围：不指定则全清。缓存永久保留，改了提示词后旧条目不会自动消失，需在此手动清
+    p_cache.add_argument("--sample", default="", metavar="样本名",
+                         help="仅清理该样本用到的条目；不指定则全清")
+    # 绑定处理函数
+    p_cache.set_defaults(func=cmd_cache)
 
     # 返回构建好的解析器
     return parser

@@ -184,6 +184,15 @@ def save_chunks(run_id, chunks_by_case, findings_by_case=None):
     return chunks_path(run_id)
 
 
+# 切分文本快照的内存缓存，只保留最近用过的一轮。
+# 标注改为按版本存之后，写一条标注、算一次统计、生成一份任务书都要回快照里
+# 核对命中，而快照是一个 1.8MB 的 gzip 文件、解压后有上万个切片——
+# 每次都重新解压会让「点一下标注」都卡上百毫秒。
+# 只缓存一轮：快照是不可变的，同一轮永远读到同样的内容；而人一次只会盯着
+# 一个版本看，缓存更多只是白占内存。
+_CHUNKS_CACHE = {"run_id": None, "mtime": None, "data": None}
+
+
 def load_chunks(run_id, case_id=None):
     """读取某一轮的切分文本快照；指定样本时只返回该样本。"""
     # 快照路径
@@ -191,18 +200,55 @@ def load_chunks(run_id, case_id=None):
     # 文件不存在说明该轮是旧版本产生的，没有文本快照
     if not path.is_file():
         return None
-    # 读取并解析
-    try:
-        with gzip.open(path, "rt", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except Exception:
-        # 快照损坏时按缺失处理，不影响其它功能
-        return None
+    # 取文件修改时间作为缓存校验依据，快照被替换时能自动失效
+    mtime = path.stat().st_mtime
+    # 命中缓存时直接用内存里的数据，省掉一次解压
+    if _CHUNKS_CACHE["run_id"] == run_id and _CHUNKS_CACHE["mtime"] == mtime:
+        data = _CHUNKS_CACHE["data"]
+    else:
+        # 未命中则读取并解析
+        try:
+            with gzip.open(path, "rt", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            # 快照损坏时按缺失处理，不影响其它功能
+            return None
+        # 覆盖式写入缓存，只保留这一轮
+        _CHUNKS_CACHE.update({"run_id": run_id, "mtime": mtime, "data": data})
     # 指定样本时只取该样本
     if case_id:
         return data.get(case_id)
     # 否则返回全部
     return data
+
+
+def latest_run_id():
+    """返回最新一轮的标识，尚无历史时返回空串。
+
+    标注、统计、任务书都必须挂在某个版本上，因此各处都需要一个明确的默认版本；
+    默认取最新一轮，与概览页打开时展示的那一轮保持一致。
+    """
+    # 索引已按生成时间倒序存储，首项即最新
+    index = _load_index()
+    # 无历史时返回空串，由调用方决定如何提示
+    return index[0]["run_id"] if index else ""
+
+
+def previous_run_id(run_id):
+    """返回某一轮之前的那一轮标识，没有上一轮时返回空串。
+
+    新版本的标注从上一版继承而来，回归护栏默认也是拿这两版作比较，
+    因此「上一轮是谁」需要有一个统一的说法。
+    """
+    # 读取按时间倒序的索引
+    index = _load_index()
+    # 逐条找到目标轮次的位置
+    for i, item in enumerate(index):
+        # 找到后，倒序表里的下一项就是时间上的上一轮
+        if item.get("run_id") == run_id:
+            return index[i + 1]["run_id"] if i + 1 < len(index) else ""
+    # 目标轮次不在索引里，说明已被删除
+    return ""
 
 
 def save_run(report, label=""):
@@ -260,6 +306,9 @@ def save_run(report, label=""):
         "git_commit": report["code"]["git_commit"],  # 关联提交
         "git_dirty": report["code"]["git_dirty"],  # 是否含未提交改动
         "corpus_hash": report["corpus_hash"],  # 语料指纹
+        # 是否跨代码版本续跑而成。为真时上面的 code_hash 只代表汇总那一刻的代码，
+        # 部分样本实际是用更早的代码跑的，这一轮与任何一轮都不能直接比较
+        "code_mixed": report.get("code_mixed", False),
         "totals_by_detector": report.get("totals_by_detector", {}),  # 各检测器命中，供趋势图使用
         "has_chunks": report.get("has_chunks", False),  # 是否含切分文本快照
         "chunks_bytes": report.get("chunks_bytes", 0),  # 文本快照压缩后体积
@@ -268,6 +317,37 @@ def save_run(report, label=""):
     _save_index(index)
     # 返回轮次标识
     return run_id
+
+
+def update_run(run_id, report):
+    """就地更新已存在轮次的快照与索引摘要，不新增历史条目。
+
+    专供「评估落盘后还要再改一次统计」的场景：人工判定的误报要等标注继承完成
+    才能确定，而标注继承又必须先有本轮快照才能按新切片定位。于是流程只能是
+    先存、再继承、最后回填——这个函数负责最后一步。
+
+    切片快照里的问题明细也要一并重写，否则界面上看到的仍是没打忽略标记的旧数据。
+    """
+    RUNS_DIR.mkdir(parents=True, exist_ok=True)  # 确保目录存在
+    stored = dict(report)  # 复制一份，避免修改调用方的对象
+    stored.pop("_chunks", None)  # 切分文本不随报告 JSON 落盘，与 save_run 保持一致
+    chunks = load_chunks(run_id)  # 取回本轮已存的切片快照，用于重写其中的问题明细
+    if chunks:  # 快照存在时才需要回写
+        findings_by_case = {c["case_id"]: c.get("findings") or []
+                            for c in stored.get("cases", [])}  # 逐样本取更新后的问题明细
+        path = save_chunks(run_id, chunks, findings_by_case)  # 用同一份文本重写快照
+        stored["chunks_bytes"] = path.stat().st_size  # 更新压缩后体积
+    with (RUNS_DIR / f"{run_id}.json").open("w", encoding="utf-8") as fh:  # 覆盖完整快照
+        json.dump(stored, fh, ensure_ascii=False, indent=2)  # 保留中文可读性
+    index = _load_index()  # 读取索引
+    for row in index:  # 找到本轮的索引摘要并同步关键统计
+        if row.get("run_id") == run_id:
+            row["finding_total"] = stored.get("finding_total", 0)  # 同步问题总数
+            row["totals_by_detector"] = stored.get("totals_by_detector", {})  # 同步各检测器命中
+            row["chunks_bytes"] = stored.get("chunks_bytes", row.get("chunks_bytes", 0))  # 同步快照体积
+            break  # 索引里每个轮次只有一条
+    _save_index(index)  # 写回索引
+    return stored  # 返回落盘后的报告，供调用方继续使用
 
 
 def migrate_legacy_baseline():
