@@ -252,10 +252,26 @@ def start_cloud_parse(file_paths, auto_import=True, kind="", note="", lang="ch")
             "block_count": 0,  # 产物块数
             "error": None,  # 失败原因
             "cloud_files": [],  # 逐文件云端状态
+            "task_kind": "cloud",  # 标记任务类型，重试时据此区分走本地还是云端提交路径
+            "cancel_requested": False,  # 是否已收到取消请求，供运行中检查点判断
+            # 以下字段原样保留本次提交参数，供失败/取消后重试时原样重新提交
+            "retry_params": {
+                "file_paths": [str(p) for p in paths],
+                "auto_import": auto_import,
+                "kind": kind,
+                "note": note,
+                "lang": lang,
+            },
         }
 
     # 后台执行
     def _run():
+        # 起线程前任务已被标记取消（排队窗口很短，但仍可能发生），
+        # 直接跳过整个解析，不必再走一遍日志安装与云端请求
+        task_now = get_task(task_id)
+        if task_now is not None and task_now.get("status") == "cancelled":
+            append_log(task_id, "已取消（提交后尚未开始即被取消）")
+            return
         # 安装日志处理器，云端解析的过程日志同样需要可见
         handler = TaskLogHandler(task_id, threading.current_thread().name)
         handler.setLevel(logging.INFO)
@@ -304,6 +320,17 @@ def start_cloud_parse(file_paths, auto_import=True, kind="", note="", lang="ch")
                     products=products,  # 全部产物，供界面列出
                     # 同时填首个产物，兼容按单产物取值的既有逻辑
                     product=products[0]["path"] if products else None)
+
+            # 请求方式没有能真正中断已发出的云端请求的检查点，只能等这次批量
+            # 跑完后再看有没有被标记取消——取消时跳过入库，避免半途而废的
+            # 产物被当成正常数据用
+            cancelled = bool((get_task(task_id) or {}).get("cancel_requested"))
+            if cancelled:
+                for r in results:
+                    if r.get("ok"):
+                        append_log(task_id, f"已按取消请求跳过入库：{r['name']}")
+                _update(task_id, status="cancelled", message="已取消（解析已跑完，未入库）")
+                return
 
             # 按需入库
             if auto_import:
@@ -376,10 +403,30 @@ def start_parse(file_path, filename, backend="", parse_method="auto",
             "case_id": None,  # 入库后的样本标识
             "block_count": 0,  # 产物块数
             "error": None,  # 失败原因
+            "task_kind": "local",  # 标记任务类型，重试时据此区分走本地还是云端提交路径
+            "cancel_requested": False,  # 是否已收到取消请求，供运行中检查点判断
+            # 以下字段原样保留本次提交参数，供失败/取消后重试时原样重新提交
+            "retry_params": {
+                "file_path": str(file_path),
+                "filename": filename,
+                "backend": backend,
+                "parse_method": parse_method,
+                "auto_import": auto_import,
+                "kind": kind,
+                "note": note,
+                "mineru_api": mineru_api,
+                "output_dir": str(output_dir or ""),
+            },
         }
 
     # 后台执行解析，避免阻塞 HTTP 请求
     def _run():
+        # 排队期间已被取消：MinerU 单实例只能串行跑，队列里可能真等了很久，
+        # 轮到它执行时直接跳过，不必再耗时占用这一次解析槽位
+        task_now = get_task(task_id)
+        if task_now is not None and task_now.get("status") == "cancelled":
+            append_log(task_id, "已取消（排队中撤回，未开始解析）")
+            return
         # 安装日志处理器，捕获本线程内 MinerU 解析产生的全部日志。
         # 挂在 root 上是因为解析链路涉及多个模块的 logger，逐个挂容易遗漏。
         handler = TaskLogHandler(task_id, threading.current_thread().name)
@@ -434,6 +481,13 @@ def start_parse(file_path, filename, backend="", parse_method="auto",
             _update(task_id, product=str(product), block_count=block_count,
                     message="解析完成", progress=1.0)
 
+            # parse_document 是单次阻塞调用，运行中收到的取消请求没有检查点能
+            # 提前中断，只能等它跑完；跑完后发现已被标记取消就跳过入库，
+            # 避免把这份「用户已经不想要了」的产物当正常数据用
+            if (get_task(task_id) or {}).get("cancel_requested"):
+                _update(task_id, status="cancelled", message="已取消（解析已跑完，未入库）")
+                return
+
             # 按需把产物导入语料库，省去手工再走一遍导入
             if auto_import:
                 # 延迟导入避免循环依赖
@@ -465,3 +519,88 @@ def start_parse(file_path, filename, backend="", parse_method="auto",
     _job_queue.put(_run)
     # 返回任务标识供前端轮询
     return task_id
+
+
+def cancel_task(task_id):
+    """请求取消一个任务，返回 {"ok": bool, "message": ...}。
+
+    排队中的任务能真取消：还没占用 MinerU，直接标记终态，worker 轮到时会跳过。
+    运行中的任务只能软取消：MinerU 是单次阻塞 HTTP 调用，没有可轮询的检查点，
+    当前这次请求仍会跑完，跑完后跳过入库并把状态改成已取消，不是立即停止。
+    """
+    # 读取任务当前状态
+    task = get_task(task_id)
+    # 任务不存在时明确回报，不能取消一个不存在的东西
+    if task is None:
+        return {"ok": False, "message": f"任务不存在：{task_id}"}
+    # 已在终态的任务无需也无法再取消
+    if task.get("status") in ("done", "failed", "cancelled"):
+        return {"ok": False, "message": "任务已结束，无法取消"}
+    # 排队中：还没真正开始，直接标记为已取消，worker 拿到后会自行跳过
+    if task.get("status") == "queued":
+        _update(task_id, status="cancelled", message="已取消（排队中撤回）")
+        return {"ok": True, "message": "已取消（排队中撤回）"}
+    # 运行中：只置取消标记，实际停止发生在当前这次解析请求跑完之后
+    _update(task_id, cancel_requested=True)
+    append_log(task_id, "已请求取消（MinerU 为单次阻塞调用，当前请求会先跑完再停止）")
+    return {"ok": True, "message": "已请求取消，当前请求跑完后停止，不会自动入库"}
+
+
+def delete_task(task_id):
+    """删除一个任务记录，返回 {"ok": bool, "message"/"removed": ...}。
+
+    只删 chunk-lab 任务表里的这条内存记录，不动已落盘的产物或已入库的语料——
+    语料自有独立的删除入口，两者不应该被这一个操作耦在一起。
+    """
+    # 任务不存在按已删除处理，保持接口幂等
+    task = get_task(task_id)
+    if task is None:
+        return {"ok": True, "removed": False}
+    # 运行中的任务不能直接摘掉记录：后台线程仍持有 task_id 在跑，
+    # 摘掉后它写回状态会静默失效，用户也无从得知这次解析最终成没成
+    if task.get("status") == "running":
+        return {"ok": False, "message": "任务正在运行，请先取消"}
+    # 加锁删除，避免与后台线程的读写竞争
+    with _lock:
+        _tasks.pop(task_id, None)
+    return {"ok": True, "removed": True}
+
+
+def retry_task(task_id):
+    """用原始参数重新提交一次失败/已取消的任务，返回新的 task_id。
+
+    每个解析任务是整份文件一次性提交，不像评估任务能按样本续跑，
+    所以“重试”就是照抄一遍当初的提交参数、开一个新任务，旧记录留作历史。
+    """
+    # 读取原任务
+    task = get_task(task_id)
+    # 任务不存在无从重试
+    if task is None:
+        return {"ok": False, "message": f"任务不存在：{task_id}"}
+    # 只有失败或已取消的任务需要重试；进行中/排队中/已完成的重试没有意义
+    if task.get("status") not in ("failed", "cancelled"):
+        return {"ok": False, "message": "只有失败或已取消的任务可以重试"}
+    # 旧任务没有记录重试参数（理论上不会出现，防御性处理）
+    params = task.get("retry_params")
+    if not params:
+        return {"ok": False, "message": "该任务缺少可重试的原始参数，请重新提交"}
+    # 云端批量任务：重新整批提交同一批文件
+    if task.get("task_kind") == "cloud":
+        # 原文件若已被清理则无法重试，如实告知而不是提交一批不存在的路径
+        missing = [p for p in params["file_paths"] if not Path(p).is_file()]
+        if missing:
+            return {"ok": False, "message": f"原文件已不存在，无法重试：{', '.join(missing)}"}
+        new_task_id = start_cloud_parse(
+            params["file_paths"], auto_import=params["auto_import"],
+            kind=params["kind"], note=params["note"], lang=params["lang"])
+        return {"ok": True, "task_id": new_task_id}
+    # 本地任务：原文件在上传目录里，解析完成后不会被清理，直接复用路径
+    file_path = params["file_path"]
+    if not Path(file_path).is_file():
+        return {"ok": False, "message": "原文件已不存在于上传目录，无法重试，请重新上传"}
+    new_task_id = start_parse(
+        file_path, params["filename"], backend=params["backend"],
+        parse_method=params["parse_method"], auto_import=params["auto_import"],
+        kind=params["kind"], note=params["note"], mineru_api=params["mineru_api"],
+        output_dir=params["output_dir"])
+    return {"ok": True, "task_id": new_task_id}

@@ -17,15 +17,15 @@ from flask import Flask, Response, jsonify, request, send_from_directory  # 导�
 from . import annotations, crawling, evaljob, guard, runs  # 导入标注、爬取、评估任务、回归护栏与运行历史模块
 from .detect import detect  # 导入列表页结构自动识别
 from .preview import (attach_source, attach_source_from_path, find_source,
-                      render_chunk, viewable_pdf)  # 导入原文截图与格式转换能力
+                      locate_chunk_text, render_chunk, viewable_pdf)  # 导入原文截图、文字反查定位与格式转换能力
 from .detectors import DetectorConfig  # 导入检测阈值配置
 from .discover import scan_products  # 导入本机产物扫描
 from .evaluate import (compare_reports, diff_chunk_texts, diff_findings,
                        inspect_case, load_cases)  # 导入评估相关能力
 from .ingest import delete_case, ingest_from_path, set_case_enabled  # 导入按路径导入语料、删除语料与启用状态切换的能力
 from .offline import DEFAULT_PARSER_CONFIG, build_parser_config  # 导入切分配置默认值与合并逻辑
-from .parsing import (get_task, list_tasks, mineru_defaults, start_cloud_parse,
-                      start_parse)  # 导入解析任务管理
+from .parsing import (cancel_task, delete_task, get_task, list_tasks,  # 导入解析任务管理
+                      mineru_defaults, retry_task, start_cloud_parse, start_parse)
 from .paths import (ensure_ragflow_llm_ready, resolve_local_backend,  # 导入云端凭据、模型环境准备、本地 backend
                     resolve_mineru_token, resolve_tenant_id)  # 导入云端凭据与租户解析
 from .paths import CORPUS_DIR, DATA_ROOT, MINERU_OUT, REPORT_DIR, UPLOAD_DIR  # 导入目录常量
@@ -510,6 +510,33 @@ def api_parse_list():
     return jsonify({"ok": True, "tasks": list_tasks()})
 
 
+@app.post("/api/parse/<task_id>/cancel")
+def api_parse_cancel(task_id):
+    """请求取消一个解析任务（排队中真取消，运行中只是软取消）。"""
+    # 委托给任务管理模块，语义与返回结构见 parsing.cancel_task 的说明
+    result = cancel_task(task_id)
+    # 被拒时按 409 返回，成功按 200
+    return jsonify(result), (200 if result.get("ok") else 409)
+
+
+@app.post("/api/parse/<task_id>/retry")
+def api_parse_retry(task_id):
+    """用原始参数重新提交一次失败/已取消的任务。"""
+    # 委托给任务管理模块，成功时返回新任务的 task_id
+    result = retry_task(task_id)
+    # 被拒时按 409 返回，成功按 200
+    return jsonify(result), (200 if result.get("ok") else 409)
+
+
+@app.delete("/api/parse/<task_id>")
+def api_parse_delete(task_id):
+    """删除一个解析任务记录（不影响已落盘产物或已入库语料）。"""
+    # 委托给任务管理模块
+    result = delete_task(task_id)
+    # 被拒时按 409 返回，成功按 200
+    return jsonify(result), (200 if result.get("ok") else 409)
+
+
 def _run_from_request():
     """解析请求指定的版本，未指定时取最新一轮。
 
@@ -855,6 +882,27 @@ def api_chunk_shot(case_id):
         case_id,  # 样本标识
         payload.get("filename", ""),  # 原始文件名
         payload.get("positions") or [],  # 切片坐标
+    ))
+
+
+@app.post("/api/preview/<case_id>/locate")
+def api_preview_locate(case_id):
+    """Office 来源的切片没有真实 bbox 时，按正文反查其在转换 PDF 页面上的大致区域。"""
+    # 读取请求体
+    payload = request.get_json(silent=True) or {}
+    # 原始文件名，决定用哪份原文
+    filename = payload.get("filename", "")
+    # 切片所在页码，与 position_int 同口径（从 1 开始）
+    page_idx = payload.get("page_idx")
+    # 缺文件名或页码时无从反查
+    if not filename or not page_idx:
+        return jsonify({"ok": False, "message": "缺少 filename 或 page_idx"}), 400
+    # 反查并返回；各类前置条件不满足时以 ok=False 携带原因返回，不抛 500
+    return jsonify(locate_chunk_text(
+        case_id,  # 样本标识
+        filename,  # 原始文件名
+        page_idx,  # 目标页码
+        payload.get("text", ""),  # 切片正文，用于文字匹配
     ))
 
 

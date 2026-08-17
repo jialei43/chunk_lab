@@ -166,14 +166,14 @@ def scan_products(roots=None):
             "doc_name": info["doc_name"],  # 文档名
             "backend": info["backend"],  # backend 标识
             "path": info["path"],  # 产物路径
+            "mtime": info["mtime"],  # 产物修改时间（秒级时间戳），供前端按时间排序与展示
             "block_count": block_count,  # 原始块数
             "filename": info["doc_name"] if _guess_extension(info["doc_name"]) else info["doc_name"] + ext,  # 建议文件名
             "kind": EXT_TO_KIND.get(ext, "pdf"),  # 文档大类
             "imported": (info["doc_name"], info["backend"]) in imported,  # 是否已导入语料库
             "origin": _origin_of(info["path"]),  # 产物来源：lab 为实验室自产，external 为外部目录
         })
-    # 实验室自产的排在最前（它们与生产隔离，是当前实验的产物），
-    # 组内再按块数降序，规模大的文档通常更有代表性
-    items.sort(key=lambda x: (x["origin"] != "lab", -x["block_count"]))
+    # 按产物时间倒序：新解析的文档排最前，方便挑选最新产物导入
+    items.sort(key=lambda x: -x["mtime"])
     # 返回候选列表
     return items

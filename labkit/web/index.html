@@ -239,9 +239,11 @@ td.num { font-family: var(--mono); font-variant-numeric: tabular-nums; text-alig
 .issue .ev { font-family: var(--mono); font-size: 0.74rem; color: var(--muted); background: var(--sunk); padding: 0.05rem 0.35rem; border-radius: 3px; }
 
 /* ========== 语料导入 ========== */
-.src-row { display: grid; grid-template-columns: 1.6rem 1fr 6rem 5rem 4.5rem 5rem; gap: 0.6rem; align-items: center; padding: 0.4rem 0; border-bottom: 1px solid var(--line); font-size: 0.84rem; }
+.src-row { display: grid; grid-template-columns: 1.6rem 1.3fr 6rem 4rem 4.5rem 8rem 1fr 5rem; gap: 0.6rem; align-items: center; padding: 0.4rem 0; border-bottom: 1px solid var(--line); font-size: 0.84rem; }
 .src-row:last-child { border-bottom: none; }
 .src-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 路径列通常很长，同样单行省略，靠 title 悬浮查看完整路径 */
+.src-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.72rem; color: var(--muted); }
 .src-row.done { opacity: 0.5; }
 
 input[type="checkbox"] { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; }
@@ -802,6 +804,7 @@ tr.is-job td { color: var(--ink-soft); }
     <div class="split" id="chunkLayout">
       <div class="card" style="margin:0">
         <h3>样本</h3>
+        <input type="text" id="caseFilter" placeholder="按样本名筛选…" style="width:100%;box-sizing:border-box;margin-bottom:0.5rem">
         <div class="case-list" id="chunkCaseList"><div class="empty">加载中…</div></div>
       </div>
       <div>
@@ -1142,6 +1145,17 @@ tr.is-job td { color: var(--ink-soft); }
 
     <div class="card">
       <h3>解析任务</h3>
+      <div class="src-bar" style="margin-bottom:0.6rem">
+        <!-- 全选框，三态由 syncParsePick 维护：全选中打勾，部分选中半勾，一个没选则不打勾 -->
+        <label class="hint" style="display:flex;align-items:center;gap:0.35rem">
+          <input type="checkbox" id="parsePickAll" title="全选/取消全选">全选
+        </label>
+        <span class="spacer"></span>
+        <!-- 批量重试：只对选中里失败/已取消的任务生效，其余的会被服务端拒绝并如实汇报 -->
+        <button class="mini" id="btnParseBatchRetry" disabled>重试选中</button>
+        <!-- 批量删除：同上，运行中的会被服务端拒绝 -->
+        <button class="mini danger" id="btnParseBatchDelete" disabled>删除选中</button>
+      </div>
       <div id="parseTasks"><div class="empty">暂无任务</div></div>
     </div>
   </div>
@@ -1160,6 +1174,7 @@ tr.is-job td { color: var(--ink-soft); }
         <label><input type="checkbox" id="hideImported" checked> 隐藏已导入</label>
         <label><input type="checkbox" id="labOnly"> 只看实验室产物</label>
         <input type="text" id="srcFilter" placeholder="按文档名筛选…" style="flex:1;min-width:10rem">
+        <button class="btn" id="btnSourceSelectAll">全选</button>
         <button class="btn primary" id="btnImport" disabled>导入选中</button>
       </div>
       <div id="srcList"><div class="empty">加载中…</div></div>
@@ -3601,24 +3616,13 @@ async function loadChunkCaseList() {
     if (viewingRun === LIVE_RUN) {
       corpusCache = await api("/api/corpus");
       runCases = corpusCache.map(c => ({ ...c, chunk_count: c.block_count, finding_count: 0 }));
-      if (!corpusCache.length) {
-        $("chunkCaseList").innerHTML = `<div class="empty">语料库为空，去「添加语料」导入产物</div>`;
-        return;
-      }
-      $("chunkCaseList").innerHTML = corpusCache.map(c => `
-        <button class="case-item" data-case="${esc(c.case_id)}">
-          <span class="n">${esc(c.case_id)}${c.enabled === false ? "　<span class='pill low'>未参与评估</span>" : ""}</span>
-          <span class="m">${esc(c.kind || "")} · ${c.block_count} 块</span>
-        </button>`).join("");
-      $("chunkCaseList").querySelectorAll(".case-item").forEach(btn => {
-        btn.addEventListener("click", () => selectCase(btn.dataset.case));
-      });
+      renderChunkCaseList();
       return;
     }
     // 一个版本都没有时无从展示：预览看的是某一轮评估的结果
     if (!viewingRun) {
       runCases = [];
-      $("chunkCaseList").innerHTML = `<div class="empty">还没有任何评估版本，先到「概览」页运行评估</div>`;
+      renderChunkCaseList();
       return;
     }
     // 列表来自**该版本实际评估过的样本**，不是语料库的启用状态。
@@ -3626,23 +3630,70 @@ async function loadChunkCaseList() {
     // 停用后还没跑新评估时，当前版本里明明有它；新导入还没评估的样本则根本没有切片可看
     const d = await api(`/api/runs/${encodeURIComponent(viewingRun)}/cases`);
     runCases = d.cases || [];
-    if (!runCases.length) {
-      $("chunkCaseList").innerHTML = `<div class="empty">该版本没有评估任何样本</div>`;
-      return;
-    }
-    // 列表直接给出该轮的切片数与问题数，比语料库的原始块数更贴合"看这一轮结果"的用途
-    $("chunkCaseList").innerHTML = runCases.map(c => `
-      <button class="case-item" data-case="${esc(c.case_id)}">
-        <span class="n">${esc(c.case_id)}${c.error ? "　<span class='pill high'>切分失败</span>" : ""}</span>
-        <span class="m">${esc(c.kind || "")} · ${c.chunk_count} 片${c.finding_count ? ` · ${c.finding_count} 问题` : ""}</span>
-      </button>`).join("");
-    $("chunkCaseList").querySelectorAll(".case-item").forEach(btn => {
-      btn.addEventListener("click", () => selectCase(btn.dataset.case));
-    });
+    renderChunkCaseList();
   } catch (e) {
     toast("加载失败：" + e.message);
   }
 }
+
+// 渲染左侧样本列表，按 caseFilter 输入框做客户端筛选。
+// 试切与切片预览两种模式的字段不同（block_count/enabled vs chunk_count/error），
+// 分开拼各自的卡片内容，但筛选、空状态、点击绑定逻辑共用一份，不必两处各写一遍
+function renderChunkCaseList() {
+  const filter = ($("caseFilter").value || "").trim().toLowerCase();
+  // 试切模式：数据源是语料库全量缓存
+  if (viewingRun === LIVE_RUN) {
+    if (!corpusCache.length) {
+      $("chunkCaseList").innerHTML = `<div class="empty">语料库为空，去「添加语料」导入产物</div>`;
+      return;
+    }
+    // 按样本名做包含匹配，不区分大小写
+    const items = filter ? corpusCache.filter(c => c.case_id.toLowerCase().includes(filter)) : corpusCache;
+    if (!items.length) {
+      $("chunkCaseList").innerHTML = `<div class="empty">没有匹配的样本</div>`;
+      return;
+    }
+    $("chunkCaseList").innerHTML = items.map(c => `
+      <button class="case-item ${c.case_id === currentCase ? "active" : ""}" data-case="${esc(c.case_id)}">
+        <span class="n">${esc(c.case_id)}${c.enabled === false ? "　<span class='pill low'>未参与评估</span>" : ""}</span>
+        <span class="m">${esc(c.kind || "")} · ${c.block_count} 块</span>
+      </button>`).join("");
+    bindCaseItemClicks();
+    return;
+  }
+  // 切片预览模式：一个版本都没有、或该版本没评估过任何样本时无从展示
+  if (!viewingRun) {
+    $("chunkCaseList").innerHTML = `<div class="empty">还没有任何评估版本，先到「概览」页运行评估</div>`;
+    return;
+  }
+  if (!runCases.length) {
+    $("chunkCaseList").innerHTML = `<div class="empty">该版本没有评估任何样本</div>`;
+    return;
+  }
+  const items = filter ? runCases.filter(c => c.case_id.toLowerCase().includes(filter)) : runCases;
+  if (!items.length) {
+    $("chunkCaseList").innerHTML = `<div class="empty">没有匹配的样本</div>`;
+    return;
+  }
+  // 列表直接给出该轮的切片数与问题数，比语料库的原始块数更贴合"看这一轮结果"的用途
+  $("chunkCaseList").innerHTML = items.map(c => `
+    <button class="case-item ${c.case_id === currentCase ? "active" : ""}" data-case="${esc(c.case_id)}">
+      <span class="n">${esc(c.case_id)}${c.error ? "　<span class='pill high'>切分失败</span>" : ""}</span>
+      <span class="m">${esc(c.kind || "")} · ${c.chunk_count} 片${c.finding_count ? ` · ${c.finding_count} 问题` : ""}</span>
+    </button>`).join("");
+  bindCaseItemClicks();
+}
+
+// 给当前渲染出的样本按钮绑定点击选中，筛选/重渲后都要重新绑一遍
+function bindCaseItemClicks() {
+  $("chunkCaseList").querySelectorAll(".case-item").forEach(btn => {
+    btn.addEventListener("click", () => selectCase(btn.dataset.case));
+  });
+}
+
+// 筛选框只重绘列表，不重新请求数据——两种模式的原始数据都已缓存在
+// corpusCache/runCases 里，重新拉一遍纯属浪费
+$("caseFilter").addEventListener("input", renderChunkCaseList);
 
 // 当前打开的样本是否属于当前版本。切换版本后两版的样本集可能不同，
 // 不属于就该清空右侧，否则列表里没有、内容却还显示着
@@ -4333,6 +4384,7 @@ async function selectCase(caseId, target) {
       // 试切不支持标注：清空标注缓存，避免把别的版本的判定画到这份结果上
       caseAnnotations = {};
       shotCache = {};
+      officeLocateCache = {};  // 换样本后切片序号的含义变了，Office 反查定位缓存一并清空
       autoShotOff = false;
       if (target) chunkJumpIndex = target.index;
       renderChunkView();
@@ -4375,6 +4427,7 @@ async function selectCase(caseId, target) {
     caseAnnotations = h.annotations || {};
     // 换样本时清掉上一份的截图缓存
     shotCache = {};
+    officeLocateCache = {};  // 换样本后切片序号的含义变了，Office 反查定位缓存一并清空
     // 换样本就重新给自动缩略图一次机会：上一个样本取不到，
     // 不代表这一个也取不到
     autoShotOff = false;
@@ -4649,10 +4702,51 @@ function focusChunkInPdf(idx, card) {
   // 选中态只保留一个，便于看清当前对照的是哪一条
   $("chunkStream").querySelectorAll(".chunk.on").forEach(el => el.classList.remove("on"));
   card.classList.add("on");
+  const boxes = c.position_int || [];
+  const pageFallback = c.page_num_int || [];
   // 交给原文视图滚动定位；没有坐标的切片如实提示而不是静默无反应
   // 没有 bbox 时用页码兜底：Office 文档的块只有页码，翻到那一页仍然有用
-  if (!pdfView.focus(c.position_int || [], c.page_num_int || [])) {
+  if (!pdfView.focus(boxes, pageFallback)) {
     toast("该切片没有坐标，无法在原文中定位");
+    return;
+  }
+  // 有真实 bbox 时到此为止；Office 来源的切片只有页码、没有真实区域坐标——
+  // 此时 pdfView.focus 只完成了翻页，这里再异步反查一次精确区域，找到了就补画高亮框
+  const hasRealBox = boxes.some(p => p && p.length >= 5 && p[2] > p[1] && p[4] > p[3]);
+  if (!hasRealBox && pageFallback[0]) {
+    locateOfficeChunkRegion(idx, c, pageFallback[0]);
+  }
+}
+
+// Office 来源切片的文字反查定位缓存，按切片序号存，避免重复点击重复请求
+let officeLocateCache = {};
+// 反查请求的世代号：切了别的切片后，旧请求晚回来的结果不该覆盖新状态
+let officeLocateEpoch = 0;
+
+// 用切片正文去原文对应页面反查一个近似区域，命中则补画高亮框；
+// 找不到（版式复杂、艺术字等）静默放弃，维持已有的纯翻页效果，不打扰用户
+async function locateOfficeChunkRegion(idx, c, pageIdx) {
+  // 本次请求的世代号，异步回来后据此判断是否已过期
+  const mine = ++officeLocateEpoch;
+  // 命中过就直接复用缓存结果，不再重新请求
+  if (idx in officeLocateCache) {
+    const cached = officeLocateCache[idx];
+    if (cached) pdfView.focus([cached], [pageIdx]);
+    return;
+  }
+  try {
+    const r = await api(`/api/preview/${encodeURIComponent(currentCase)}/locate`, {
+      method: "POST",
+      body: JSON.stringify({ filename: currentCaseData.filename, page_idx: pageIdx, text: c.content || "" }),
+    });
+    // 反查失败（含正文与页面文字对不上）也缓存 null，避免同一切片反复重试
+    officeLocateCache[idx] = r.ok ? r.position : null;
+    // 世代号变了说明用户已经点了别的切片，这次结果不再有效，不能覆盖当前定位
+    if (mine !== officeLocateEpoch) return;
+    if (r.ok) pdfView.focus([r.position], [pageIdx]);
+  } catch (e) {
+    // 网络错误等同样静默放弃，不打断已经完成的翻页定位
+    officeLocateCache[idx] = null;
   }
 }
 
@@ -5400,9 +5494,21 @@ async function loadParseTasks() {
 }
 
 // 渲染任务列表
+// 当前勾选待批量操作的任务。放在 DOM 之外单独存，是因为轮询会不断整体重绘，
+// 只靠 checkbox 的 DOM 状态会在下一次重绘时丢失（对齐语料库页 corpusPicked 的做法）
+const parsePicked = new Set();
+// 最近一次渲染用的任务列表，供全选框与批量按钮在渲染函数之外也能取到当前任务集合
+let parseTasksCache = [];
+
 function renderParseTasks(tasks) {
+  // 记录本次任务集合，供全选/批量操作使用
+  parseTasksCache = tasks;
+  // 任务被删除或服务重启后已不在列表里的选中项要一并清掉，否则批量操作会带上幽灵 id
+  const liveIds = new Set(tasks.map(t => t.task_id));
+  [...parsePicked].forEach(id => { if (!liveIds.has(id)) parsePicked.delete(id); });
   if (!tasks.length) {
     $("parseTasks").innerHTML = `<div class="empty">暂无任务</div>`;
+    syncParsePick();
     return;
   }
   // 排队中的任务数，用于在批量提交后一眼看出还剩多少没开始
@@ -5412,23 +5518,37 @@ function renderParseTasks(tasks) {
     ? `<div class="hint" style="margin-bottom:0.6rem">还有 ${queued} 个任务排队中，将依次执行（同一时刻只解析一个）。</div>`
     : "";
   $("parseTasks").innerHTML = summary + tasks.map(t => {
-    // 状态徽标：排队中不转圈以区别于真正在跑的那个，运行中带转圈，失败标红
+    // 状态徽标：排队中不转圈以区别于真正在跑的那个，运行中带转圈，失败标红，取消标灰
     const badge = t.status === "queued"
       ? `<span class="pill low">排队中</span>`
       : t.status === "running" ? `<span class="pill kind"><span class="spin"></span> 解析中</span>`
       : t.status === "done" ? `<span class="pill good">完成</span>`
+      : t.status === "cancelled" ? `<span class="pill low">已取消</span>`
       : `<span class="pill bad">失败</span>`;
     // 进度条仅在运行中展示
     const bar = t.status === "running"
       ? `<div class="bar-track" style="margin-top:0.4rem"><div class="bar-fill" style="width:${Math.round((t.progress || 0) * 100)}%"></div></div>`
       : "";
+    // 取消按钮：排队中/运行中才有意义，运行中点了也只是软取消（当前请求仍会跑完）
+    const cancelBtn = (t.status === "queued" || t.status === "running")
+      ? `<button class="mini" data-parse-cancel="${esc(t.task_id)}">取消</button>` : "";
+    // 重试按钮：只对失败/已取消的任务提供，重新提交一份同参数的新任务
+    const retryBtn = (t.status === "failed" || t.status === "cancelled")
+      ? `<button class="mini" data-parse-retry="${esc(t.task_id)}">重试</button>` : "";
+    // 删除按钮：运行中的任务不能删（后台线程还在写它），其余状态都能删
+    const deleteBtn = t.status !== "running"
+      ? `<button class="mini" data-parse-delete="${esc(t.task_id)}">删除</button>` : "";
     return `<div class="task-row">
       <div class="task-head">
+        <input type="checkbox" data-parse-pick="${esc(t.task_id)}" ${parsePicked.has(t.task_id) ? "checked" : ""}>
         ${badge}
         <strong>${esc(t.filename)}</strong>
         <span class="hint mono">${esc(t.backend)} · ${esc(t.parse_method)}</span>
         <span class="spacer"></span>
         ${t.case_id ? `<button class="mini" data-goto-case="${esc(t.case_id)}">查看切片</button>` : ""}
+        ${cancelBtn}
+        ${retryBtn}
+        ${deleteBtn}
       </div>
       <div class="task-msg">${esc(t.error || t.message || "")}</div>
       ${t.block_count ? `<div class="hint">原始块数 ${t.block_count}${t.case_id ? `　样本 ${esc(t.case_id)}` : ""}</div>` : ""}
@@ -5447,6 +5567,127 @@ function renderParseTasks(tasks) {
       gotoChunks(btn.dataset.gotoCase, "");
     });
   });
+  // 绑定取消：排队中的会立即停止，运行中的只是标记，当前请求仍会跑完
+  $("parseTasks").querySelectorAll("[data-parse-cancel]").forEach(btn => {
+    btn.addEventListener("click", () => cancelParseTask(btn.dataset.parseCancel));
+  });
+  // 绑定重试：用原参数重新提交一个新任务
+  $("parseTasks").querySelectorAll("[data-parse-retry]").forEach(btn => {
+    btn.addEventListener("click", () => retryParseTask(btn.dataset.parseRetry));
+  });
+  // 绑定删除：只删任务列表里的记录，不动已落盘产物或已入库语料
+  $("parseTasks").querySelectorAll("[data-parse-delete]").forEach(btn => {
+    btn.addEventListener("click", () => deleteParseTask(btn.dataset.parseDelete));
+  });
+  // 绑定单行选择框：只改本地选择集，不发请求
+  $("parseTasks").querySelectorAll("[data-parse-pick]").forEach(box => {
+    box.addEventListener("change", () => {
+      // 勾上加入选择集、取消则移除
+      if (box.checked) parsePicked.add(box.dataset.parsePick);
+      else parsePicked.delete(box.dataset.parsePick);
+      syncParsePick();
+    });
+  });
+  // 同步全选框与批量按钮的状态
+  syncParsePick();
+}
+
+// 同步全选框三态与批量按钮的禁用状态、选中数量文案
+function syncParsePick() {
+  const all = $("parsePickAll");
+  const retryBtn = $("btnParseBatchRetry");
+  const delBtn = $("btnParseBatchDelete");
+  // 页面结构尚未就绪时直接返回
+  if (!all || !retryBtn || !delBtn) return;
+  const n = parsePicked.size;
+  const total = parseTasksCache.length;
+  // 全选框三态：全选中打勾，部分选中显示中间态，一个没选则不打勾
+  all.checked = n > 0 && n === total;
+  all.indeterminate = n > 0 && n < total;
+  // 没选中就禁用，按钮上直接带出数量，避免点了才知道要动几个
+  retryBtn.disabled = n === 0;
+  retryBtn.textContent = n ? `重试选中 ${n}` : "重试选中";
+  delBtn.disabled = n === 0;
+  delBtn.textContent = n ? `删除选中 ${n}` : "删除选中";
+}
+
+// 全选框：一次性选中或清空当前列表里的全部任务
+$("parsePickAll").addEventListener("change", (e) => {
+  parsePicked.clear();
+  if (e.target.checked) parseTasksCache.forEach(t => parsePicked.add(t.task_id));
+  // 重绘各行的勾选状态；任务列表本身没变，直接用缓存重绘即可，不必重新请求
+  renderParseTasks(parseTasksCache);
+});
+
+// 批量重试：逐个调用单任务重试接口，非失败/已取消的会被服务端拒绝，
+// 结果里如实汇总成功与被跳过的数量，而不是假装全部成功
+$("btnParseBatchRetry").addEventListener("click", async () => {
+  const ids = [...parsePicked];
+  if (!ids.length) return;
+  if (!confirm(`重试选中的 ${ids.length} 个任务？只有失败/已取消的会真正重新提交，其余会被跳过。`)) return;
+  // 并发调用，互不影响；用 allSettled 保证个别失败不影响其它任务的结果统计
+  const results = await Promise.allSettled(
+    ids.map(id => api(`/api/parse/${encodeURIComponent(id)}/retry`, { method: "POST" })));
+  const ok = results.filter(r => r.status === "fulfilled").length;
+  const skipped = results.length - ok;
+  toast(`已重新提交 ${ok} 个${skipped ? `，跳过 ${skipped} 个（非失败/已取消或原文件已不存在）` : ""}`);
+  parsePicked.clear();
+  await loadParseTasks();
+  startParsePolling();
+});
+
+// 批量删除：逐个调用单任务删除接口，运行中的会被服务端拒绝
+$("btnParseBatchDelete").addEventListener("click", async () => {
+  const ids = [...parsePicked];
+  if (!ids.length) return;
+  if (!confirm(`删除选中的 ${ids.length} 条任务记录？运行中的会被跳过；不会删除已落盘产物或已入库语料。`)) return;
+  const results = await Promise.allSettled(
+    ids.map(id => api(`/api/parse/${encodeURIComponent(id)}`, { method: "DELETE" })));
+  const ok = results.filter(r => r.status === "fulfilled").length;
+  const skipped = results.length - ok;
+  toast(`已删除 ${ok} 条${skipped ? `，跳过 ${skipped} 条（正在运行中）` : ""}`);
+  parsePicked.clear();
+  await loadParseTasks();
+});
+
+// 取消一个解析任务：排队中会被真正撤回，运行中只是打上标记
+async function cancelParseTask(taskId) {
+  // 运行中的取消不会立刻停止，弹窗提前说明，避免用户以为点了就立即停
+  if (!confirm("取消这个解析任务？排队中会立即撤回；运行中的话当前这次解析请求仍会跑完，跑完后不会自动入库。")) return;
+  try {
+    // 调用取消接口，成功后刷新任务列表看最新状态
+    const d = await api(`/api/parse/${encodeURIComponent(taskId)}/cancel`, { method: "POST" });
+    toast(d.message || "已请求取消");
+    await loadParseTasks();
+  } catch (e) {
+    toast("取消失败：" + e.message);
+  }
+}
+
+// 用原始参数重新提交一次失败/已取消的解析任务
+async function retryParseTask(taskId) {
+  try {
+    // 成功时后端返回新任务的 task_id，刷新列表 + 继续轮询即可看到新任务
+    const d = await api(`/api/parse/${encodeURIComponent(taskId)}/retry`, { method: "POST" });
+    toast("已重新提交，新任务 " + d.task_id);
+    await loadParseTasks();
+    startParsePolling();
+  } catch (e) {
+    toast("重试失败：" + e.message);
+  }
+}
+
+// 删除一个解析任务记录：只影响任务列表，不影响已落盘产物或已入库语料
+async function deleteParseTask(taskId) {
+  if (!confirm("删除这条解析任务记录？不会删除已经生成的产物或已入库的语料。")) return;
+  try {
+    // 调用删除接口，成功后从列表里刷新掉
+    await api(`/api/parse/${encodeURIComponent(taskId)}`, { method: "DELETE" });
+    toast("已删除任务记录");
+    await loadParseTasks();
+  } catch (e) {
+    toast("删除失败：" + e.message);
+  }
 }
 
 // 渲染任务日志。失败的任务默认展开——那正是需要看日志的时候。
@@ -5505,6 +5746,14 @@ function stopParsePolling() {
   parsePollTimer = null;
 }
 
+// 把产物的秒级时间戳格式化成便于扫读的本地时间，缺失时用占位符而不是抛错
+function fmtSourceTime(mtime) {
+  if (!mtime) return "—";
+  const d = new Date(mtime * 1000);
+  const pad = n => String(n).padStart(2, "0");
+  return `${d.getMonth() + 1}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 // ========== 添加语料：扫描本机产物 ==========
 async function loadSources() {
   // 已加载过则不重复扫描，扫描全盘较慢
@@ -5535,7 +5784,7 @@ function renderSources() {
   }
   $("srcList").innerHTML =
     `<div class="src-row" style="font-family:var(--mono);font-size:0.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em">
-      <span></span><span>文档</span><span>backend</span><span style="text-align:right">块数</span><span>来源</span><span>状态</span>
+      <span></span><span>文档</span><span>backend</span><span style="text-align:right">块数</span><span>来源</span><span>时间</span><span>路径</span><span>状态</span>
     </div>` +
     items.map(s => {
       const idx = sourcesCache.indexOf(s);
@@ -5547,24 +5796,38 @@ function renderSources() {
         <span>${s.origin === "lab"
           ? '<span class="pill good" title="实验室自己解析的产物，与生产隔离">实验室</span>'
           : '<span class="pill low" title="来自生产 MinerU 输出或历史实验目录">外部</span>'}</span>
+        <span class="mono" style="font-size:0.76rem;color:var(--muted)">${fmtSourceTime(s.mtime)}</span>
+        <span class="src-path" title="${esc(s.path)}">${esc(s.path)}</span>
         <span>${s.imported ? '<span class="pill low">已导入</span>' : `<span class="pill kind">${esc(s.kind)}</span>`}</span>
       </div>`;
     }).join("");
 
   // 勾选变化时更新导入按钮可用状态
   $("srcList").querySelectorAll(".src-cb").forEach(cb => {
-    cb.addEventListener("change", () => {
-      const n = $("srcList").querySelectorAll(".src-cb:checked").length;
-      $("btnImport").disabled = n === 0;
-      $("btnImport").textContent = n ? `导入选中 (${n})` : "导入选中";
-    });
+    cb.addEventListener("change", updateSourceImportBtn);
   });
+  updateSourceImportBtn();
+}
+
+// 同步「导入选中」按钮的可用状态与选中数量文案，勾选变化和全选都会触发
+function updateSourceImportBtn() {
+  const n = $("srcList").querySelectorAll(".src-cb:checked").length;
+  $("btnImport").disabled = n === 0;
+  $("btnImport").textContent = n ? `导入选中 (${n})` : "导入选中";
 }
 
 // 筛选控件联动
 $("hideImported").addEventListener("change", renderSources);
 $("labOnly").addEventListener("change", renderSources);
 $("srcFilter").addEventListener("input", renderSources);
+
+// 全选：只对当前列表里未导入（未禁用）的行生效，已导入的行本就不可勾选
+$("btnSourceSelectAll").addEventListener("click", () => {
+  const boxes = [...$("srcList").querySelectorAll(".src-cb:not(:disabled)")];
+  const allChecked = boxes.length && boxes.every(b => b.checked);
+  boxes.forEach(b => { b.checked = !allChecked; });
+  updateSourceImportBtn();
+});
 
 // ========== 执行导入 ==========
 $("btnImport").addEventListener("click", async () => {

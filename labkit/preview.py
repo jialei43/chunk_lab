@@ -50,6 +50,16 @@ _convert_lock = threading.Lock()
 # 12 页约 70MB——够覆盖切片列表一屏内的跨页范围，又不至于把内存吃光
 PAGE_CACHE_SIZE = 12
 
+# 文字反查每次最多尝试的行数：切片正文可能很长（多个要点合并成一个 chunk），
+# 逐行都去搜一遍既慢又没必要，命中足够多行就能拼出近似区域
+LOCATE_MAX_LINES = 8
+# 反查片段取每行开头的字符数：太长容易跨越 PDF 渲染时的折行断点（页面上排版换行
+# 与切片正文的自然换行不是一回事，一个词可能被从中间断开）而搜不到；
+# 太短则容易在页面上命中不止一处，无法判断该用哪个
+LOCATE_SNIPPET_LEN = 16
+# 反查片段的最短长度：短于此长度的行大概率是空行或纯符号，不具备唯一定位价值，直接跳过
+LOCATE_SNIPPET_MIN_LEN = 6
+
 
 def viewable_pdf(src):
     """返回可供 pdf.js 渲染的 PDF 路径；Office 文档先转换。
@@ -308,3 +318,74 @@ def render_chunk(case_id, filename, positions, page_hint=None):
         return {"ok": False, "reason": "no_region", "message": "坐标无法映射到有效页面区域"}
     # 返回全部截图
     return {"ok": True, "images": images, "source": str(src)}
+
+
+def locate_chunk_text(case_id, filename, page_idx, text):
+    """在 Office 转换出的 PDF 页面里按切片正文反查其大致区域，供无真实 bbox 的切片补高亮框。
+
+    Office 格式的 MinerU 块本身没有版面坐标，只有页码（见模块头部说明）；但 LibreOffice
+    转出的 PDF 通常保留真实文字层，可以用切片正文去该页面做文字匹配，反推出一个近似区域，
+    而不必等 MinerU 哪天给 Office 格式补上真实坐标。
+
+    做法：把正文按自然行拆开，取每行开头一小段做精确搜索——片段太长容易跨越 PDF 渲染时
+    的折行断点（版式换行与正文的段落换行不是一回事）而搜不到，片段太短又容易在页面上
+    命中不止一处、无法判断该用哪个，命中恰好一处才采信。多行命中取外接矩形，近似覆盖
+    整段切片在页面上的范围；一行都没命中就如实返回失败，前端退回纯翻页，不猜测坐标。
+    """
+    # 复用与截图同一套原文定位逻辑，保证「关联了原文才能定位」这条前提一致
+    src = find_source(case_id, filename)
+    if src is None:
+        return {"ok": False, "reason": "no_source", "message": "该样本尚未关联原始文件"}
+    # Office 文档同样先转 PDF，转换结果与截图功能共用同一份缓存
+    src, why = viewable_pdf(src)
+    if src is None:
+        return {"ok": False, "reason": "not_pdf", "message": why}
+    # 延迟导入 pdfplumber，未触发反查的场景不承担其加载开销
+    try:
+        import pdfplumber
+    except ImportError:
+        return {"ok": False, "reason": "no_pdfplumber", "message": "环境缺少 pdfplumber，无法反查文字位置"}
+    # 入参页码与 position_int 同口径，从 1 开始，这里转成 pdfplumber 要的 0 基下标
+    idx = int(page_idx) - 1
+    try:
+        with pdfplumber.open(str(src)) as pdf:
+            # 页码越界时明确回报，而不是让后续索引抛异常
+            if idx < 0 or idx >= len(pdf.pages):
+                return {"ok": False, "reason": "bad_page", "message": "页码超出范围"}
+            page = pdf.pages[idx]
+            # 收集每一行命中的区域，最后取外接矩形近似覆盖整段正文
+            hits = []
+            # 按切片正文的自然换行拆分成候选行
+            lines = [ln.strip() for ln in (text or "").split("\n")]
+            for line in lines:
+                # 命中行数够用即停：整段正文可能有几十行，没必要每行都搜一遍
+                if len(hits) >= LOCATE_MAX_LINES:
+                    break
+                # 取行首短片段，太长的整行大概率跨越 PDF 折行断点而搜不到
+                snippet = line[:LOCATE_SNIPPET_LEN]
+                # 片段太短（含空行）在页面上大概率不止命中一处，跳过以免选错区域
+                if len(snippet) < LOCATE_SNIPPET_MIN_LEN:
+                    continue
+                try:
+                    found = page.search(snippet, regex=False, case=True)
+                except Exception:
+                    # 单行搜索异常（如片段含 pdfplumber 不接受的字符）不影响其余行
+                    continue
+                # 零命中或命中多处都无法确定唯一区域，宁可跳过也不猜
+                if len(found) != 1:
+                    continue
+                hits.append(found[0])
+    except Exception as e:
+        # 打开/搜索失败如实回报原因，而不是让界面拿到裸 500
+        return {"ok": False, "reason": "render_failed", "message": f"{type(e).__name__}: {e}"}
+    # 一行都没命中，说明提取出的文字与页面对不上（常见于艺术字、复杂版式）
+    if not hits:
+        return {"ok": False, "reason": "no_match",
+                "message": "正文与页面文字对不上，可能是版式或艺术字导致提取的文字不一致"}
+    # 外接矩形：取全部命中行坐标的并集
+    x0 = min(h["x0"] for h in hits)
+    x1 = max(h["x1"] for h in hits)
+    top = min(h["top"] for h in hits)
+    bottom = max(h["bottom"] for h in hits)
+    # 返回格式与 render_chunk 的 positions 参数一致，前端可直接喂给同一套高亮逻辑
+    return {"ok": True, "position": [int(page_idx), x0, x1, top, bottom]}
